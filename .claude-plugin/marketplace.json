@@ -1,0 +1,19 @@
+{
+  "name": "pacoragroma-projects",
+  "owner": {
+    "name": "Pacoragroma"
+  },
+  "metadata": {
+    "description": "Claude plugins and skills from github.com/Pacoragroma/projects"
+  },
+  "plugins": [
+    {
+      "name": "day-trader",
+      "source": "./day-trader",
+      "description": "11 Claude skills for day trading: scan thousands of charts, track breaking news, time every entry and exit, and replay every outcome before you risk a dollar. Paper trading only.",
+      "version": "1.0.0",
+      "license": "MIT",
+      "keywords": ["day-trading", "stock-market", "backtesting", "paper-trading", "claude-skills"]
+    }
+  ]
+}

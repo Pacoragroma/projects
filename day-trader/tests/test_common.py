@@ -1,0 +1,293 @@
+import json
+import os
+import unittest
+from datetime import datetime, timezone
+from unittest import mock
+
+from helpers import (ROOT, SKILLS, TempHomeTestCase, bars_from_closes, daily_bars, et_ts,
+                     fake_http, random_walk_history, tc, write_fixture, yahoo_chart_url,
+                     yahoo_payload)
+
+
+class TimeTests(unittest.TestCase):
+    def test_eastern_conversion_across_dst(self):
+        # 2026-10-30 is EDT (UTC-4); 2026-11-02 is EST (UTC-5).
+        self.assertEqual(tc.to_et(datetime(2026, 10, 30, 13, 30, tzinfo=timezone.utc).timestamp()).strftime("%H:%M"), "09:30")
+        self.assertEqual(tc.to_et(datetime(2026, 11, 2, 14, 30, tzinfo=timezone.utc).timestamp()).strftime("%H:%M"), "09:30")
+
+    def test_fallback_dst_rule_matches_zoneinfo(self):
+        if tc.ET is None:
+            self.skipTest("zoneinfo unavailable")
+        for y in (2024, 2025, 2026, 2027):
+            for month in range(1, 13):
+                for day in (1, 7, 8, 14, 15, 28):
+                    for hour in (0, 6, 7, 12):
+                        u = datetime(y, month, day, hour, tzinfo=timezone.utc)
+                        self.assertEqual(tc._us_eastern_offset(u), u.astimezone(tc.ET).utcoffset(), u)
+
+    def test_parse_hhmm(self):
+        self.assertEqual(tc.parse_hhmm("10:15"), 615)
+        self.assertEqual(tc.hhmm(615), "10:15")
+        for bad in ("25:00", "10:60", "1015", ""):
+            with self.assertRaises(ValueError):
+                tc.parse_hhmm(bad)
+
+    def test_now_override(self):
+        with mock.patch.dict(os.environ, {"DAYTRADER_NOW": "2026-10-30T10:15"}):
+            n = tc.now_et()
+            self.assertEqual((n.hour, n.minute), (10, 15))
+            self.assertEqual(tc.today_et(), "2026-10-30")
+            self.assertTrue(tc.is_market_open())
+        with mock.patch.dict(os.environ, {"DAYTRADER_NOW": "2026-10-31T10:15"}):  # Saturday
+            self.assertFalse(tc.is_market_open())
+
+    def test_regular_session_and_grouping(self):
+        bars = bars_from_closes("2026-10-29", [10, 11, 12], start="09:25") + \
+            bars_from_closes("2026-10-30", [12, 13], start="15:55")
+        groups = tc.group_sessions(bars)
+        self.assertEqual(list(groups), ["2026-10-29", "2026-10-30"])
+        self.assertEqual([b.time for b in groups["2026-10-29"]], ["09:30", "09:35"])
+        self.assertEqual([b.time for b in groups["2026-10-30"]], ["15:55"])
+
+
+class YahooParseTests(unittest.TestCase):
+    def test_parse_drops_null_rows_and_repairs_wicks(self):
+        payload = yahoo_payload(bars_from_closes("2026-10-30", [100, 101, 102]))
+        q = payload["chart"]["result"][0]["indicators"]["quote"][0]
+        q["close"][1] = None
+        q["high"][2] = 50.0  # below the close: repaired to max(o, c)
+        bars, meta = tc.parse_yahoo_chart(payload)
+        self.assertEqual(len(bars), 2)
+        self.assertEqual(bars[1].high, 102)
+        self.assertEqual(meta["symbol"], "TEST")
+
+    def test_parse_error_payload(self):
+        with self.assertRaises(tc.FetchError):
+            tc.parse_yahoo_chart({"chart": {"result": None, "error": {"code": "Not Found", "description": "No data"}}})
+
+    def test_yahoo_symbol(self):
+        self.assertEqual(tc.yahoo_symbol("brk.b"), "BRK-B")
+
+
+class IndicatorTests(unittest.TestCase):
+    def test_sma_ema(self):
+        self.assertEqual(tc.sma([1, 2, 3, 4], 2), [None, 1.5, 2.5, 3.5])
+        e = tc.ema([1, 2, 3, 4, 5], 3)
+        self.assertEqual(e[:2], [None, None])
+        self.assertAlmostEqual(e[2], 2.0)
+        self.assertAlmostEqual(e[3], 3.0)
+
+    def test_rsi_bounds(self):
+        up = tc.rsi([float(i) for i in range(30)])
+        self.assertEqual(up[-1], 100.0)
+        mixed = tc.rsi([10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10])
+        self.assertTrue(40 < mixed[-1] < 60)
+
+    def test_atr_and_vwap(self):
+        bars = bars_from_closes("2026-10-30", [10] * 20, wick=0.5)
+        self.assertAlmostEqual(tc.atr(bars, 14), 1.0)
+        self.assertIsNone(tc.atr(bars[:5], 14))
+        v = tc.vwap(bars_from_closes("2026-10-30", [10, 20]))
+        self.assertAlmostEqual(v[0], 10.0)
+        self.assertAlmostEqual(v[1], (10 + (20 + 10 + 20) / 3) / 2)
+
+
+class SymbolTests(unittest.TestCase):
+    NASDAQ = (
+        "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares\n"
+        "AAPL|Apple Inc. - Common Stock|Q|N|N|100|N|N\n"
+        "QQQ|Invesco QQQ Trust, Series 1|G|N|N|100|Y|N\n"
+        "ABCDW|ABCD Corp - Warrants|S|N|N|100|N|N\n"
+        "ZXZZT|NASDAQ TEST STOCK|G|Y|N|100|N|N\n"
+        "File Creation Time: 1030202606:01|||||||\n")
+    OTHER = (
+        "ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol\n"
+        "BRK.B|Berkshire Hathaway Inc. Class B|N|BRK.B|N|100|N|BRK.B\n"
+        "ABR$D|Arbor Realty Trust 6.375% Series D Preferred Stock|N|ABRpD|N|100|N|ABR-D\n"
+        "BABA|Alibaba Group Holding Limited American Depositary Shares|N|BABA|N|100|N|BABA\n"
+        "SPY|SPDR S&P 500 ETF Trust|P|SPY|Y|100|N|SPY\n"
+        "File Creation Time: 1030202606:01|||||||\n")
+
+    def test_universe_filters(self):
+        with fake_http({"nasdaqlisted": self.NASDAQ, "otherlisted": self.OTHER}):
+            syms = [r["symbol"] for r in tc.us_symbols(ttl=0)]
+            self.assertEqual(syms, ["AAPL", "BRK.B", "BABA"])
+            with_etfs = [r["symbol"] for r in tc.us_symbols(include_etfs=True, ttl=0)]
+            self.assertEqual(with_etfs, ["AAPL", "QQQ", "BRK.B", "BABA", "SPY"])
+
+
+class SecTests(TempHomeTestCase):
+    def test_recent_filings(self):
+        tickers = {"0": {"cik_str": 1318605, "ticker": "TSLA", "title": "Tesla, Inc."},
+                   "1": {"cik_str": 1067983, "ticker": "BRK-B", "title": "BERKSHIRE HATHAWAY INC"}}
+        subs = {"filings": {"recent": {
+            "accessionNumber": ["0001-26-000002", "0001-26-000001"],
+            "filingDate": ["2026-10-22", "2026-09-01"],
+            "acceptanceDateTime": ["2026-10-22T16:05:00.000Z", "2026-09-01T08:00:00.000Z"],
+            "form": ["8-K", "4"],
+            "items": ["2.02,9.01", ""],
+            "primaryDocument": ["tsla-8k.htm", "form4.xml"],
+            "primaryDocDescription": ["8-K", "4"]}}}
+        with fake_http({"company_tickers.json": tickers, "CIK0001318605.json": subs}):
+            self.assertEqual(tc.sec_cik("brk.b"), "0001067983")
+            f = tc.sec_recent_filings("TSLA", forms={"8-K"})
+            self.assertEqual(len(f), 1)
+            self.assertEqual(f[0]["items"], ["2.02", "9.01"])
+            self.assertEqual(f[0]["url"], "https://www.sec.gov/Archives/edgar/data/1318605/000126000002/tsla-8k.htm")
+            self.assertEqual(len(tc.sec_recent_filings("TSLA", since="2026-10-01")), 1)
+            with self.assertRaises(tc.FetchError):
+                tc.sec_recent_filings("NOPE")
+
+    def test_sec_user_agent_uses_contact(self):
+        self.assertIn("personal research", tc._user_agent("https://data.sec.gov/x"))
+        tc.save_settings({"contact_email": "me@example.com"})
+        self.assertTrue(tc._user_agent("https://www.sec.gov/x").endswith("me@example.com"))
+        self.assertEqual(tc._user_agent("https://query1.finance.yahoo.com/x"), tc.BROWSER_UA)
+
+
+class StateTests(TempHomeTestCase):
+    NOW = "2026-10-30T10:15"
+
+    def test_settings_roundtrip_and_validation(self):
+        s = tc.save_settings({"account_size": "30000", "max_trades_per_day": "4"})
+        self.assertEqual(s["account_size"], 30000.0)
+        self.assertEqual(s["max_trades_per_day"], 4)
+        with self.assertRaises(ValueError):
+            tc.save_settings({"nope": 1})
+        with self.assertRaises(ValueError):
+            tc.save_settings({"account_size": -5})
+
+    def test_corrupt_state_raises_state_error(self):
+        (self.home / "ledger.json").write_text("{not json")
+        with self.assertRaises(tc.StateError):
+            tc.load_ledger()
+
+    def test_plans(self):
+        p = tc.save_plan({"symbol": "tsla", "side": "long", "entry": 364.18, "stop": 358.32, "target": 370.04})
+        self.assertEqual(p["symbol"], "TSLA")
+        tc.save_plan({"symbol": "TSLA", "side": "long", "entry": 364.18, "stop": 358.32, "setup": "orb"})
+        loaded = tc.load_plan("TSLA")
+        self.assertEqual(loaded["target"], 370.04)  # merged, not replaced
+        self.assertEqual(loaded["setup"], "orb")
+        self.assertEqual(len(tc.list_plans()), 1)
+        with self.assertRaises(ValueError):
+            tc.save_plan({"symbol": "TSLA", "side": "long", "entry": 10, "stop": 11})
+
+    def test_validate_levels_and_rr(self):
+        self.assertEqual(tc.validate_levels("long", 364.18, 358.32, 370.04), [])
+        self.assertEqual(tc.validate_levels("short", 100, 102, 96), [])
+        self.assertTrue(tc.validate_levels("short", 100, 98, 96))
+        self.assertTrue(tc.validate_levels("sideways", 100, 98, 96))
+        self.assertAlmostEqual(tc.reward_risk("long", 364.18, 358.32, 370.04), 1.0, places=6)
+        self.assertAlmostEqual(tc.reward_risk("short", 100, 102, 96), 2.0)
+
+    def test_new_id(self):
+        self.assertEqual(tc.new_id("TKT", []), "TKT-20261030-001")
+        self.assertEqual(tc.new_id("TKT", ["TKT-20261030-001", "TKT-20261030-007", "TKT-20261029-099"]), "TKT-20261030-008")
+
+
+class SizingAndBudgetTests(TempHomeTestCase):
+    NOW = "2026-10-30T11:00"
+
+    def test_video_example_buys_8_tsla(self):
+        r = tc.position_size(364.18, 358.32)   # defaults: $25k account, 0.2% risk = $50
+        self.assertEqual(r["shares"], 8)
+        self.assertEqual(r["capped_by"], "risk")
+        self.assertAlmostEqual(r["risk_used"], 46.88)
+
+    def test_position_cap(self):
+        r = tc.position_size(100, 99.9, risk_dollars=1000)  # 10,000 shares by risk, capped at 25% of 25k
+        self.assertEqual(r["shares"], 62)
+        self.assertEqual(r["capped_by"], "max_position_pct")
+        with self.assertRaises(ValueError):
+            tc.position_size(100, 100)
+
+    def _trade(self, tid, pnl=None, status="closed", opened="2026-10-30T09:45:00-04:00",
+               closed="2026-10-30T10:00:00-04:00", entry=100.0, stop=99.0, qty=50, side="long"):
+        t = {"id": tid, "symbol": "X", "side": side, "qty": qty, "entry_price": entry, "stop": stop,
+             "target": 102.0, "opened_at": opened, "status": status}
+        if status == "closed":
+            t.update(pnl=pnl, closed_at=closed, exit_price=entry + pnl / qty)
+        return t
+
+    def test_day_summary_and_budget(self):
+        led = {"tickets": [], "trades": [
+            self._trade("a", pnl=-50, closed="2026-10-30T09:50:00-04:00"),
+            self._trade("b", pnl=-50, closed="2026-10-30T09:55:00-04:00"),
+            self._trade("c", status="open"),
+            self._trade("old", pnl=-500, opened="2026-10-29T10:00:00-04:00", closed="2026-10-29T11:00:00-04:00"),
+        ]}
+        s = tc.day_summary(led)
+        self.assertEqual(s["realized_pnl"], -100)
+        self.assertEqual(s["open_risk"], 50)
+        self.assertEqual(s["trades_today"], 3)
+        self.assertEqual(s["loss_streak"], 2)
+        ok = tc.budget_check(0, ledger=led)
+        self.assertTrue(ok["ok"])
+        self.assertEqual(ok["loss_budget_left"], 0)
+        blocked = tc.budget_check(10, ledger=led)
+        self.assertFalse(blocked["ok"])
+        self.assertTrue(any("daily max loss" in r for r in blocked["reasons"]))
+
+    def test_tilt_guard(self):
+        led = {"tickets": [], "trades": [self._trade(str(i), pnl=-1, closed=f"2026-10-30T10:0{i}:00-04:00") for i in range(3)]}
+        r = tc.budget_check(5, ledger=led)
+        self.assertFalse(r["ok"])
+        self.assertTrue(any("tilt" in x for x in r["reasons"]))
+
+
+class HttpTests(TempHomeTestCase):
+    def test_fixture_mode_and_fetch_bars(self):
+        bars = random_walk_history("2026-10-30", 2)
+        fx = self.home / "fx"
+        write_fixture(fx, yahoo_chart_url("TSLA", "5m", "60d"), yahoo_payload(bars, "TSLA"))
+        with mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(fx)}):
+            got, meta = tc.fetch_bars("TSLA")
+            self.assertEqual(len(got), len(bars))
+            self.assertEqual(meta["symbol"], "TSLA")
+            with self.assertRaises(tc.FetchError):
+                tc.fetch_bars("NVDA")
+
+    def test_cache(self):
+        calls = []
+
+        def fake(url, **kw):
+            calls.append(url)
+            return b'{"a": 1}'
+        os.environ.pop("DAYTRADER_NO_CACHE")
+        with mock.patch.object(tc, "http_get", side_effect=fake):
+            self.assertEqual(tc.get_json("https://example.com/x", ttl=60), {"a": 1})
+            self.assertEqual(tc.get_json("https://example.com/x", ttl=60), {"a": 1})
+            tc.get_json("https://example.com/x", ttl=0)
+        self.assertEqual(len(calls), 2)
+
+    def test_non_json_is_fetch_error(self):
+        with fake_http({"example.com": "<html>blocked</html>"}):
+            with self.assertRaises(tc.FetchError):
+                tc.get_json("https://example.com/y")
+
+
+class OutputTests(unittest.TestCase):
+    def test_formatters(self):
+        self.assertEqual(tc.fmt_money(-1234.5), "-$1,234.50")
+        self.assertEqual(tc.fmt_money(5, signed=True), "+$5.00")
+        self.assertEqual(tc.fmt_pct(29.44), "29.4%")
+        self.assertEqual(tc.fmt_big(5_900_000), "5.90M")
+        t = tc.table([["TSLA", "364.18"], ["F", "9.50"]], ["sym", "price"])
+        self.assertIn("TSLA  364.18", t)
+        self.assertIn("F       9.50", t)
+
+
+class VendoredCopiesTests(unittest.TestCase):
+    def test_every_skill_ships_identical_common(self):
+        canonical = (ROOT / "shared" / "trader_common.py").read_bytes()
+        skills = [p for p in SKILLS.iterdir() if p.is_dir()]
+        self.assertEqual(len(skills), 11, sorted(p.name for p in skills))
+        for s in skills:
+            copy = s / "scripts" / "trader_common.py"
+            self.assertTrue(copy.exists(), f"{copy} missing - run tools/sync_common.py")
+            self.assertEqual(copy.read_bytes(), canonical, f"{copy} is stale - run tools/sync_common.py")
+
+
+if __name__ == "__main__":
+    unittest.main()

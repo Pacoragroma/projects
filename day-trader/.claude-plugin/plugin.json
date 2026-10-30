@@ -1,0 +1,7 @@
+{
+  "name": "day-trader",
+  "version": "1.0.0",
+  "description": "11 Claude skills for day trading: scan thousands of charts, track breaking news, time every entry and exit, and replay every outcome before you risk a dollar. Paper trading only.",
+  "license": "MIT",
+  "keywords": ["day-trading", "stock-market", "backtesting", "paper-trading", "claude-skills"]
+}
