@@ -25,14 +25,18 @@ jobs:
     defaults:
       run:
         working-directory: day-trader
+    env:
+      # actions/setup-python has no 3.9 build for current Ubuntu runner images; uv's
+      # standalone interpreters still cover the pack's oldest supported Python.
+      PY: uv run --no-project --python ${{ matrix.python-version }} python
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
       - name: Vendored trader_common.py copies match shared/
-        run: python tools/sync_common.py --check
+        run: $PY tools/sync_common.py --check
       - name: Unit tests (offline, standard library only)
-        run: python -m unittest discover -s tests
+        run: $PY -m unittest discover -s tests
       - name: SKILL.md frontmatter
-        run: python tools/package_skills.py --check
+        run: $PY tools/package_skills.py --check
