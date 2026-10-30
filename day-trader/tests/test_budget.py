@@ -456,6 +456,15 @@ class MarkTests(TempHomeTestCase):
         with self.assertRaises(ValueError):
             run_main("status", "--mark", "--date", "2026-10-29")
 
+    def test_through_a_stop_past_the_entry_claims_no_planned_risk(self):
+        tc.save_ledger(ledger(trade("L", status="open", symbol="TSLA", entry=100.0, stop=103.0, qty=10)))
+        with fake_bars({("TSLA", "1m"): bars_from_closes(DAY, [102.5], minutes=1, start="10:58")}):
+            r = json.loads(run_main("status", "--mark", "--json")[1])
+        msg = [c for c in r["cautions"] if "through its stop" in c]
+        self.assertEqual(len(msg), 1, r["cautions"])
+        self.assertIn("risks no loss", msg[0])
+        self.assertNotIn("$0.00 planned risk", msg[0])
+
 
 class CliTests(TempHomeTestCase):
     NOW = f"{DAY}T11:05"
@@ -688,6 +697,71 @@ class ReviewRegressionTests(TempHomeTestCase):
         self.assertIn("Do not open a ticket", out)
 
 
+class WorkingOrderHistoryTests(TempHomeTestCase):
+    """Regression: a confirmed-but-unfilled limit order was a trade in `status` but `history` said
+    "No paper trades in this window"."""
+    NOW = f"{DAY}T11:00"
+
+    @staticmethod
+    def working(tid="TKT-20261030-001", confirmed=f"{DAY}T10:22:00-04:00"):
+        return {"id": tid, "symbol": "TSLA", "side": "long", "qty": 8, "type": "limit", "entry": 364.18,
+                "stop": 358.32, "target": 370.04, "status": "working", "confirmed_at": confirmed}
+
+    def test_todays_working_order_counts_as_a_trade_in_both(self):
+        tc.save_ledger(ledger(tickets=[self.working()]))
+        st = json.loads(run_main("status", "--json")[1])
+        self.assertEqual(st["trades_today"], 1)
+        h = json.loads(run_main("history", "--json")[1])
+        self.assertEqual(len(h["rows"]), 1)
+        row = h["rows"][0]
+        self.assertEqual((row["date"], row["trades"], row["working"], row["still_open"], row["closed"]),
+                         (DAY, st["trades_today"], 1, 0, 0))
+        self.assertEqual(row["risked"], st["risked_today"])
+        self.assertEqual((h["totals"]["trades"], h["totals"]["working"]), (1, 1))
+        text = run_main("history")[1]
+        self.assertNotIn("No paper trades", text)
+        self.assertIn("1 working (not filled)", text)
+        self.assertIn("Total: 1 trades (1 working, not filled)", text)
+
+    def test_working_order_beside_a_filled_trade(self):
+        tc.save_ledger(ledger(trade("TRADE-20261030-001", pnl=-40, opened=f"{DAY}T09:45:00-04:00"),
+                              tickets=[self.working("TKT-20261030-002")]))
+        st = json.loads(run_main("status", "--json")[1])
+        row = json.loads(run_main("history", "--json")[1])["rows"][0]
+        self.assertEqual((row["trades"], row["working"], row["losses"]), (2, 1, 1))
+        self.assertEqual(row["trades"], st["trades_today"])
+
+    def test_a_past_days_unsynced_working_order_matches_status_date(self):
+        old = self.working("TKT-20261029-001", confirmed="2026-10-29T15:30:00-04:00")
+        tc.save_ledger(ledger(tickets=[old]))
+        past = json.loads(run_main("status", "--date", "2026-10-29", "--json")[1])
+        row = json.loads(run_main("history", "--json")[1])["rows"][0]
+        self.assertEqual((row["date"], row["trades"], row["working"], row["unsynced_working"]),
+                         ("2026-10-29", past["trades_today"], 0, 1))
+        self.assertIn("1 working never synced (run broker sync)", run_main("history")[1])
+
+
+class DirectionalRiskTests(unittest.TestCase):
+    def test_stop_past_the_entry_risks_nothing_and_rows_add_up(self):
+        # tc.trade_initial_risk is directional: 0 once a stop has moved past the entry. The position rows
+        # used |entry - stop| and so did not add up to the open-risk total.
+        locked = trade("L", status="open", entry=100.0, stop=103.0, qty=10)
+        short = trade("S", status="open", side="short", entry=50.0, stop=49.0, qty=10, symbol="Y")
+        live = trade("R", status="open", entry=100.0, stop=99.0, qty=20, symbol="Z")
+        s = status_of(ledger(locked, short, live))
+        self.assertEqual([p["risk"] for p in s["positions"]], [0.0, 0.0, 20.0])
+        self.assertEqual(s["open_risk"]["total"], 20.0)
+        self.assertEqual(s["open_risk"]["positions"], sum(p["risk"] for p in s["positions"]))
+        self.assertEqual(s["loss_budget"]["used"], 20.0)
+        rows = bud.mark_positions(s["positions"][:1], {"X": 102.0})
+        self.assertEqual((rows[0]["unrealized"], rows[0]["r_now"]), (20.0, None))   # no risk -> no R
+
+    def test_working_ticket_needs_a_side(self):
+        bad = {"id": "TKT-X", "symbol": "AMZN", "qty": 10, "entry": 220.0, "stop": 218.0, "status": "working"}
+        with self.assertRaises(tc.StateError):
+            bud.normalize_ledger(ledger(tickets=[bad]))
+
+
 class SkillDocTests(unittest.TestCase):
     def test_every_documented_command_parses(self):
         text = SKILL_MD.read_text(encoding="utf-8")
@@ -711,6 +785,14 @@ class SkillDocTests(unittest.TestCase):
         desc = text.split("---")[1]
         self.assertIn("Day-trading desk:", desc)
         self.assertLessEqual(len(" ".join(desc.split("description:", 1)[1].split())), 1024)
+        self.assertIn('"how am I doing today?"', " ".join(desc.split()))         # routing: today = budget
+        reading = text.split("## Reading the output", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("analyst.py review", reading)                            # the longer-term picture
+        rules = " ".join(text.split("## Rules", 1)[1].split())
+        for phrase in ("may be gone next conversation", "an empty ledger reads OPEN FOR TRADING",
+                       "`ledger.json` and `settings.json` as downloads"):    # sandbox: state can vanish
+            self.assertIn(phrase, rules)
+        self.assertLessEqual(len(text.splitlines()), 150)
 
 
 if __name__ == "__main__":

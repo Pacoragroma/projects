@@ -161,6 +161,44 @@ def levels_changed(plan: Optional[Dict[str, Any]], lv: Dict[str, Any]) -> bool:
                 and _same(_num(plan.get("target")), lv["target"]))
 
 
+def tm_levels_match(tm: Dict[str, Any], lv: Dict[str, Any]) -> bool:
+    """True when the time machine's saved odds were computed for exactly these side/levels."""
+    return (tm.get("side") in (None, lv["side"]) and _num(tm.get("entry")) is not None
+            and _same(_num(tm.get("entry")), lv["entry"]) and _same(_num(tm.get("stop")), lv["stop"])
+            and _same(_num(tm.get("target")), lv["target"]))
+
+
+def tm_display(tm: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """Time-machine odds as the time machine prints them: its saved one-decimal `display_pct`
+    (largest-remainder rounded, adds up to 100.0), else the raw *_pct values (shown with :.1f)."""
+    disp = tm.get("display_pct") if isinstance(tm.get("display_pct"), dict) else {}
+    out: Dict[str, Optional[float]] = {}
+    for key in ("target_first", "stop_first", "open_at_close"):
+        for v in (disp.get(key), tm.get(f"{key}_pct")):
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+                out[key] = float(v)
+                break
+        else:
+            out[key] = None
+    return out
+
+
+def _price_arg(x: float) -> str:
+    return f"{x:.2f}" if abs(x) >= 1 else f"{x:.4f}"
+
+
+def untested_note(sym: str, lv: Dict[str, Any], in_plan: bool, stale: bool = False) -> str:
+    """The note for levels the time machine has not tested (no odds, or odds for other levels).
+    `in_plan`: the saved plan holds these levels, so the time machine can read them from it."""
+    if lv["target"] is None:
+        return "not tested by the time machine for these levels (it needs a target to measure the odds)"
+    cmd = (f"time_machine.py {sym} --save" if in_plan else
+           f"time_machine.py {sym} --entry {_price_arg(lv['entry'])} --stop {_price_arg(lv['stop'])} "
+           f"--target {_price_arg(lv['target'])} --save")
+    return (f"not tested by the time machine for these levels (run {cmd})"
+            + (" - the plan's odds were for other levels" if stale else ""))
+
+
 def size_position(side: str, entry: float, stop: float, target: Optional[float] = None,
                   settings: Optional[Dict[str, Any]] = None, account: Optional[float] = None,
                   risk_pct: Optional[float] = None, risk_dollars: Optional[float] = None,
@@ -669,12 +707,15 @@ def cmd_size(args: argparse.Namespace) -> int:
         if n:
             notes.append(n)
     tm = (plan or {}).get("time_machine")
-    if isinstance(tm, dict) and plan and not levels_changed(plan, lv):
-        try:
-            notes.append(f"time-machine: target first {float(tm['target_first_pct']):.1f}% / stop first "
-                         f"{float(tm['stop_first_pct']):.1f}% - {tm.get('verdict', '')}".rstrip(" -"))
-        except (KeyError, TypeError, ValueError):
-            pass
+    tm_ok = isinstance(tm, dict) and tm_levels_match(tm, lv)
+    odds = tm_display(tm) if tm_ok else None  # type: ignore[arg-type]
+    if odds and odds["target_first"] is not None and odds["stop_first"] is not None:
+        notes.append(f"time-machine: target first {odds['target_first']:.1f}% / stop first "
+                     f"{odds['stop_first']:.1f}% - {tm.get('verdict') or ''}".rstrip(" -"))  # type: ignore[union-attr]
+    elif sym:
+        in_plan = bool(plan) and not levels_changed(plan, lv)
+        notes.append(untested_note(sym, lv, in_plan or (args.save and sz["shares"] > 0),
+                                   isinstance(tm, dict) and not tm_ok))
     notes.append("risk assumes the stop fills at its price; gaps, halts and slippage can lose more")
 
     res: Dict[str, Any] = {"symbol": sym}
@@ -769,8 +810,8 @@ def cmd_show(args: argparse.Namespace) -> int:
     positions = []
     for t in items["open"]:
         try:
-            risk = round(tc.trade_initial_risk(t), 2)
-        except (KeyError, TypeError, ValueError):
+            risk = round(tc.trade_initial_risk(t), 2)   # directional, as the budget counts it
+        except (KeyError, TypeError, ValueError, tc.StateError):
             risk = None
         positions.append({"id": t.get("id"), "symbol": t.get("symbol"), "side": t.get("side"),
                           "qty": t.get("qty"), "entry_price": _num(t.get("entry_price")),

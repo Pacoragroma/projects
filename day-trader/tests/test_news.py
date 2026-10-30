@@ -440,6 +440,30 @@ class CliInputTests(unittest.TestCase):
         self.assertEqual((a.symbols, a.since, a.tags, a.limit, a.new_only, a.json),
                          (["TSLA", "NVDA"], "90m", "EARNINGS,DEAL", 5, True, True))
 
+    def test_every_skill_md_command_parses(self):
+        import re
+        import shlex
+        text = (helpers.SKILLS / "news" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("Scripts live in this skill's `scripts/` folder. Run them from the skill's folder "
+                      "(`python3 scripts/<tool>.py ...`) or by absolute path. Python 3.9+, standard library only.", text)
+        self.assertIn("DAYTRADER_CONTACT", text)        # what to suggest when SEC answers 403
+        cmds = re.findall(r"python3 scripts/news\.py ([^\n#`]*)", text)
+        self.assertGreaterEqual(len(cmds), 8)
+        for c in cmds:
+            with self.subTest(cmd=c):
+                a = news.build_parser().parse_intermixed_args(shlex.split(c))
+                news.parse_symbols(a.symbols)
+                news.parse_tags(a.tags)
+                news.parse_since(a.since, now_dt())
+
+    def test_usage_errors_exit_1(self):
+        from contextlib import redirect_stderr
+        import io
+        for argv in (["TSLA", "--live"], []):
+            with self.assertRaises(SystemExit) as cm, redirect_stderr(io.StringIO()):
+                news.build_parser().parse_intermixed_args(argv)
+            self.assertEqual(cm.exception.code, 1, argv)
+
 
 class GatherTests(TempHomeTestCase):
     NOW = NOW
@@ -512,6 +536,61 @@ class GatherTests(TempHomeTestCase):
             self.assertEqual(len(subs), 2)
         self.assertEqual(rows[0]["status"], "ok")
         self.assertEqual([i["title"] for i in rows[0]["items"]], ["8-K: Results of operations (earnings)"])
+
+    def test_sec_403_says_to_set_a_contact_email(self):
+        # SEC answers 403 to automated clients without a contact address in the User-Agent. The
+        # shared library's hint must reach the user's warning line, and the address must be sent.
+        import urllib.error
+        from unittest import mock
+
+        routes = self.routes()
+        agents = []
+
+        class Resp:
+            headers = {}
+
+            def __init__(self, body):
+                self.body = body if isinstance(body, bytes) else (
+                    body.encode("utf-8") if isinstance(body, str) else json.dumps(body).encode("utf-8"))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return self.body
+
+        def opener(req, timeout=None):
+            url = req.full_url
+            if "sec.gov" in url:
+                agents.append(req.get_header("User-agent"))
+                raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+            for key, body in routes.items():
+                if key in url:
+                    return Resp(body)
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+        now = now_dt()
+        with mock.patch("urllib.request.urlopen", side_effect=opener):
+            raw, rows = news.gather(["TSLA"], now - timedelta(hours=24), now)
+        self.assertTrue(raw)
+        _, warnings = news.source_summary(rows)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertTrue(warnings[0].startswith("SEC EDGAR failed for TSLA: HTTP 403 for https://www.sec.gov/"),
+                        warnings[0])
+        self.assertIn("SEC asks for a contact email in the User-Agent: set DAYTRADER_CONTACT=", warnings[0])
+        self.assertNotIn("(personal research)", warnings[0])
+        self.assertIn("(personal research)", agents[0])
+        # With an address set it is sent, and a 403 is then a plain access problem.
+        with mock.patch.dict(os.environ, {"DAYTRADER_CONTACT": "me@example.com"}), \
+                mock.patch("urllib.request.urlopen", side_effect=opener):
+            _, rows = news.gather(["TSLA"], now - timedelta(hours=24), now)
+        _, warnings = news.source_summary(rows)
+        self.assertIn("me@example.com", agents[-1])
+        self.assertNotIn("DAYTRADER_CONTACT", warnings[0])
+        self.assertIn("access denied", warnings[0])
 
     def test_render_text(self):
         now = now_dt()

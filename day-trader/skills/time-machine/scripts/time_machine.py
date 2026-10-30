@@ -55,6 +55,7 @@ AMBIGUOUS_NOTE_PCT = 5.0       # note when this share of replays touched both le
 EPS = 1e-12                    # float tolerance so a bar that exactly touches a level counts
 TREND_MATERIAL_R = 0.1         # trend-removed replays this far off in expected R -> say so
 TREND_MATERIAL_PCT = 5.0       # ... or this many points off in target-first %
+TREND_EXPLAINS_R = 0.05        # drift to the median exit at least this many R can explain that gap
 
 Shape = Tuple[float, float, float]           # (close, high, low) relative to the previous close
 Library = List[List[Optional[Shape]]]        # one row of SLOTS shapes per past session
@@ -172,6 +173,53 @@ def library_trend(library: Library, start_slot: int, end_slot: int) -> Dict[str,
     return {"sessions": n, "avg_move_pct": round(mean * 100.0, 3), "t_stat": round(t, 2)}
 
 
+def slot_drift(library: Library, start_slot: int, end_slot: int) -> float:
+    """Cumulative average drift from the start of `start_slot` to the end of `end_slot`, as a
+    fraction: the product of each slot's mean close/prev-close across the past sessions, minus 1.
+
+    This is exactly what detrend_library takes out of the replays over those bars.
+    """
+    g = 1.0
+    for k in range(start_slot, end_slot + 1):
+        closes = [row[k][0] for row in library if k < len(row) and row[k] is not None]
+        if closes:
+            g *= sum(closes) / len(closes)
+    return g - 1.0
+
+
+def trend_check(library: Library, start_slot: int, end_slot: int, side: str, entry: float, stop: float,
+                median_minutes: Optional[float]) -> Dict[str, Any]:
+    """How much drift the replays inherit, measured over the horizon that decides the trade.
+
+    Most replays end at the stop or the target, so the drift that tilts the odds is the one between
+    the entry and the typical exit: the horizon runs from the start slot to the median time to
+    resolution of the trend-included replays (the whole window if no replay resolved). drift_pct
+    is the cumulative per-slot mean drift over it (what the trend-removed replays take out),
+    drift_r the same move in R for this trade (positive = in its favour), horizon_t_stat the
+    t-statistic of the past sessions' own moves over it. avg_move_pct / t_stat cover the whole
+    window, start to close.
+    """
+    whole = library_trend(library, start_slot, end_slot)
+    if median_minutes:
+        h_end = min(end_slot, start_slot + max(1, int(math.ceil(median_minutes / BAR_MINUTES))) - 1)
+        basis = "median_resolution"
+    else:
+        h_end, basis = end_slot, "window"
+    near = library_trend(library, start_slot, h_end)
+    drift = slot_drift(library, start_slot, h_end)
+    risk_frac = abs(entry - stop) / entry
+    sign = 1.0 if side == "long" else -1.0
+    out = dict(whole)
+    out.update({
+        "horizon": {"start": slot_time(start_slot), "end": slot_time(h_end + 1), "end_slot": h_end,
+                    "minutes": (h_end - start_slot + 1) * BAR_MINUTES, "basis": basis},
+        "drift_pct": round(drift * 100.0, 3),
+        "drift_r": round(sign * drift / risk_frac, 3) if risk_frac > 0 else None,
+        "horizon_avg_move_pct": near["avg_move_pct"], "horizon_t_stat": near["t_stat"],
+    })
+    return out
+
+
 def split_pct(counts: Sequence[int], total: int, digits: int = 2) -> List[float]:
     """Percentages of `total` rounded to `digits` that add up to exactly 100 (largest remainder)."""
     if total <= 0:
@@ -182,6 +230,13 @@ def split_pct(counts: Sequence[int], total: int, digits: int = 2) -> List[float]
     for i in sorted(range(len(counts)), key=lambda i: rems[i], reverse=True)[:scale - sum(floors)]:
         floors[i] += 1
     return [f / 10 ** digits for f in floors]
+
+
+def display_pct(counts: Mapping[str, int], total: int) -> Dict[str, float]:
+    """The three odds with one decimal, exactly as the card prints them (largest remainder, so they
+    add up to 100.0). Saved in the plan so risk, broker and analyst quote the same numbers."""
+    pt, ps, po = split_pct([counts["target"], counts["stop"], counts["open"]], total, 1)
+    return {"target_first": pt, "stop_first": ps, "open_at_close": po}
 
 
 def _se_pct(count: int, n: int) -> float:
@@ -346,6 +401,7 @@ def simulate(library: Library, start_slot: int, entry: float, stop: float, targe
         "sessions_at_start": len(eligible[start_slot]),
         "counts": {"target": n_target, "stop": n_stop, "open": n_open, "ambiguous": n_amb},
         "target_first_pct": pt, "stop_first_pct": ps, "open_at_close_pct": po,
+        "display_pct": display_pct({"target": n_target, "stop": n_stop, "open": n_open}, n_paths),
         "ambiguous_pct": split_pct([n_amb, n_paths - n_amb], n_paths)[0],
         "target_first_se": _se_pct(n_target, n_paths), "stop_first_se": _se_pct(n_stop, n_paths),
         "open_at_close_se": _se_pct(n_open, n_paths),
@@ -465,19 +521,54 @@ def verdict_notes(result: Mapping[str, Any]) -> List[str]:
         flips = alt["verdict"] != main_v
         material = (abs(float(alt["expected_r"]) - er) >= TREND_MATERIAL_R
                     or abs(alt["target_first_pct"] - result["target_first_pct"]) >= TREND_MATERIAL_PCT)
-        move = (f"past sessions moved {trend['avg_move_pct']:+.2f}% on average over this window, "
-                f"t={trend['t_stat']:.1f}")
-        odds = (f"{alt['target_first_pct']:.1f}% target / {alt['stop_first_pct']:.1f}% stop, "
-                f"{alt['expected_r']:+.2f}R, {alt['verdict']}")
-        if trend.get("detrended") and (flips or material):
-            out.append(f"with the recent trend left in ({move}) the replays give {odds}")
-        elif flips:
-            out.append(f"this verdict leans on the stock's recent trend ({move}); with the trend removed the "
-                       f"replays give {odds} - short-term trends often fade")
-        elif material:
-            out.append(f"part of this result is the stock's recent trend ({move}); with the trend removed the "
-                       f"replays give {odds} - short-term trends often fade")
+        if flips or material:
+            out.append(_trend_note(result, trend, alt, flips))
     return out
+
+
+def _drift_words(trend: Mapping[str, Any], side: str) -> Tuple[str, bool]:
+    """('+0.11% on average between 09:30 and 10:10, the median time to the stop or target: 0.23R in
+    favour of this long (t=1.5, within noise)', whether that drift is big enough to matter)."""
+    h = trend.get("horizon") or {}
+    drift_pct = float(trend.get("drift_pct", trend.get("avg_move_pct", 0.0)))
+    t = float(trend.get("horizon_t_stat", trend.get("t_stat", 0.0)))
+    drift_r = trend.get("drift_r")
+    span = (f" between {h['start']} and {h['end']}" if h.get("start") else " over this window") + (
+        ", the median time to the stop or target" if h.get("basis") == "median_resolution" else "")
+    size = "" if drift_r is None else \
+        f": {abs(drift_r):.2f}R {'in favour of' if drift_r >= 0 else 'against'} this {side}"
+    noise = ", within noise" if abs(t) < 2 else ""
+    return (f"{drift_pct:+.2f}% on average{span}{size} (t={t:.1f}{noise})",
+            drift_r is not None and abs(drift_r) >= TREND_EXPLAINS_R)
+
+
+def _trend_note(result: Mapping[str, Any], trend: Mapping[str, Any], alt: Mapping[str, Any], flips: bool) -> str:
+    """Why the trend-included and trend-removed replays differ - worded so it never contradicts itself.
+
+    The drift is measured from the entry to the median exit (see trend_check). It is named as the
+    cause only when it is big enough (>= 0.05R) and points the way the two answers differ;
+    otherwise the note says the odds are sensitive to small slot-by-slot drifts.
+    """
+    odds = (f"{alt['target_first_pct']:.1f}% target / {alt['stop_first_pct']:.1f}% stop, "
+            f"{alt['expected_r']:+.2f}R, {alt['verdict']}")
+    words, big = _drift_words(trend, str(result.get("side") or "trade"))
+    detrended = bool(trend.get("detrended"))
+    gain = float(result["expected_r"]) - float(alt["expected_r"])
+    if detrended:
+        gain = -gain                     # always: trend-included minus trend-removed expected R
+    explains = big and float(trend.get("drift_r") or 0.0) * gain > 0
+    if detrended:
+        if explains:
+            return f"with the time-of-day drift left in, the replays give {odds}; that drift is {words}"
+        return (f"with the past sessions' small time-of-day drifts left in, the replays give {odds} - the odds "
+                f"are sensitive to them, though they add up to only {words}")
+    if explains:
+        lead = ("this verdict leans on a time-of-day drift in the past sessions" if flips
+                else "part of this result is a time-of-day drift in the past sessions")
+        return f"{lead}, {words}; with the drift removed the replays give {odds} - short-term drifts often fade"
+    lead = "this verdict" if flips else "this result"
+    return (f"{lead} is sensitive to small time-of-day drifts in the past sessions, though they add up to only "
+            f"{words}; with them removed the replays give {odds}")
 
 
 def session_end_minute(meta: Mapping[str, Any], day: str) -> Optional[int]:
@@ -715,10 +806,10 @@ def render_svg(res: Mapping[str, Any], samples: Sequence[Mapping[str, Any]],
     out.append(text(rx0, 84, f"{res['paths']:,}", 30, "bold"))
     out.append(text(rx0, 102, f"REPLAYS FROM {res['sessions_used']} PAST SESSIONS", 10, "bold", c["muted"],
                     "start", "Menlo, Consolas, monospace"))
-    cnt = res["counts"]
-    pcts = split_pct([cnt["target"], cnt["stop"], cnt["open"]], res["paths"], 1)   # same as the text
-    rows = (("HIT TARGET FIRST", pcts[0], c["target"]), ("HIT STOP FIRST", pcts[1], c["stop"]),
-            ("OPEN AT CLOSE", pcts[2], c["open"]))
+    shown = res.get("display_pct") or display_pct(res["counts"], res["paths"])   # same as the text
+    rows = (("HIT TARGET FIRST", shown["target_first"], c["target"]),
+            ("HIT STOP FIRST", shown["stop_first"], c["stop"]),
+            ("OPEN AT CLOSE", shown["open_at_close"], c["open"]))
     for i, (label, pct, col) in enumerate(rows):
         ty = 138 + i * 46
         out.append(text(rx0, ty, label, 11, "bold", c["ink"], "start", "Menlo, Consolas, monospace"))
@@ -854,8 +945,31 @@ def resolve_levels(sym: str, entry: Optional[float], stop: Optional[float], targ
         if made and made < today:
             warnings.append(f"the saved {sym} plan is from {made} - its levels may be stale; pass --entry, "
                             "--stop and --target to test today's levels")
+    if src["entry"] == "saved plan":
+        played_out = finished_trigger_note(plan, sym, vals["entry"], today)
+        if played_out:
+            notes.append(played_out)
     return {"side": side, "entry": vals["entry"], "stop": vals["stop"], "target": vals["target"],
             "sources": src, "side_source": side_source, "notes": notes, "warnings": warnings}
+
+
+def finished_trigger_note(plan: Mapping[str, Any], sym: str, entry: float, today: str) -> Optional[str]:
+    """The entry skill's note when the plan's entry is a trigger from a session that is already over.
+
+    entry --save after the close (or of a past --date) stores entry_signal.session_over and a note;
+    a trigger saved live whose session date is now in the past has played out just the same.
+    """
+    sig = plan.get("entry_signal")
+    if not isinstance(sig, MappingABC) or not isinstance(sig.get("entry"), (int, float)) \
+            or not _same_level(sig["entry"], entry):
+        return None
+    day = str(sig.get("date") or "")
+    if not (sig.get("session_over") or sig.get("replay") or (day and day < today)):
+        return None
+    note = sig.get("note") or f"trigger is from the finished {day} session - re-plan from the next open"
+    when = f" at {sig['triggered_at']} ET" if sig.get("triggered_at") else ""
+    what = f"{sig.get('label') or sig.get('setup') or 'entry'}{when}"
+    return f"the saved {sym} entry {tc.fmt_price(entry)} is an entry-skill trigger ({what}): {note}"
 
 
 def _not_found(err: Exception) -> bool:
@@ -886,6 +1000,7 @@ def time_machine_section(res: Mapping[str, Any]) -> Dict[str, Any]:
         "rr": res["rr"], "start": res["start"], "mode": res["mode"],
         "target_first_pct": res["target_first_pct"], "stop_first_pct": res["stop_first_pct"],
         "neither_pct": res["open_at_close_pct"], "open_at_close_pct": res["open_at_close_pct"],
+        "display_pct": dict(res["display_pct"]),
         "ambiguous_pct": res["ambiguous_pct"], "expected_r": res["expected_r"],
         "avg_r_open": res["avg_r_open"], "paths": res["paths"], "sessions": res["sessions_used"],
         "block": res["block"], "seed": res["seed"], "detrended": res["trend"]["detrended"],
@@ -974,7 +1089,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     alt = simulate(library if args.detrend else flat, st["start_slot"], entry, stop, target, side,
                    args.paths, random.Random(seed), args.block, end_slot=st["end_slot"])
     alt.pop("sample_paths")
-    trend = library_trend(library, sim["start_slot"], sim["end_slot"])
+    with_trend = alt if args.detrend else sim
+    trend = trend_check(library, sim["start_slot"], sim["end_slot"], side, entry, stop,
+                        with_trend["median_minutes_to_resolution"])
     trend.update({"detrended": bool(args.detrend), "alt": {
         k: alt[k] for k in ("target_first_pct", "stop_first_pct", "open_at_close_pct", "expected_r")}})
     trend["alt"]["verdict"] = verdict(alt)
@@ -1076,8 +1193,9 @@ def render(res: Mapping[str, Any]) -> str:
     fp = tc.fmt_price
     sym, n = res["symbol"], res["paths"]
     c = res["counts"]
-    # one-decimal percentages that still add up to 100.0
-    pt, ps, po = split_pct([c["target"], c["stop"], c["open"]], n, 1)
+    # one-decimal percentages that still add up to 100.0 (saved in the plan as display_pct)
+    shown = res.get("display_pct") or display_pct(c, n)
+    pt, ps, po = shown["target_first"], shown["stop_first"], shown["open_at_close"]
     when = f"from {res['start']} ET" if res["mode"] != "open" else "from the 09:30 open"
     which = " (next session)" if res["session"] == "next" else ""
     lines = [f"TIME MACHINE · {sym} · {res['side'].upper()} {when}{which} · {n:,} replays from {sym}'s past "
@@ -1109,8 +1227,18 @@ def render(res: Mapping[str, Any]) -> str:
         lines.append(f"History check: no past session had bars at {res['start']} ET")
     tr = res["trend"]
     a = tr["alt"]
-    lines.append(f"Trend check: the past sessions drifted {tr['avg_move_pct']:+.2f}% on average from {res['start']} "
-                 f"to {res['end']} (t={tr['t_stat']:.1f}; |t| < 2 is noise)")
+    h = tr.get("horizon") or {}
+    if h.get("start"):
+        why = " (the median time to stop/target)" if h.get("basis") == "median_resolution" else ""
+        drift_r = "" if tr.get("drift_r") is None else f" = {tr['drift_r']:+.2f}R for this {res['side']}"
+        rest = ("" if h.get("end") == res["end"] else
+                f"; whole window to {res['end']}: {tr['avg_move_pct']:+.2f}% (t={tr['t_stat']:.1f})")
+        lines.extend(_wrap(f"Trend check: from {h['start']} to {h['end']}{why} the past sessions drifted "
+                           f"{tr['drift_pct']:+.2f}% on average{drift_r} (t={tr['horizon_t_stat']:.1f}; |t| < 2 is "
+                           f"noise){rest}", "", " " * 13))
+    else:
+        lines.append(f"Trend check: the past sessions drifted {tr['avg_move_pct']:+.2f}% on average from "
+                     f"{res['start']} to {res['end']} (t={tr['t_stat']:.1f}; |t| < 2 is noise)")
     lines.append(" " * 13 + ("with the trend left in: " if tr["detrended"] else "trend removed: ")
                  + f"{a['target_first_pct']:.1f}% target / {a['stop_first_pct']:.1f}% stop / "
                  f"{a['open_at_close_pct']:.1f}% open, {a['expected_r']:+.2f}R")

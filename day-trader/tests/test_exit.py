@@ -1,5 +1,6 @@
 """Tests for skills/exit/scripts/exit_plan.py (offline, synthetic data only)."""
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -13,7 +14,7 @@ from unittest import mock
 # Works both with `unittest discover -s tests` and `python3 -m unittest tests.test_exit`.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from helpers import (SKILLS, TempHomeTestCase, bars_from_closes, et_ts, fake_bars,  # noqa: E402
+from helpers import (ROOT, SKILLS, TempHomeTestCase, bars_from_closes, et_ts, fake_bars,  # noqa: E402
                      load_skill_module, random_walk_history, run_cli, skill_script, tc,
                      trading_days, write_fixture, yahoo_chart_url, yahoo_payload)
 
@@ -331,6 +332,58 @@ class MethodResolutionTests(unittest.TestCase):
                 ep.parse_time_stop(args.time_stop or "15:55")
 
 
+DESK_SCRIPTS = {"scan.py": ("scanner", "scan"), "news.py": ("news", "news"), "entry.py": ("entry", "entry"),
+                "exit_plan.py": ("exit", "exit_plan"), "time_machine.py": ("time-machine", "time_machine"),
+                "risk.py": ("risk", "risk"), "budget.py": ("budget", "budget"), "broker.py": ("broker", "broker")}
+
+
+def desk_run_section(skill):
+    """The '## Full desk run' section of skills/<skill>/SKILL.md."""
+    text = (SKILLS / skill / "SKILL.md").read_text(encoding="utf-8")
+    m = re.search(r"^## Full desk run.*?(?=^## )", text, re.M | re.S)
+    return m.group(0) if m else ""
+
+
+class DeskRunDocTests(unittest.TestCase):
+    """'Plan a trade on TSLA and test it' must route to exit/time-machine and name the whole chain."""
+
+    def test_description_routes_the_headline_prompt(self):
+        spec = importlib.util.spec_from_file_location("day_trader_package_skills_exit",
+                                                      ROOT / "tools" / "package_skills.py")
+        pkg = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pkg)
+        fm = pkg.parse_frontmatter((SKILLS / "exit" / "SKILL.md").read_text(encoding="utf-8"))
+        self.assertEqual(pkg.check_frontmatter("exit", fm), [])       # <= 1024 characters, no tags
+        self.assertIn('"plan a trade on TSLA and test it"', fm["description"])
+        self.assertIn('"plan and test a trade"', fm["description"])
+
+    def test_section_is_near_the_top_and_mirrored_in_time_machine(self):
+        sec = desk_run_section("exit")
+        self.assertTrue(sec.startswith('## Full desk run ("plan a trade on SYM and test it")'), sec[:80])
+        self.assertEqual(sec, desk_run_section("time-machine"))
+        text = (SKILLS / "exit" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertLess(text.index("## Full desk run"), text.index("## Run"))
+        steps = re.findall(r"^\d\. \*\*([a-z-]+)\*\*", sec, re.M)
+        self.assertEqual(steps, ["scanner", "news", "entry", "exit", "time-machine", "risk", "budget", "broker"])
+
+    def test_every_desk_run_command_parses_with_the_real_parser(self):
+        cmds = re.findall(r"`python3 scripts/(\w+\.py)([^`]*)`", desk_run_section("exit"))
+        self.assertEqual(len(cmds), 9)
+        self.assertEqual({c[0] for c in cmds}, set(DESK_SCRIPTS))
+        for script, argv in cmds:
+            skill, module = DESK_SCRIPTS[script]
+            with self.subTest(cmd=f"{script}{argv}"):
+                mod = load_skill_module(skill, module)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    args = mod.build_parser().parse_args(shlex.split(argv))
+                self.assertFalse(getattr(args, "json", False))
+        exit_args = [shlex.split(a) for s, a in cmds if s == "exit_plan.py"]
+        for argv in exit_args:                                       # and exit's own flag rules hold
+            args = ep.build_parser().parse_args(argv)
+            given = [k for k in ("stop", "pct", "lookback", "atr_mult") if getattr(args, k) is not None]
+            ep.resolve_method(args.method, given)
+
+
 class MainTests(TempHomeTestCase):
     NOW = f"{DAY}T11:00"
 
@@ -437,6 +490,37 @@ class MainTests(TempHomeTestCase):
             r = self.run_main("TSLA", "--entry", "100")
         self.assertFalse(any("--side" in w for w in r["warnings"]), r["warnings"])
         self.assertTrue(any("side short taken from the saved TSLA plan" in n for n in r["notes"]), r["notes"])
+
+    def test_entry_from_a_finished_session_trigger_is_a_warning(self):
+        # entry.py --save after the close stores entry_signal.session_over + note: exit repeats it.
+        note = f"trigger is from the finished {DAY} session - re-plan from the next open"
+        signal = {"source": "entry", "setup": "orb", "label": "ORB(15)", "date": DAY, "triggered_at": "10:15",
+                  "entry": 100.0, "suggested_stop": 98.5, "session_over": True, "note": note}
+        tc.save_plan({"symbol": "TSLA", "side": "long", "entry": 100.0, "stop": 98.5, "setup": "orb",
+                      "entry_signal": signal})
+        want = f"the saved TSLA entry 100.00 is an entry-skill trigger (ORB(15) at 10:15 ET): {note}"
+        with fake_bars({"TSLA": self.bars()}):
+            r = self.run_main("TSLA", "--method", "manual", "--rr", "1", "--save")
+            self.assertIn(want, r["warnings"])
+            self.assertEqual(tc.load_plan("TSLA")["entry_signal"]["note"], note)   # kept for time-machine
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ep.main(["TSLA", "--method", "manual"])
+            self.assertIn("! the saved TSLA entry 100.00 is an entry-skill trigger", out.getvalue())
+            # A new entry from the user is not that trigger: no warning.
+            r = self.run_main("TSLA", "--entry", "100.4", "--method", "manual")
+            self.assertFalse(any("entry-skill trigger" in w for w in r["warnings"]), r["warnings"])
+            # A trigger saved live today is fine...
+            tc.save_plan({"symbol": "TSLA", "side": "long", "entry": 100.0, "stop": 98.5,
+                          "entry_signal": dict(signal, session_over=False, note=None)})
+            r = self.run_main("TSLA", "--method", "manual")
+            self.assertFalse(any("entry-skill trigger" in w for w in r["warnings"]), r["warnings"])
+            # ...but once its session date is in the past it has played out just the same.
+            tc.save_plan({"symbol": "TSLA", "side": "long", "entry": 100.0, "stop": 98.5,
+                          "entry_signal": dict(signal, date=PREV, session_over=False, note=None)})
+            r = self.run_main("TSLA", "--method", "manual")
+        self.assertIn(f"the saved TSLA entry 100.00 is an entry-skill trigger (ORB(15) at 10:15 ET): trigger is "
+                      f"from the finished {PREV} session - re-plan from the next open", r["warnings"])
 
     def test_pre_market_gap_plan_compares_with_the_last_close(self):
         with mock.patch.dict(os.environ, {"DAYTRADER_NOW": f"{DAY}T08:30"}), fake_bars({"TSLA": self.bars()}):

@@ -916,6 +916,12 @@ class CommandTests(TempHomeTestCase):
                 mock.patch("sys.stderr", io.StringIO()):
             pelosi.main(["recent", "--live"])
         self.assertEqual(cm.exception.code, 1)
+        # Subcommand usage errors come from the shared parser too: exit 1, never 2 (= data source down).
+        for argv in (["ticker"], ["recent", "--days", "x"], ["bogus"], []):
+            with self.assertRaises(SystemExit, msg=argv) as cm, redirect_stdout(io.StringIO()), \
+                    mock.patch("sys.stderr", io.StringIO()):
+                pelosi.main(argv)
+            self.assertEqual(cm.exception.code, 1, argv)
 
 
 class NewYearIndexTests(TempHomeTestCase):

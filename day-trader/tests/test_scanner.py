@@ -238,6 +238,73 @@ class VolumePaceTests(unittest.TestCase):
         self.assertAlmostEqual(scan.day_progress(last, tc.parse_et(f"{END}T10:00"), stale), 0.115)
         self.assertAlmostEqual(scan.day_progress(last, tc.parse_et(f"{END}T10:00"), {"currentTradingPeriod": None}), 0.115)
 
+    def test_day_progress_paces_replayed_data_at_its_own_stamp(self):
+        # Replayed at 10:00 from data fetched at 15:00: the bar holds volume through 15:00, so
+        # pacing it as 11.5% of a day would read ~6x relative volume.
+        last = tc.Bar(et_ts(END, "09:30"), 1, 1, 1, 1, 1)
+        later = {"regularMarketTime": et_ts(END, "15:00")}
+        self.assertAlmostEqual(scan.day_progress(last, tc.parse_et(f"{END}T10:00"), later),
+                               scan.volume_progress(330))
+        earlier = {"regularMarketTime": et_ts(END, "09:55")}   # live data lags `now`: pace at `now`
+        self.assertAlmostEqual(scan.day_progress(last, tc.parse_et(f"{END}T10:00"), earlier), 0.115)
+        closed = {"regularMarketTime": et_ts(END, "16:00")}
+        self.assertEqual(scan.day_progress(last, tc.parse_et(f"{END}T10:00"), closed), 1.0)
+        self.assertAlmostEqual(scan.day_progress(last, tc.parse_et(f"{END}T10:00"), {"regularMarketTime": True}),
+                               0.115)
+
+
+class LookaheadTests(unittest.TestCase):
+    """$DAYTRADER_NOW replays: a daily bar for the as-of day can hold trading after `now`."""
+    NOW = tc.parse_et(f"{END}T10:16")
+    BAR = tc.Bar(et_ts(END, "09:30"), 1, 1, 1, 1, 1)
+
+    def test_data_after_now_is_flagged(self):
+        full = scan.lookahead(self.BAR, self.NOW, {"regularMarketTime": et_ts(END, "16:00")})
+        self.assertEqual(full, {"through": et_ts(END, "16:00"), "to_close": True})
+        mid = scan.lookahead(self.BAR, self.NOW, {"regularMarketTime": et_ts(END, "15:59")})
+        self.assertEqual(mid, {"through": et_ts(END, "15:59"), "to_close": False})
+        # A live-style bar stamped with its last trade time says so too.
+        live_row = tc.Bar(et_ts(END, "13:05"), 1, 1, 1, 1, 1)
+        self.assertEqual(scan.lookahead(live_row, self.NOW)["through"], et_ts(END, "13:05"))
+        # No timestamp says where the data ends: it may hold later trading.
+        self.assertEqual(scan.lookahead(self.BAR, self.NOW), {"through": None, "to_close": False})
+
+    def test_honest_as_of_data_is_not_flagged(self):
+        self.assertIsNone(scan.lookahead(self.BAR, self.NOW, {"regularMarketTime": et_ts(END, "10:15")}))
+        self.assertIsNone(scan.lookahead(self.BAR, tc.parse_et(f"{END}T16:00"),
+                                         {"regularMarketTime": et_ts(END, "16:00")}))   # day is over
+        self.assertIsNone(scan.lookahead(self.BAR, tc.parse_et("2026-11-02T10:16"),
+                                         {"regularMarketTime": et_ts(END, "16:00")}))   # an earlier day
+
+    def test_evaluate_symbol_flags_only_replays(self):
+        bars = breakout_bars()
+        meta = {"regularMarketTime": et_ts(END, "16:00")}
+        r = scan.evaluate_symbol("BRKO", bars, self.NOW, meta, replay=True)
+        self.assertTrue(r["row"]["after_as_of"])
+        self.assertTrue(r["lookahead"]["to_close"])
+        r = scan.evaluate_symbol("BRKO", bars, self.NOW, meta)
+        self.assertFalse(r["row"]["after_as_of"])
+        self.assertNotIn("lookahead", r)
+        # Filtered names were judged on the later prices too.
+        thin = daily_bars(END, wave(70, 20) + [21.5], [100_000] * 70 + [400_000])
+        r = scan.evaluate_symbol("THIN", thin, self.NOW, meta, replay=True)
+        self.assertEqual(r["status"], "filtered")
+        self.assertIn("lookahead", r)
+
+    def test_warning_text(self):
+        now = self.NOW
+        one = scan.replay_warning([{"symbol": "TSLA", "through": et_ts(END, "15:59"), "to_close": False}], now)
+        self.assertIn("replay at 10:16 ET ($DAYTRADER_NOW): the 2026-10-30 daily bar of TSLA includes trading "
+                      "after 10:16 ET (data through 15:59 ET)", one)
+        self.assertIn("not the market at 10:16", one)
+        many = scan.replay_warning([{"symbol": s, "through": et_ts(END, "16:00"), "to_close": True}
+                                    for s in ("NVDA", "AMD")], now)
+        self.assertIn("daily bars of 2 symbols (AMD, NVDA) include trading after 10:16 ET "
+                      "(data runs to the close)", many)
+        unknown = scan.replay_warning([{"symbol": "X", "through": None, "to_close": False}], now)
+        self.assertIn("bar of X may include trading after 10:16 ET", unknown)
+        self.assertIsNone(scan.replay_warning([], now))
+
     def test_partial_day_rvol_is_paced_with_floor(self):
         bars = breakout_bars(vol_mult=0.4)        # 400k so far vs a 1M average
         m = scan.metrics_at(bars, len(bars) - 1, progress=0.2)
@@ -458,6 +525,26 @@ class RunScanTests(TempHomeTestCase):
         with fake_bars({"CALM": daily_bars(END, wave(71, 80, 0.3, 2.9), [1_000_000] * 71)}):
             self.assertIn("No setup today: CALM", scan.render(scan.run_scan(self.universe("CALM"), tc.now_et())))
 
+    def test_replay_warning_in_results_and_text(self):
+        # $DAYTRADER_NOW=10:16 over data fetched after the close: say the scan saw the whole day.
+        now = tc.parse_et(f"{END}T10:16")
+        with fake_bars({"BRKO": breakout_bars(), "CALM": daily_bars(END, wave(71, 80, 0.3, 2.9), [1_000_000] * 71)},
+                       meta={"regularMarketTime": et_ts(END, "16:00")}):
+            res = scan.run_scan(self.universe("BRKO", "CALM"), now, replay=True)
+        self.assertIn("daily bars of 2 symbols (BRKO, CALM) include trading after 10:16 ET", res["replay_warning"])
+        self.assertTrue(res["results"][0]["after_as_of"])
+        text = scan.render(res)
+        self.assertIn("WARNING: replay at 10:16 ET ($DAYTRADER_NOW)", text)
+        self.assertNotIn("results below are partial", text)
+        json.dumps(res)
+        # Data stamped by `now` (a faithful replay) or a live run: no warning.
+        with fake_bars({"BRKO": breakout_bars()}, meta={"regularMarketTime": et_ts(END, "10:15")}):
+            res = scan.run_scan(self.universe("BRKO"), now, replay=True)
+        self.assertIsNone(res["replay_warning"])
+        self.assertNotIn("WARNING", scan.render(res))
+        with fake_bars({"BRKO": breakout_bars()}, meta={"regularMarketTime": et_ts(END, "16:00")}):
+            self.assertIsNone(scan.run_scan(self.universe("BRKO"), now)["replay_warning"])
+
     def test_progress_lines(self):
         data = {f"S{i}": breakout_bars() for i in range(12)}
         lines = []
@@ -573,6 +660,29 @@ class CliTests(TempHomeTestCase):
         self.assertEqual(res["disclaimer"], tc.DISCLAIMER)
         self.assertEqual(res["results"][1]["setups"][0]["levels"]["high_20d"],
                          round(max(b.high for b in breakout_bars()[-21:-1]), 2))
+        self.assertIsNone(res["replay_warning"])          # 17:30: the day's bar is complete
+
+    def test_replay_mid_session_warns_text_and_json(self):
+        # Fixtures fetched after the close, replayed at 10:16 (the critic's TSLA case).
+        session = {"currentTradingPeriod": {"regular": {"start": et_ts(END, "09:30"), "end": et_ts(END, "16:00")}}}
+        write_fixture(self.fx, yahoo_chart_url("BRKO", "1d", "6mo"),
+                      yahoo_payload(breakout_bars(), "BRKO", regularMarketTime=et_ts(END, "15:59"), **session))
+        env = dict(self.env, DAYTRADER_NOW=f"{END}T10:16")
+        p = run_cli(SCRIPT, "--symbols", "BRKO", env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("WARNING: replay at 10:16 ET ($DAYTRADER_NOW): the 2026-10-30 daily bar of BRKO includes "
+                      "trading after 10:16 ET (data through 15:59 ET)", p.stdout)
+        j = run_cli(SCRIPT, "--symbols", "BRKO", "--json", env=env)
+        self.assertEqual(j.returncode, 0, j.stderr)
+        res = json.loads(j.stdout)
+        self.assertIn("includes trading after 10:16 ET", res["replay_warning"])
+        self.assertTrue(res["results"][0]["after_as_of"])
+        # The same data replayed at its own time (10:16, stamped 10:15:55) is an honest as-of view.
+        write_fixture(self.fx, yahoo_chart_url("BRKO", "1d", "6mo"),
+                      yahoo_payload(breakout_bars(), "BRKO", regularMarketTime=et_ts(END, "10:15") + 55, **session))
+        res = json.loads(run_cli(SCRIPT, "--symbols", "BRKO", "--json", env=env).stdout)
+        self.assertIsNone(res["replay_warning"])
+        self.assertFalse(res["results"][0]["after_as_of"])
 
     def test_universe_text(self):
         p = run_cli(SCRIPT, "--limit", "3", "--setups", "breakout,breakdown,gap_up", env=self.env)

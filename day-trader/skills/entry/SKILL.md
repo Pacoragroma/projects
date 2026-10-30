@@ -97,14 +97,22 @@ forming counts here, since its prices already traded; it never counts for the tr
   last, move, move_r, high, low, max_favorable_r, max_adverse_r, stop_hit, stop_hit_at,
   stop_hit_in_forming_bar},
   watching [{side, level, armed, distance, distance_pct}], rejected [], context {vwap, high, low,
-  pdh, pdl, prev_close}, cutoff, expired_reason, notes [], saved`.
+  pdh, pdl, prev_close}, cutoff, session_over, expired_reason, notes [], saved {path, cleared,
+  note}`.
 
 ## Next step on the desk
 - `--save` writes `symbol, side, entry, stop (= suggested stop), setup, entry_signal {...}` into
   `plans/<SYM>.json`. If the saved plan had a target, exit plan, time-machine odds or sizing for a
   different entry, those are cleared (set to null) because they no longer apply - the output says so.
+- A trigger from a session that is already over (`--save` after the close, or with a past `--date`)
+  is still saved - useful for replays - but never silently: the output adds a note and the plan's
+  `entry_signal` gets `session_over: true` and `note: "trigger is from the finished <date> session -
+  re-plan from the next open"`. Exit and time-machine repeat that note whenever they plan or test
+  from this entry. Tell the user the move has already played out; for a live trade, re-run entry
+  after the next open.
 - Then the **exit** skill sets stop and target before entering (`exit_plan.py TSLA` reads the saved
-  entry and side; add `--method manual --stop <suggested stop>` to keep this stop).
+  entry and side; `exit_plan.py TSLA --method manual --rr 1 --save` keeps this stop and sets a 1R
+  target - the step the exit skill's "Full desk run" uses after a trigger).
 - Then **time-machine** for the honest odds, **risk** to size it, **budget** to check the day's
   limits, and the paper **broker** ticket, which waits for the user's explicit yes.
 

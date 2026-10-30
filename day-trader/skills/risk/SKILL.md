@@ -86,7 +86,10 @@ fetched). A blocked daily budget is reported, not an error: check JSON `budget.o
 * Lead with the order line as printed (`BUY 8 TSLA @ 364.18 · STOP 358.32 · TARGET 370.04 ·
   PAPER`), then $ at risk, notional and % of account, R:R, and what set the size.
 * Relay every `!` line (JSON `warnings`) in plain words. `-` lines (`notes`) are context: where
-  the levels came from, short-selling needs, the time-machine odds if the plan has them.
+  the levels came from, short-selling needs, and the time-machine odds when the plan's odds were
+  computed for exactly these levels (printed as the time machine printed them, from its
+  `display_pct`). Otherwise a note says "not tested by the time machine for these levels (run
+  time_machine.py SYM --save)": relay it and offer that command before a ticket.
 * If the daily budget says BLOCKED, say so first: the broker will refuse the ticket. Offer the
   "at most N shares fit" figure or waiting until tomorrow. Do not suggest raising limits to get
   around it.

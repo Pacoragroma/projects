@@ -325,6 +325,9 @@ class SharedLibHardeningTests(TempHomeTestCase):
         self.assertEqual(tc.trade_initial_risk(short), 10.0)
         with self.assertRaises(tc.StateError):
             tc.trade_initial_risk({"id": "bad", "side": "long"})
+        for side in (None, "", "buy"):
+            with self.assertRaises(tc.StateError):
+                tc.trade_initial_risk({"id": "odd", "side": side, "entry_price": 100, "stop": 99, "qty": 1})
 
     def test_utc_stamps_count_on_their_et_day(self):
         # 2026-10-31T01:00Z is still Oct 30 in New York.
@@ -353,6 +356,8 @@ class SharedLibHardeningTests(TempHomeTestCase):
 
     def test_sec_403_hint_mentions_contact(self):
         self.assertIn("DAYTRADER_CONTACT", tc._host_hint("https://data.sec.gov/x", 403))
+        self.assertNotIn("DAYTRADER_CONTACT", tc._host_hint("https://data.sec.gov/x", 403, proxy=True))
+        self.assertIn("allow-listed", tc._host_hint("https://data.sec.gov/x", 403, proxy=True))
         tc.save_settings({"contact_email": "me@example.com"})
         self.assertNotIn("DAYTRADER_CONTACT", tc._host_hint("https://data.sec.gov/x", 403))
 

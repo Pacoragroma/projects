@@ -917,18 +917,10 @@ def render_filing(out: Dict[str, Any]) -> str:
 # CLI
 # ---------------------------------------------------------------------------
 
-class _Parser(argparse.ArgumentParser):
-    """Bad flags are bad input: exit 1, not argparse's 2 (2 means a data source is down)."""
-
-    def error(self, message: str) -> None:  # type: ignore[override]
-        self.print_usage(sys.stderr)
-        self.exit(1, f"{self.prog}: error: {message}\n")
-
-
 def build_parser() -> argparse.ArgumentParser:
+    # tc's parser (and its subparsers): bad flags are bad input, exit 1 (2 means a data source is down).
     p = tc.make_parser("Congressional stock trades from House Periodic Transaction Reports (House Clerk).")
-    p.error = _Parser.error.__get__(p)  # type: ignore[method-assign]
-    sub = p.add_subparsers(dest="command", metavar="{recent,ticker,member,filing}", parser_class=_Parser)
+    sub = p.add_subparsers(dest="command", metavar="{recent,ticker,member,filing}")
     sub.required = True
 
     r = sub.add_parser("recent", help="recent PTR filings (and their trades)")

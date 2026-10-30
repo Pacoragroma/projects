@@ -85,7 +85,8 @@ HIGH  Oct 29 16:05 ET  18h 09m ago  TSLA  SEC EDGAR · EARNINGS
   FDA means gap and volatility risk, OFFERING can mean dilution pressure, and ANALYST moves are
   usually smaller and fade.
 * Read the `Sources:` line and any `!` warnings. If a source failed, say the list may be
-  incomplete.
+  incomplete. If SEC EDGAR failed with `HTTP 403` or the warning mentions a contact email /
+  `DAYTRADER_CONTACT`, see the SEC rule below.
 * With `--new-only`, "No new headlines" means nothing new since the last check. It does not mean
   "no news today". With `--tags`, "No headlines tagged X" means none matched the tag filter; the
   count of other headlines is in brackets.
@@ -112,3 +113,11 @@ HIGH  Oct 29 16:05 ET  18h 09m ago  TSLA  SEC EDGAR · EARNINGS
   `data.sec.gov`. In sandboxes the host may need to be allow-listed. Never invent prices,
   headlines or odds to fill the gap. Exit 1 means bad input (bad ticker, tag or `--since`); the
   message says what to fix.
+* **SEC 403 / contact email:** SEC asks automated clients to send a contact address, and may answer
+  `HTTP 403` without one (the message then says `set DAYTRADER_CONTACT=...`). Suggest the user set
+  `DAYTRADER_CONTACT` to their own email and re-run, e.g.
+  `DAYTRADER_CONTACT=you@example.com python3 scripts/news.py TSLA` (or put `"contact_email"` in
+  `settings.json` in `$DAYTRADER_HOME`). Ask for the address; never make one up. `blocked by
+  proxy` / `Tunnel connection failed` means the request never reached SEC: the host needs
+  allow-listing, and an email will not fix that. Meanwhile the Yahoo headlines still stand; say
+  that SEC filings are missing from the list.

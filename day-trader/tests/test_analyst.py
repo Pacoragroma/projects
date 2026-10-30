@@ -483,6 +483,32 @@ class GatherTests(TempHomeTestCase):
         self.assertTrue(b["sources"]["intraday"].startswith("error"))
         self.assertIn("SEC         unavailable", an.render_brief(b))
 
+    def test_sec_403_says_to_set_a_contact_email(self):
+        # SEC answers 403 to automated clients without a contact address. The shared library's hint
+        # (set DAYTRADER_CONTACT) must reach the brief's SEC line; the Yahoo part still prints.
+        import urllib.error
+        from unittest import mock
+
+        def opener(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, None)
+
+        daily = rising_daily(PREV, 60) + [bar(DAY, "09:30", 160, 161, 159, 160.5, 1e6)]
+        with fake_bars({("TSLA", "1d"): daily}), mock.patch("urllib.request.urlopen", side_effect=opener):
+            b = an.gather_brief("TSLA", tc.now_et())
+        self.assertEqual(b["sec"]["status"], "error")
+        err = b["sec"]["errors"][0]
+        self.assertTrue(err.startswith("HTTP 403 for https://www.sec.gov/"), err)
+        self.assertIn("SEC asks for a contact email in the User-Agent: set DAYTRADER_CONTACT=", err)
+        text = " ".join(an.render_brief(b).split())
+        self.assertIn("SEC unavailable - HTTP 403 for https://www.sec.gov/", text)
+        self.assertIn("set DAYTRADER_CONTACT=you@example.com", text)
+        self.assertIn("LAST 160.50", text)
+        with mock.patch.dict(os.environ, {"DAYTRADER_CONTACT": "me@example.com"}), \
+                fake_bars({("TSLA", "1d"): daily}), mock.patch("urllib.request.urlopen", side_effect=opener):
+            b = an.gather_brief("TSLA", tc.now_et())
+        self.assertNotIn("DAYTRADER_CONTACT", b["sec"]["errors"][0])
+        self.assertIn("access denied", b["sec"]["errors"][0])
+
     def test_gather_requires_daily_bars(self):
         with fake_bars({("TSLA", "5m"): intraday_history(DAY, 5)}):
             with self.assertRaises(tc.FetchError):
@@ -567,6 +593,22 @@ class ReviewTests(TempHomeTestCase):
         self.assertEqual((c["n"], c["predicted_target_first_pct"], c["actual_target_pct"], c["actual_stop_pct"]),
                          (2, 30.0, 50.0, 50.0))
         self.assertTrue(any("leaned against you (net -$50.00)" in t for t in r["takeaways"]))
+
+    def test_time_machine_check_quotes_the_cards_display_pct(self):
+        # Regression: the desk-flow card said 31.6% / 31.6% (time machine, risk and broker), but the
+        # review re-rounded the raw 31.66 / 31.57 to "32% / 32%" (and 32.53 -> 32.5 -> "32%").
+        led = {"tickets": [], "trades": [trade("a", 50, ts(DAY, "10:22"), ts(DAY, "11:00"), time_machine={
+            "verdict": "CLOSE TO A COIN FLIP", "target_first_pct": 31.66, "stop_first_pct": 31.57,
+            "display_pct": {"target_first": 31.6, "stop_first": 31.6, "open_at_close": 36.8}})]}
+        r = an.build_review(led, 30, DAY)
+        c = r["time_machine_check"]
+        self.assertEqual((c["n"], c["predicted_target_first_pct"], c["predicted_stop_first_pct"]), (1, 31.6, 31.6))
+        self.assertIn("predicted target-first 31.6% / stop-first 31.6%", an.render_review(r))
+        # an older ticket without display_pct (or with a malformed one) falls back to the raw values
+        led["trades"][0]["time_machine"] = {"target_first_pct": 32.53, "stop_first_pct": 31.93,
+                                            "display_pct": {"target_first": "x"}}
+        r = an.build_review(led, 30, DAY)
+        self.assertIn("predicted target-first 32.5% / stop-first 31.9%", an.render_review(r))
 
     def test_window_symbol_open_and_malformed(self):
         led = self.four()
@@ -763,6 +805,19 @@ class SkillDocTests(unittest.TestCase):
         self.assertGreaterEqual(len(cmds), 5)
         for c in cmds:
             an.build_parser().parse_args(shlex.split(c))   # SystemExit (test error) if a documented flag is wrong
+        # Routing: "how am I doing" goes to review for the trend, and budget status for today.
+        self.assertIn("how am I doing overall / this month?", desc)
+        self.assertIn("`budget.py status`", md)
+        # SEC 403: suggest a contact address (SEC asks automated clients for one).
+        self.assertIn("DAYTRADER_CONTACT=you@example.com python3 scripts/analyst.py brief TSLA", md)
+
+    def test_usage_errors_exit_1_in_process(self):
+        import contextlib
+        import io
+        for argv in (["brief", "TSLA", "--live"], ["review", "--days", "0"], ["bogus"]):
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()):
+                an.build_parser().parse_args(argv)
+            self.assertEqual(cm.exception.code, 1, argv)
 
 
 if __name__ == "__main__":

@@ -315,13 +315,16 @@ class TicketTests(BrokerCase):
         self.assertIn("SELL SHORT 40 TSLA", res["card"])
 
     def test_market_hours_window(self):
+        # Outside the session the ticket is a PREVIEW (exit 0, nothing saved) - see TicketPreviewTests.
         for now, msg in ((f"2026-10-31T11:00", "closed"), (f"{DAY}T15:55", "time stop"),
                          (f"{DAY}T09:00", "pre-market")):
-            with self.subTest(now=now), self.assertRaises(ValueError) as cm:
-                self.ticket(now=now)
-            self.assertIn(msg, str(cm.exception))
+            with self.subTest(now=now):
+                code, res = self.ticket(now=now)
+                self.assertEqual((code, res["status"], res["preview"]), (0, "preview", True))
+                self.assertIn(msg, res["market_closed"])
+                self.assertEqual(self.ledger()["tickets"], [])
         code, res = self.ticket(now=f"{DAY}T09:20")        # expires 09:35, after the open: allowed
-        self.assertEqual(code, 0)
+        self.assertEqual((code, res["status"], res["preview"]), (0, "pending", False))
         code, res = self.ticket(now=f"{DAY}T15:50")
         self.assertEqual(res["ticket"]["expires_at"], "2026-10-30T15:55:00-04:00")   # clipped to the time stop
 
@@ -345,9 +348,12 @@ class TicketTests(BrokerCase):
         self.assertIn("other levels", str(cm.exception))
         with fake_bars({("TSLA", "1m"): quote_bars(364.5)}), self.assertRaises(ValueError):
             self.run_main("ticket", "--symbol", "TSLA", "--side", "short")
-        with fake_bars({("TSLA", "1m"): quote_bars(364.5)}), self.assertRaises(ValueError) as cm:
-            self.run_main("ticket", "--symbol", "TSLA", now=f"{DAY}T11:45")     # past the plan's 11:30 time stop
-        self.assertIn("pass --time-stop", str(cm.exception))
+        with fake_bars({("TSLA", "1m"): quote_bars(364.5)}):
+            code, res = self.run_json("ticket", "--symbol", "TSLA", now=f"{DAY}T11:45")  # past the plan's 11:30 stop
+        self.assertEqual((code, res["status"]), (0, "preview"))
+        self.assertIn("pass --time-stop", res["market_closed"])
+        self.assertTrue(res["banner"].startswith("PAST THE 11:30 ET TIME STOP — preview only."))
+        self.assertEqual([k["id"] for k in self.ledger()["tickets"]], ["TKT-20261030-001"])   # no new ticket
         with fake_bars({("TSLA", "1m"): quote_bars(364.5)}):
             code, res = self.run_json("ticket", "--symbol", "TSLA", "--time-stop", "15:55", now=f"{DAY}T11:45")
         self.assertEqual((code, res["ticket"]["time_stop"]), (0, "15:55"))
@@ -391,6 +397,193 @@ class TicketTests(BrokerCase):
         self.assertIsNone(res["last_price"])
         self.assertTrue(any("live price unavailable" in n for n in res["notes"]))
         self.assertTrue(any("no target" in w for w in res["warnings"]))
+
+
+class TicketPreviewTests(BrokerCase):
+    """Outside the session `ticket` still checks everything but prints a PREVIEW: exit 0, nothing saved."""
+
+    BANNER = "MARKET CLOSED — preview only. Re-run ticket after 09:30 ET to get a ticket you can confirm."
+    NEXT_DAY = ("MARKET CLOSED — preview only. Re-run ticket after 09:30 ET on the next trading day to get a "
+                "ticket you can confirm.")
+
+    def save_tsla_plan(self, **tm_extra):
+        tm = {"side": "long", "entry": 364.18, "stop": 358.32, "target": 370.04, "verdict": "CLOSE TO A COIN FLIP",
+              "target_first_pct": 31.66, "stop_first_pct": 31.57, "open_at_close_pct": 36.77}
+        tm.update(tm_extra)
+        tc.save_plan({"symbol": "TSLA", "side": "long", "entry": 364.18, "stop": 358.32, "target": 370.04,
+                      "setup": "orb", "sizing": {"shares": 8, "side": "long", "entry": 364.18, "stop": 358.32},
+                      "time_machine": tm})
+
+    def test_preview_outside_the_session_is_exit_0_and_saves_nothing(self):
+        self.save_tsla_plan()
+        for now, banner in (("2026-10-31T11:00", self.NEXT_DAY), (f"{DAY}T19:30", self.NEXT_DAY),
+                            (f"{DAY}T08:00", self.BANNER)):
+            with self.subTest(now=now):
+                with fake_bars({("TSLA", "1m"): quote_bars(368.14)}):
+                    code, res = self.run_json("ticket", "--symbol", "TSLA", now=now)
+                self.assertEqual(code, 0)
+                self.assertEqual((res["ok"], res["status"], res["preview"], res["real_money"]),
+                                 (True, "preview", True, False))
+                self.assertNotIn("ticket", res)
+                self.assertNotIn("awaiting", res)
+                o = res["order"]
+                self.assertEqual((o["side"], o["qty"], o["entry"], o["stop"], o["target"], o["risk"], o["status"]),
+                                 ("long", 8, 364.18, 358.32, 370.04, 46.88, "preview"))
+                self.assertNotIn("id", o)
+                self.assertEqual(res["banner"], banner)
+                self.assertEqual(res["card"], "BUY 8 TSLA · LIMIT 364.18 · TARGET 370.04 · STOP 358.32 · PAPER · "
+                                              "REAL MONEY: OFF · " + banner)
+                self.assertTrue(res["budget"]["ok"])
+                self.assertEqual(self.ledger(), {"tickets": [], "trades": []})
+                with fake_bars({("TSLA", "1m"): quote_bars(368.14)}):
+                    code, text = self.run_main("ticket", "--symbol", "TSLA", now=now)
+                self.assertEqual(code, 0)
+                self.assertIn("ORDER TICKET · PREVIEW", text)
+                self.assertIn("BUY 8 TSLA · LIMIT 364.18 · TARGET 370.04 · STOP 358.32 · PAPER · REAL MONEY: OFF", text)
+                self.assertIn("$46.88", text)
+                self.assertIn(banner, text)
+                self.assertNotIn("WAITING FOR YOUR YES", text)
+                self.assertNotIn("reply yes", text)
+                self.assertIn(tc.DISCLAIMER, text)
+        code, res = self.run_json("tickets", "--all")
+        self.assertEqual(res["tickets"], [])
+
+    def test_past_the_time_stop_before_the_close(self):
+        code, res = self.ticket(now=f"{DAY}T15:57")
+        self.assertEqual((code, res["status"]), (0, "preview"))
+        self.assertEqual(res["banner"], "PAST THE 15:55 ET TIME STOP — preview only. Re-run ticket after 09:30 ET on "
+                                        "the next trading day to get a ticket you can confirm.")
+
+    def test_preview_still_validates_levels_exposure_and_budget(self):
+        sat = "2026-10-31T11:00"
+        with fake_bars({("TSLA", "1m"): quote_bars(100)}), self.assertRaises(ValueError) as cm:
+            self.run_main("ticket", "--symbol", "TSLA", "--qty", "8", "--entry", "100", "--stop", "101",
+                          "--side", "long", now=sat)
+        self.assertIn("stop must be below", str(cm.exception))
+        with fake_bars({("TSLA", "1m"): quote_bars(100)}), self.assertRaises(ValueError) as cm:
+            self.run_main("ticket", "--symbol", "TSLA", "--qty", "1500", "--entry", "100", "--stop", "99.95", now=sat)
+        self.assertIn("4x", str(cm.exception))
+        code, res = self.ticket(qty="200", now=sat)            # $200 risk > $150 daily max loss
+        self.assertEqual(code, broker.EXIT_BLOCKED)
+        self.assertTrue(res["blocked"] and res["preview"])
+        self.assertTrue(any("start fresh on the next session" in n for n in res["notes"]))
+        with fake_bars({("TSLA", "1m"): quote_bars(100)}):
+            code, text = self.run_main("ticket", "--symbol", "TSLA", "--qty", "200", "--entry", "100", "--stop", "99",
+                                       now=sat)
+        self.assertIn("TICKET REFUSED", text)
+        self.assertIn(self.NEXT_DAY, text)
+        self.assertEqual(self.ledger()["tickets"], [])
+
+    def test_preview_never_supersedes_a_live_ticket_and_confirm_is_unchanged(self):
+        self.ticket()                                                       # TKT-001, pending until 10:30
+        code, res = self.ticket("--time-stop", "10:00", qty="30", now=f"{DAY}T10:16")   # past its own time stop
+        self.assertEqual((code, res["status"], res["preview"]), (0, "preview", True))
+        led = self.ledger()
+        self.assertEqual([(k["id"], k["status"]) for k in led["tickets"]], [("TKT-20261030-001", "pending")])
+        code, res = self.confirm("TKT-20261030-001", now=f"{DAY}T10:17")    # the real ticket still confirms
+        self.assertEqual((code, res["status"]), (0, "filled"))
+        # A real ticket made outside the session by older versions still cannot be filled then.
+        led = self.ledger()
+        led["tickets"].append(dict(led["tickets"][0], id="TKT-20261031-001", status="pending", trade_id=None,
+                                   created_at="2026-10-31T10:00:00-04:00", expires_at="2026-10-31T23:00:00-04:00"))
+        tc.save_ledger(led)
+        with self.assertRaises(ValueError) as cm:
+            self.confirm("TKT-20261031-001", now="2026-10-31T11:00")
+        self.assertIn("market is closed", str(cm.exception))
+
+    def test_preview_wording_of_the_last_price_notes(self):
+        code, res = self.ticket(entry="99.5", stop="98.5", target="101.5", now="2026-10-31T11:00")
+        self.assertTrue(any("a confirmed ticket would rest as a working day order" in n for n in res["notes"]))
+        self.assertFalse(any("on yes" in n for n in res["notes"]))
+        code, res = self.ticket(entry="100.5", stop="99.5", target="102.5", now="2026-10-31T11:00")
+        self.assertTrue(any("a confirmed ticket would fill right away" in n for n in res["notes"]))
+        w, n = broker.order_checks(dict(symbol="TSLA", side="long", entry=100.0, stop=99.0, target=102.0, qty=10,
+                                        type="limit"), tc.DEFAULT_SETTINGS, {"price": 100.5, "date": DAY},
+                                   "2026-10-31", preview=True)
+        self.assertTrue(any("the last session's price" in x for x in n))
+
+
+class TimeMachineNoteTests(BrokerCase):
+    """The ticket says when its levels were never tested by the time machine; odds read as printed there."""
+
+    UNTESTED = "not tested by the time machine for these levels"
+
+    def plan(self, tm=None, target=370.04):
+        p = {"symbol": "TSLA", "side": "long", "entry": 364.18, "stop": 358.32, "target": target,
+             "sizing": {"shares": 8, "side": "long", "entry": 364.18, "stop": 358.32}}
+        if tm is not None:
+            p["time_machine"] = tm
+        tc.save_plan(p)
+
+    def plan_ticket(self, *extra):
+        with fake_bars({("TSLA", "1m"): quote_bars(364.5)}):
+            return self.run_json("ticket", "--symbol", "TSLA", *extra)
+
+    def tm(self, **kw):
+        d = {"side": "long", "entry": 364.18, "stop": 358.32, "target": 370.04, "verdict": "CLOSE TO A COIN FLIP",
+             "target_first_pct": 31.66, "stop_first_pct": 31.57, "open_at_close_pct": 36.77}
+        d.update(kw)
+        return d
+
+    def test_plan_without_time_machine(self):
+        self.plan()
+        code, res = self.plan_ticket()
+        self.assertIn(f"{self.UNTESTED} (run time_machine.py TSLA --save)", res["notes"])
+        self.assertIsNone(res["ticket"]["time_machine"])
+        with fake_bars({("TSLA", "1m"): quote_bars(364.5)}):
+            code, text = self.run_main("ticket", "--symbol", "TSLA", now=f"{DAY}T10:16")
+        self.assertIn(f"  - {self.UNTESTED} (run time_machine.py TSLA --save)", text)
+
+    def test_time_machine_for_other_levels(self):
+        self.plan(self.tm(target=375.0))                      # exit moved the target after the time machine ran
+        code, res = self.plan_ticket()
+        self.assertIn(f"{self.UNTESTED} (run time_machine.py TSLA --save) - the plan's odds were for other levels",
+                      res["notes"])
+        self.assertIsNone(res["ticket"]["time_machine"])
+
+    def test_flag_levels_without_a_plan_name_the_levels(self):
+        code, res = self.ticket()
+        self.assertIn(f"{self.UNTESTED} (run time_machine.py TSLA --entry 100.00 --stop 99.00 --target 102.00 --save)",
+                      res["notes"])
+        code, res = self.ticket(target=None, now=f"{DAY}T10:16")
+        self.assertIn(f"{self.UNTESTED} (it needs a target to measure the odds)", res["notes"])
+
+    def test_matching_time_machine_has_no_untested_note_and_prints_display_pct(self):
+        self.plan(self.tm(display_pct={"target_first": 31.6, "stop_first": 31.6, "open_at_close": 36.8}))
+        code, res = self.plan_ticket()
+        self.assertFalse(any(self.UNTESTED in n for n in res["notes"]))
+        self.assertEqual(res["ticket"]["time_machine"]["display_pct"],
+                         {"target_first": 31.6, "stop_first": 31.6, "open_at_close": 36.8})
+        text = broker.render_ticket(res)
+        self.assertIn("time-machine: CLOSE TO A COIN FLIP (target first 31.6% / stop first 31.6%)", text)
+        self.assertNotIn("31.66", text)
+
+    def test_raw_odds_fall_back_to_one_decimal(self):
+        self.plan(self.tm())
+        code, res = self.plan_ticket()
+        text = broker.render_ticket(res)
+        self.assertIn("(target first 31.7% / stop first 31.6%)", text)    # raw 31.66 / 31.57 with :.1f
+        self.assertNotIn("31.66", text)
+        self.assertEqual(broker.tm_display({"target_first_pct": 30, "display_pct": {"target_first": "x"}}),
+                         {"target_first": 30.0, "stop_first": None, "open_at_close": None})
+
+
+class DirectionalRiskTests(BrokerCase):
+    def test_working_order_risk_matches_tc_open_risk(self):
+        # Regression: working-order risk used |entry - stop|, so a (hand-edited) stop past the limit showed
+        # reserved risk that tc.day_summary - and so the budget check - counts as 0.
+        led = {"tickets": [{"id": "TKT-20261030-009", "symbol": "TSLA", "side": "long", "qty": 10, "entry": 100.0,
+                            "stop": 101.0, "status": "working", "confirmed_at": f"{DAY}T10:05:00-04:00"},
+                           {"id": "TKT-20261030-010", "symbol": "NVDA", "side": "short", "qty": 10, "entry": 50.0,
+                            "stop": 51.0, "status": "working", "confirmed_at": f"{DAY}T10:06:00-04:00"}],
+               "trades": []}
+        res = broker.check_budget(led, 0.0, broker.load_settings(), DAY)
+        self.assertEqual(res["working_risk"], 10.0)                      # the short only
+        self.assertEqual(res["working_risk"], res["summary"]["open_risk"])
+        tc.save_ledger(led)
+        with fake_bars({}):
+            code, res = self.run_json("positions")
+        self.assertEqual(res["working_risk"], 10.0)
 
 
 class ConfirmTests(BrokerCase):
@@ -510,12 +703,16 @@ class ConfirmTests(BrokerCase):
         with fake_bars(quote, meta):
             code, res = self.run_json(*args, now=f"{hd}T12:50")
         self.assertEqual(res["ticket"]["expires_at"], "2026-11-27T12:55:00-05:00")   # 5 min before the close
-        with fake_bars(quote, meta), self.assertRaises(ValueError) as cm:
-            self.run_main(*args, now=f"{hd}T13:20")
-        self.assertIn("13:00", str(cm.exception))
+        with fake_bars(quote, meta):
+            code, res = self.run_json(*args, now=f"{hd}T13:20")          # after the early close: a preview only
+        self.assertEqual((code, res["status"]), (0, "preview"))
+        self.assertIn("13:00", res["market_closed"])
+        self.assertTrue(res["banner"].startswith("MARKET CLOSED — preview only."))
+        self.assertEqual(len(self.ledger()["tickets"]), 1)
         # a ticket that (by older rules) outlived the close still cannot be filled after it
         led = self.ledger()
-        led["tickets"][0]["expires_at"] = f"{hd}T13:40:00-05:00"
+        led["tickets"][0].update(status="pending", expires_at=f"{hd}T13:40:00-05:00")   # (the preview expired it)
+        led["tickets"][0].pop("expired_at", None)
         tc.save_ledger(led)
         with fake_bars(quote, meta), self.assertRaises(ValueError) as cm:
             self.run_main("confirm", "TKT-20261127-001", "--yes", now=f"{hd}T13:30")
@@ -639,12 +836,41 @@ class CloseCancelPositionsHistoryTests(BrokerCase):
 
     def test_manual_close_with_price(self):
         t = self.open_long()
-        with fake_bars({("TSLA", "5m"): flat_session()}):
+        five = bars_from_closes(DAY, [100.0] * 11 + [100.4, 100.75], wick=0.1)   # 10:25 bar trades to 100.85
+        with fake_bars({("TSLA", "5m"): five}):
             code, res = self.run_json("close", t["id"], "--price", "100.75", now=f"{DAY}T10:40")
         self.assertEqual((res["closed_by"], res["trade"]["exit_reason"], res["trade"]["pnl"], res["trade"]["r_multiple"]),
                          ("manual", "manual", 30.0, 0.75))
+        self.assertFalse([n for n in res["notes"] if "not checked" in n], res["notes"])
         with self.assertRaises(ValueError):
             self.run_main("close", t["id"], "--price", "101", now=f"{DAY}T10:41")
+
+    def test_manual_close_price_must_have_traded_since_the_fill(self):
+        # Regression: `close --price 1000` on a ~100 stock recorded +$36,000 of made-up profit, and
+        # realized profit widens today's loss budget - a way around the daily guard-rail.
+        t = self.open_long()
+        five = flat_session(wick=0.1)            # 99.90-100.10 all day; bars after 10:40 are the future
+        five[20] = tc.Bar(five[20].ts, 100.0, 105.0, 100.0, 100.0, five[20].volume)   # 11:10, after "now"
+        for price in ("1000", "100.5", "99.5", "105"):
+            with self.subTest(price=price), fake_bars({("TSLA", "5m"): five}), \
+                    self.assertRaises(ValueError) as cm:
+                self.run_main("close", t["id"], "--price", price, now=f"{DAY}T10:40")
+            self.assertIn("outside what TSLA traded since the fill (99.90-100.10", str(cm.exception))
+        led = self.ledger()
+        self.assertEqual((led["trades"][0]["status"], led["trades"][0].get("pnl")), ("open", None))
+        self.assertEqual(broker.traded_range(five, None, et_ts(DAY, "10:40")), None)
+        self.assertEqual(broker.traded_range([], et_ts(DAY, "10:16"), et_ts(DAY, "10:40")), None)
+        self.assertEqual(broker.traded_range(five, et_ts(DAY, "10:16"), et_ts(DAY, "10:16")), (99.9, 100.1))  # fill bar
+        with fake_bars({("TSLA", "5m"): five}):          # at the edge of the range (half a cent of float noise)
+            code, res = self.run_json("close", t["id"], "--price", "100.10", now=f"{DAY}T10:40")
+        self.assertEqual((code, res["trade"]["exit_price"]), (0, 100.1))
+
+    def test_manual_close_price_without_bars_is_accepted_with_a_note(self):
+        t = self.open_long()
+        with fake_bars({}):
+            code, res = self.run_json("close", t["id"], "--price", "100.5", now=f"{DAY}T10:40")
+        self.assertEqual((code, res["trade"]["exit_price"]), (0, 100.5))
+        self.assertTrue(any("not checked against traded prices" in n for n in res["notes"]), res["notes"])
 
     def test_close_at_quote_even_without_bars(self):
         t = self.open_long()
@@ -835,6 +1061,13 @@ class SkillDocTests(unittest.TestCase):
                        "allow-listed", "Never invent prices"):
             self.assertIn(phrase, flat)
 
+    def test_sandbox_state_and_manual_price_rules_are_spelled_out(self):
+        # The README tells the user; Claude only sees SKILL.md once installed, so it says it too.
+        flat = " ".join(self.skill.split())
+        for phrase in ("(`ledger.json`) and `settings.json` live in `$DAYTRADER_HOME`", "may be gone next conversation",
+                       "offer both as files to download", "`--price` must be a price that traded since the fill"):
+            self.assertIn(phrase, flat)
+
     def test_every_documented_command_parses(self):
         import re
         import shlex
@@ -882,6 +1115,19 @@ class CliTests(TempHomeTestCase):
         self.assertEqual(json.loads(r.stdout)["totals"]["net_pnl"], 47.52)   # (370.04 - 364.10) x 8
         r = cli(f"{DAY}T11:00", "--json", "positions")
         self.assertEqual(json.loads(r.stdout)["positions"], [])
+
+    def test_weekend_ticket_is_a_preview_cli(self):
+        fx = self.home / "fx"
+        write_fixture(fx, yahoo_chart_url("TSLA", "1m", "1d"), yahoo_payload(quote_bars(368.14), "TSLA", price=368.14))
+        env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(fx), "DAYTRADER_NOW": "2026-10-31T11:00"}
+        r = run_cli(SCRIPT, "ticket", "--symbol", "TSLA", "--qty", "8", "--entry", "364.18", "--stop", "358.32",
+                    "--target", "370.04", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ORDER TICKET · PREVIEW", r.stdout)
+        self.assertIn("MARKET CLOSED — preview only. Re-run ticket after 09:30 ET", r.stdout)
+        self.assertNotIn("WAITING FOR YOUR YES", r.stdout)
+        r = run_cli(SCRIPT, "tickets", "--all", "--json", env=env)
+        self.assertEqual(json.loads(r.stdout)["tickets"], [])
 
     def test_data_error_is_one_line_exit_2(self):
         env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_NOW": f"{DAY}T10:15"}

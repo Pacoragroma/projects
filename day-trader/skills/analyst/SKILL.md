@@ -4,14 +4,14 @@ description: >-
   Day-trading desk: pre-trade ticker brief and post-trade review of the paper journal. The brief
   shows trend (price vs the 20/50-day SMAs, 20-day slope), key levels (prior day high/low/close,
   20-day and 6-month high/low, today's VWAP), daily ATR in $ and %, average dollar volume,
-  relative volume vs the same time of day, today's gap, and SEC context: company, shares
-  outstanding, last 30 days of 8-K items, 10-Q/10-K, possible dilution (S-1/S-3/424B) and insider
-  Form 4s. The review grades closed paper trades: win rate, average win/loss in $ and R, profit
-  factor, expectancy, max drawdown, best/worst trade, and breakdowns by setup, side, entry hour,
-  exit and Time Machine verdict, with plain-language takeaways. Use for "brief me on TSLA", "what
-  are the key levels for NVDA?", "is AAPL trending?", "is volume heavy today?", "any recent
-  filings or dilution?", "review my trades", "what's my win rate?", "which setups work for me?".
-  Free Yahoo Finance + SEC EDGAR data, no API key. Not financial advice.
+  relative volume vs the same time of day, today's gap, and SEC context: shares outstanding,
+  recent 8-K items, 10-Q/10-K, possible dilution (S-1/S-3/424B) and insider Form 4s. The review
+  grades closed paper trades: win rate, average win/loss in $ and R, profit factor, expectancy,
+  max drawdown, and breakdowns by setup, side, entry hour, exit and Time Machine verdict, with
+  plain-language takeaways. Use for "brief me on TSLA", "what are the key levels for NVDA?", "is
+  AAPL trending?", "is volume heavy today?", "any recent filings or dilution?", "review my
+  trades", "how am I doing overall / this month?", "what's my win rate?", "which setups work for
+  me?". Free Yahoo Finance + SEC EDGAR data, no API key. Not financial advice.
 ---
 # Analyst
 
@@ -31,12 +31,14 @@ python3 scripts/analyst.py brief TSLA --no-sec           # skip SEC (faster, Yah
 python3 scripts/analyst.py brief NVDA --filing-days 90 --json
 python3 scripts/analyst.py review                        # closed paper trades, last 30 days
 python3 scripts/analyst.py review --days 90 --symbol TSLA
+python3 scripts/analyst.py review --days 3650            # "overall": the whole journal (max 10 years)
 python3 scripts/analyst.py review --json
 ```
 
 * `brief SYMBOL`: one ticker per run. `--filing-days N` (1-365, default 30) sets the SEC window.
 * `review`: `--days N` = today and the previous N-1 calendar days, by close date (default 30).
-  `--symbol` keeps one ticker.
+  `--symbol` keeps one ticker. "This month" = `--days` set to today's day of the month (e.g.
+  `--days 30` on Oct 30); "overall" = `--days 3650`.
 * `--json` on either command gives the machine-readable result for chaining. Exit codes: 0 ok,
   1 bad input or a broken state file, 2 a data source is unreachable.
 
@@ -104,6 +106,8 @@ twenty paper trades cannot show an edge.
   earnings 8-K, a "possible dilution" filing, a Form 4 cluster.
 * Relay every `!` warning (JSON `warnings`): stale data, a halt, no bars in market hours, or a
   replay caveat. `-` lines (`notes`) say which data was missing or how a number was computed.
+* If the SEC line says `unavailable - HTTP 403 ...` or mentions `DAYTRADER_CONTACT`, see the SEC
+  rule below; the Yahoo part of the brief still stands.
 * "Possible dilution" means a registration or prospectus was filed, not that shares were sold.
   Say "worth checking", not "they are diluting".
 * **Brief JSON keys:**
@@ -119,6 +123,10 @@ twenty paper trades cannot show an edge.
 * **Review.** Give net P&L and expectancy (R) first, then the win rate next to the break-even
   win rate. Then the 2-3 most useful takeaways in your own words, always with the trade count
   ("over 5 trades"). Never turn a small-sample bucket into a rule ("always trade ORB longs").
+* **"How am I doing?"** Review is the trend over days and weeks, from closed trades only. For
+  *today* (P&L, open risk, loss budget left, trades left, loss streak, OPEN / CAUTION / STOP
+  TRADING) use the **budget** skill's `budget.py status` card. For a plain "how am I doing?",
+  give today's budget status first, then this review for the trend.
 * **Review JSON keys:** the headline numbers `count, win_rate_pct, net_pnl, expectancy_r,
   profit_factor, max_drawdown{usd, peak_at, trough_at}`, the breakdowns `by_setup, by_side,
   by_hour, by_window, by_exit, by_time_machine, by_symbol` (each a list of bucket stats), plus
@@ -149,3 +157,10 @@ twenty paper trades cannot show an edge.
   may need to be allow-listed. Never invent prices, headlines, or odds to fill the gap. Use
   `--no-sec` if only SEC is blocked. Exit code 1 means bad input or a broken state file: show
   the error.
+* **SEC 403 / contact email:** SEC asks automated clients to send a contact address, and may answer
+  `HTTP 403` without one (the SEC line then says `set DAYTRADER_CONTACT=...`). Suggest the user set
+  `DAYTRADER_CONTACT` to their own email and re-run, e.g.
+  `DAYTRADER_CONTACT=you@example.com python3 scripts/analyst.py brief TSLA` (or put
+  `"contact_email"` in `settings.json` in `$DAYTRADER_HOME`). Ask for the address; never make one
+  up. `blocked by proxy` / `Tunnel connection failed` means the request never reached SEC: the
+  host needs allow-listing, and an email will not fix that.

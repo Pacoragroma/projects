@@ -5,6 +5,8 @@ import json
 import math
 import os
 import random
+import re
+import shlex
 import sys
 import time
 import unittest
@@ -14,7 +16,7 @@ from unittest import mock
 # Works both with `unittest discover -s tests` and `python3 -m unittest tests.test_time_machine`.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from helpers import (TempHomeTestCase, bars_from_closes, et_ts, fake_bars, load_skill_module,  # noqa: E402
+from helpers import (SKILLS, TempHomeTestCase, bars_from_closes, et_ts, fake_bars, load_skill_module,  # noqa: E402
                      random_walk_history, random_walk_session, run_cli, skill_script, tc, trading_days,
                      write_fixture, yahoo_chart_url, yahoo_payload)
 
@@ -372,21 +374,114 @@ class VerdictTests(unittest.TestCase):
         self.assertIn("53.5%", notes[0])
         rr_edge = tm.verdict_notes(self.r(0.2, 20, 30, rr=3, share=40.0))
         self.assertTrue(any("comes from the reward:risk" in n for n in rr_edge))
-        res = self.r(0.3, 60, 38, share=61.2)
-        res["trend"] = {"avg_move_pct": 0.42, "t_stat": 1.9, "detrended": False,
-                        "alt": {"target_first_pct": 49.1, "stop_first_pct": 48.3, "open_at_close_pct": 2.6,
-                                "expected_r": 0.0, "verdict": "CLOSE TO A COIN FLIP"}}
-        self.assertTrue(any("leans on the stock's recent trend" in n and "+0.42%" in n
-                            for n in tm.verdict_notes(res)))
+        res = dict(self.r(0.3, 60, 38, share=61.2), side="long")
+        res["trend"] = self.trend(0.42, 0.26, 1.9, alt=(49.1, 48.3, 2.6, 0.0, "CLOSE TO A COIN FLIP"))
+        self.assertTrue(any(n.startswith("this verdict leans on a time-of-day drift in the past sessions, +0.42% "
+                                         "on average between 10:15 and 11:00, the median time to the stop or "
+                                         "target: 0.26R in favour of this long (t=1.9, within noise)")
+                            for n in tm.verdict_notes(res)), tm.verdict_notes(res))
         # same verdict either way, but the expected value moves a lot -> still mentioned
-        res = self.r(0.11, 36.9, 63.1, rr=2.0, share=36.9)
-        res["trend"] = {"avg_move_pct": 0.40, "t_stat": 1.7, "detrended": False,
-                        "alt": {"target_first_pct": 33.2, "stop_first_pct": 66.8, "open_at_close_pct": 0.0,
-                                "expected_r": -0.01, "verdict": "CLOSE TO A COIN FLIP"}}
-        self.assertTrue(any(n.startswith("part of this result is the stock's recent trend")
+        res = dict(self.r(0.11, 36.9, 63.1, rr=2.0, share=36.9), side="long")
+        res["trend"] = self.trend(0.40, 0.25, 1.7, alt=(33.2, 66.8, 0.0, -0.01, "CLOSE TO A COIN FLIP"))
+        self.assertTrue(any(n.startswith("part of this result is a time-of-day drift")
                             for n in tm.verdict_notes(res)))
         res["trend"]["alt"].update(expected_r=0.09, target_first_pct=36.0)    # immaterial -> no note
-        self.assertFalse(any("recent trend" in n for n in tm.verdict_notes(res)))
+        self.assertFalse(any("drift" in n for n in tm.verdict_notes(res)))
+
+    @staticmethod
+    def trend(drift_pct, drift_r, t, alt, detrended=False, avg=None, avg_t=None):
+        keys = ("target_first_pct", "stop_first_pct", "open_at_close_pct", "expected_r", "verdict")
+        return {"avg_move_pct": drift_pct if avg is None else avg, "t_stat": t if avg_t is None else avg_t,
+                "horizon": {"start": "10:15", "end": "11:00", "end_slot": 17, "minutes": 45,
+                            "basis": "median_resolution"},
+                "drift_pct": drift_pct, "drift_r": drift_r, "horizon_avg_move_pct": drift_pct,
+                "horizon_t_stat": t, "detrended": detrended, "alt": dict(zip(keys, alt))}
+
+    def test_trend_note_never_contradicts_itself(self):
+        # The critic's case: the whole window moved +0.00% (t=0.0), yet removing the drift flips
+        # +0.10R to -0.11R because of drift in the first bars: +0.11% by the median exit = 0.23R of a
+        # 0.47% stop. The note must quote that, not the whole-window +0.00%.
+        res = dict(self.r(0.104, 36.7, 63.2, o=0.1, rr=2.0, share=36.8), side="long")
+        res["trend"] = self.trend(0.109, 0.232, 1.5, alt=(29.57, 70.42, 0.01, -0.113, "ODDS LEAN AGAINST YOU"),
+                                  avg=0.0, avg_t=0.0)
+        note = [n for n in tm.verdict_notes(res) if "drift" in n]
+        self.assertEqual(len(note), 1, tm.verdict_notes(res))
+        self.assertIn("leans on a time-of-day drift in the past sessions, +0.11% on average between 10:15 and "
+                      "11:00, the median time to the stop or target: 0.23R in favour of this long", note[0])
+        self.assertIn("-0.11R, ODDS LEAN AGAINST YOU", note[0])
+        self.assertNotIn("+0.00%", note[0])
+        self.assertNotIn("recent trend", note[0])
+        # --detrend headline: the comparison names the same drift.
+        flat = dict(self.r(-0.113, 29.57, 70.42, o=0.01, rr=2.0, share=29.6), side="long",
+                    verdict="ODDS LEAN AGAINST YOU")
+        flat["trend"] = self.trend(0.109, 0.232, 1.5, alt=(36.7, 63.2, 0.1, 0.104, "CLOSE TO A COIN FLIP"),
+                                   detrended=True, avg=0.0, avg_t=0.0)
+        note = [n for n in tm.verdict_notes(flat) if "drift" in n]
+        self.assertTrue(note[0].startswith("with the time-of-day drift left in, the replays give 36.7% target / "
+                                           "63.2% stop, +0.10R, CLOSE TO A COIN FLIP; that drift is +0.11%"), note)
+        # A drift too small to matter, or pointing the other way, is never named as the cause.
+        for drift_r in (0.01, -0.3):
+            res["trend"] = self.trend(0.005 if drift_r > 0 else -0.14, drift_r, 0.1,
+                                      alt=(29.57, 70.42, 0.01, -0.113, "ODDS LEAN AGAINST YOU"))
+            note = [n for n in tm.verdict_notes(res) if "drift" in n]
+            self.assertTrue(note[0].startswith("this verdict is sensitive to small time-of-day drifts in the past "
+                                               "sessions, though they add up to only"), note)
+            self.assertNotIn("leans on", note[0])
+        # A short gains from a falling drift: the R is signed for the trade.
+        res["side"] = "short"
+        res["trend"] = self.trend(-0.2, 0.4, -2.5, alt=(29.57, 70.42, 0.01, -0.113, "ODDS LEAN AGAINST YOU"))
+        note = [n for n in tm.verdict_notes(res) if "drift" in n]
+        self.assertIn("-0.20% on average between 10:15 and 11:00, the median time to the stop or target: 0.40R in "
+                      "favour of this short (t=-2.5)", note[0])
+
+
+class TrendCheckTests(unittest.TestCase):
+    MU = 0.0005          # +0.05% per bar for the first FRONT bars, then drifting back down
+
+    def library(self, front=6, sessions=40):
+        """Per-slot mean r_close = 1 + MU for the first `front` slots, 1 - MU*front/(78-front) later;
+        sessions alternate a +/-0.1% first bar (given back in the last bar) so the slot means are
+        exact, the whole day nets out and the sessions still differ."""
+        late = -self.MU * front / (tm.SLOTS - front)
+        lib = []
+        for j in range(sessions):
+            sgn = 1 if j % 2 == 0 else -1
+            row = []
+            for k in range(tm.SLOTS):
+                noise = 0.001 * sgn * (1 if k == 0 else -1 if k == tm.LAST_SLOT else 0)
+                c = 1 + (self.MU if k < front else late) + noise
+                row.append((c, max(c, 1.0) * 1.0005, min(c, 1.0) * 0.9995))
+            lib.append(row)
+        return lib
+
+    def test_slot_drift_is_what_detrending_removes(self):
+        lib = self.library()
+        self.assertAlmostEqual(tm.slot_drift(lib, 0, 5), (1 + self.MU) ** 6 - 1)
+        self.assertAlmostEqual(tm.slot_drift(lib, 2, 3), (1 + self.MU) ** 2 - 1)
+        self.assertAlmostEqual(tm.slot_drift(tm.detrend_library(lib), 0, 5), 0.0)
+        self.assertAlmostEqual(tm.slot_drift([[None] * 78], 0, 77), 0.0)
+
+    def test_horizon_runs_to_the_median_exit(self):
+        lib = self.library()
+        # 0.47% stop below 100, median resolution 30 minutes = 6 bars: 09:30-10:00.
+        tr = tm.trend_check(lib, 0, tm.LAST_SLOT, "long", 100.0, 99.53, 30.0)
+        self.assertEqual(tr["horizon"], {"start": "09:30", "end": "10:00", "end_slot": 5, "minutes": 30,
+                                         "basis": "median_resolution"})
+        drift = (1 + self.MU) ** 6 - 1
+        self.assertAlmostEqual(tr["drift_pct"], round(drift * 100, 3))
+        self.assertAlmostEqual(tr["drift_r"], round(drift / 0.0047, 3))       # ~0.64R of a 0.47% stop
+        self.assertLess(abs(tr["avg_move_pct"]), 0.01)                         # whole window: ~nothing
+        self.assertGreater(tr["horizon_t_stat"], 2)                           # sessions differ, drift real
+        # a part-bar median rounds up to the bar it ends in; a short gets the sign flipped
+        tr = tm.trend_check(lib, 2, tm.LAST_SLOT, "short", 100.0, 100.47, 12.5)
+        self.assertEqual((tr["horizon"]["start"], tr["horizon"]["end"]), ("09:40", "09:55"))
+        self.assertAlmostEqual(tr["drift_r"], round(-((1 + self.MU) ** 3 - 1) / 0.0047, 3))
+        # no replay resolved: the whole window, capped at the end slot
+        tr = tm.trend_check(lib, 0, 40, "long", 100.0, 99.53, None)
+        self.assertEqual((tr["horizon"]["basis"], tr["horizon"]["end"], tr["horizon"]["end_slot"]),
+                         ("window", "12:55", 40))
+        tr = tm.trend_check(lib, 70, 77, "long", 100.0, 99.53, 600.0)
+        self.assertEqual(tr["horizon"]["end"], "16:00")
 
 
 class StartTests(unittest.TestCase):
@@ -484,6 +579,27 @@ class SvgTests(unittest.TestCase):
         self.assertIn(f"{po:.1f}%", texts)
         strokes = {g.get("stroke") for g in root.iter(f"{ns}g") if g.get("stroke")}
         self.assertIn(tm.COLORS["target"], strokes)
+
+
+def front_loaded_history(end="2026-10-30", n=60, mu=0.00015, front=8, vol=0.002, seed=3, wick=0.0005):
+    """The critic's shape: past sessions that drift up +mu per bar for the first `front` bars and give
+    it back over the rest of the day, so the whole window nets out to ~0% while the first 40 minutes -
+    where a tight trade is decided - drift up. Sessions come in mirrored-noise pairs (oldest first),
+    so over whole pairs each slot's mean move is exactly the drift."""
+    rng = random.Random(seed)
+    bars = []
+    noise = []
+    for j, day in enumerate(trading_days(end, n)):
+        if j % 2 == 0:
+            noise = [rng.gauss(0, vol) for _ in range(tm.SLOTS)]
+        sgn = 1 if j % 2 == 0 else -1
+        t0, p = et_ts(day, "09:30"), 100.0
+        for k in range(tm.SLOTS):
+            m = mu if k < front else -mu * front / (tm.SLOTS - front)
+            c = p * (1 + m + sgn * noise[k])
+            bars.append(tc.Bar(t0 + k * 300, p, max(p, c) * (1 + wick), min(p, c) * (1 - wick), c, 1000))
+            p = c
+    return bars
 
 
 def capture(argv):
@@ -641,6 +757,88 @@ class MainTests(TempHomeTestCase):
         self.assertEqual((past["mode"], past["start"]), ("at", "09:45"))
         self.assertFalse(any("already through your stop" in w for w in past["warnings"]))
         self.assertTrue(any("already through your stop" in w for w in ahead["warnings"]))
+
+    def test_trend_check_measures_the_drift_a_trade_lives_through(self):
+        # Regression (critic): the whole window drifted +0.00% (t=0.0), the trend-removed replays
+        # still came out far worse, and the note blamed "the stock's recent trend (+0.00%)". The drift
+        # is in the first bars: measured to the median exit it is a real share of a 0.47% stop.
+        lv = ["TSLA", "--entry", "100", "--stop", "99.53", "--target", "100.94", "--paths", "4000",
+              "--sessions", "58"]                                       # whole mirrored pairs only
+        with fake_bars({"TSLA": front_loaded_history()}), \
+                mock.patch.dict(os.environ, {"DAYTRADER_NOW": "2026-10-30T19:30"}):
+            d = json.loads(capture(lv + ["--json"])[1])
+            text = capture(lv)[1]
+        tr = d["trend"]
+        self.assertLess(abs(tr["avg_move_pct"]), 0.005)                      # the misleading number
+        h = tr["horizon"]
+        self.assertEqual((h["start"], h["basis"]), ("09:30", "median_resolution"))
+        self.assertEqual(h["minutes"], math.ceil(d["median_minutes_to_resolution"] / 5) * 5)
+        bars_in = min(h["end_slot"] + 1, 8)
+        want = (1.00015 ** bars_in) * (1 - 0.00015 * 8 / 70) ** (h["end_slot"] + 1 - bars_in) - 1
+        self.assertAlmostEqual(tr["drift_pct"], want * 100, places=3)
+        self.assertAlmostEqual(tr["drift_r"], want / 0.0047, places=2)
+        self.assertGreater(tr["drift_r"], 0.1)
+        gap = d["expected_r"] - tr["alt"]["expected_r"]
+        self.assertGreaterEqual(gap, 0.1)                                    # material: a note is due
+        notes = [n for n in d["verdict_notes"] if "drift" in n]
+        self.assertEqual(len(notes), 1, d["verdict_notes"])
+        self.assertIn(f"{tr['drift_pct']:+.2f}% on average between 09:30 and {h['end']}, the median time to "
+                      f"the stop or target: {tr['drift_r']:.2f}R in favour of this long", notes[0])
+        self.assertNotIn("+0.00%", notes[0])
+        self.assertIn(f"Trend check: from 09:30 to {h['end']} (the median time to stop/target) the past "
+                      f"sessions drifted {tr['drift_pct']:+.2f}%", " ".join(text.split()))
+        self.assertIn("whole window to 16:00: +0.00% (t=0.0)", " ".join(text.split()))
+
+    def test_display_pct_is_what_the_card_prints_and_is_saved(self):
+        self.assertEqual(tm.display_pct({"target": 3166, "stop": 3157, "open": 3677}, 10000),
+                         {"target_first": 31.6, "stop_first": 31.6, "open_at_close": 36.8})   # not 31.7 / 36.8
+        with fake_bars({"TSLA": self.history()}):
+            d = json.loads(capture(["TSLA", "--entry", "364.18", "--stop", "362.5", "--target", "366",
+                                    "--paths", "3001", "--json", "--save"])[1])
+            text = capture(["TSLA", "--entry", "364.18", "--stop", "362.5", "--target", "366", "--paths", "3001"])[1]
+        shown = d["display_pct"]
+        c = d["counts"]
+        self.assertEqual([shown["target_first"], shown["stop_first"], shown["open_at_close"]],
+                         tm.split_pct([c["target"], c["stop"], c["open"]], 3001, 1))
+        self.assertAlmostEqual(sum(shown.values()), 100.0, places=9)
+        for label, key in (("HIT TARGET FIRST", "target_first"), ("HIT STOP FIRST", "stop_first"),
+                           ("OPEN AT CLOSE", "open_at_close")):
+            self.assertIn(f"{label:<18} {shown[key]:5.1f}%", text)
+        self.assertEqual(tc.load_plan("TSLA")["time_machine"]["display_pct"], shown)
+
+    def test_entry_from_a_finished_session_trigger_is_noted(self):
+        note = "trigger is from the finished 2026-10-29 session - re-plan from the next open"
+        signal = {"source": "entry", "setup": "orb", "label": "ORB(15)", "date": "2026-10-29",
+                  "triggered_at": "10:15", "entry": 364.18, "suggested_stop": 358.32, "session_over": True,
+                  "note": note}
+        tc.save_plan({"symbol": "TSLA", "side": "long", "entry": 364.18, "stop": 358.32, "target": 370.04,
+                      "entry_signal": signal})
+        want = f"the saved TSLA entry 364.18 is an entry-skill trigger (ORB(15) at 10:15 ET): {note}"
+        with fake_bars({"TSLA": self.history()}):
+            d = json.loads(capture(["TSLA", "--json", "--paths", "500"])[1])
+            self.assertIn(want, d["notes"])
+            text = capture(["TSLA", "--paths", "500"])[1]
+            self.assertIn("  - the saved TSLA entry 364.18 is an entry-skill trigger", text)
+            d = json.loads(capture(["TSLA", "--entry", "364.5", "--json", "--paths", "500"])[1])  # a new entry
+            self.assertFalse(any("entry-skill trigger" in n for n in d["notes"]), d["notes"])
+        # A trigger saved live today has not played out: no note.
+        tc.save_plan({"symbol": "TSLA", "side": "long", "entry": 364.18, "stop": 358.32, "target": 370.04,
+                      "entry_signal": dict(signal, date="2026-10-30", session_over=False, note=None)})
+        self.assertIsNone(tm.finished_trigger_note(tc.load_plan("TSLA"), "TSLA", 364.18, "2026-10-30"))
+        self.assertIsNotNone(tm.finished_trigger_note(tc.load_plan("TSLA"), "TSLA", 364.18, "2026-10-31"))
+
+    def test_skill_md_routes_the_desk_run(self):
+        text = (SKILLS / "time-machine" / "SKILL.md").read_text(encoding="utf-8")
+        desc = " ".join(re.search(r"^description: >-\n(.*?)^---", text, re.M | re.S).group(1).split())
+        self.assertIn('"plan a trade on TSLA and test it"', desc)
+        self.assertIn('"plan and test a trade"', desc)
+        self.assertLessEqual(len(desc), 1024)
+        self.assertLess(text.index('## Full desk run ("plan a trade on SYM and test it")'), text.index("## Run"))
+        section = re.search(r"^## Full desk run.*?(?=^## )", text, re.M | re.S).group(0)
+        cmds = re.findall(r"`python3 scripts/time_machine\.py([^`]*)`", section)
+        self.assertEqual(cmds, [" SYM --save"])
+        for c in cmds:
+            tm.build_parser().parse_args(shlex.split(c))
 
     def test_market_closed_runs_next_session_and_uses_todays_complete_session(self):
         with fake_bars({"TSLA": self.history()}), mock.patch.dict(os.environ, {"DAYTRADER_NOW": "2026-10-30T18:00"}):

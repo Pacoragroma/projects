@@ -287,7 +287,8 @@ class CommandTests(TempHomeTestCase):
     def test_save_merges_sizing_and_reads_plan_back(self):
         tc.save_plan({"symbol": "TSLA", "side": "long", "entry": 364.18, "stop": 358.32, "target": 370.04,
                       "entry_signal": {"setup": "orb"},
-                      "time_machine": {"target_first_pct": 29.4, "stop_first_pct": 25.5, "verdict": "CLOSE TO A COIN FLIP"}})
+                      "time_machine": {"side": "long", "entry": 364.18, "stop": 358.32, "target": 370.04,
+                                       "target_first_pct": 29.4, "stop_first_pct": 25.5, "verdict": "CLOSE TO A COIN FLIP"}})
         code, out = run_main("size", "--symbol", "TSLA", "--save", "--json")
         d = json.loads(out)
         self.assertEqual(code, 0)
@@ -470,6 +471,95 @@ class ReviewRegressionTests(TempHomeTestCase):
         notes = json.loads(out)["notes"]
         self.assertTrue(any("SHORT inferred" in n for n in notes), notes)
         self.assertFalse(any("pass --side long" in n for n in notes), notes)
+
+
+class TimeMachineNoteTests(TempHomeTestCase):
+    """`size` shows the time machine's odds exactly as it printed them, and says when these levels were
+    never tested."""
+    NOW = "2026-10-30T10:15"
+    UNTESTED = "not tested by the time machine for these levels"
+
+    @staticmethod
+    def tm(**kw):
+        d = {"side": "long", "entry": 364.18, "stop": 358.32, "target": 370.04, "verdict": "CLOSE TO A COIN FLIP",
+             "target_first_pct": 31.66, "stop_first_pct": 31.57, "open_at_close_pct": 36.77}
+        d.update(kw)
+        return d
+
+    def save_plan(self, tm=None):
+        p = {"symbol": "TSLA", "side": "long", "entry": 364.18, "stop": 358.32, "target": 370.04}
+        if tm is not None:
+            p["time_machine"] = tm
+        tc.save_plan(p)
+
+    def notes(self, *argv):
+        code, out = run_main("size", *argv, "--json")
+        self.assertEqual(code, 0)
+        return json.loads(out)["notes"]
+
+    def test_display_pct_is_printed_as_the_time_machine_printed_it(self):
+        self.save_plan(self.tm(display_pct={"target_first": 31.6, "stop_first": 31.6, "open_at_close": 36.8}))
+        notes = self.notes("TSLA")
+        self.assertIn("time-machine: target first 31.6% / stop first 31.6% - CLOSE TO A COIN FLIP", notes)
+        self.assertFalse(any(self.UNTESTED in n for n in notes))
+        _, text = run_main("size", "TSLA")
+        self.assertIn("- time-machine: target first 31.6% / stop first 31.6%", text)
+
+    def test_raw_values_fall_back_to_one_decimal(self):
+        self.save_plan(self.tm())
+        self.assertIn("time-machine: target first 31.7% / stop first 31.6% - CLOSE TO A COIN FLIP", self.notes("TSLA"))
+        self.save_plan(self.tm(display_pct={"target_first": None, "stop_first": "?"}))   # malformed: raw values
+        self.assertIn("time-machine: target first 31.7% / stop first 31.6% - CLOSE TO A COIN FLIP", self.notes("TSLA"))
+
+    def test_plan_without_time_machine(self):
+        self.save_plan()
+        self.assertIn(f"{self.UNTESTED} (run time_machine.py TSLA --save)", self.notes("TSLA"))
+        _, text = run_main("size", "TSLA")
+        self.assertIn(f"- {self.UNTESTED} (run time_machine.py TSLA --save)", text)
+
+    def test_odds_for_other_levels_are_not_shown(self):
+        # Regression: the odds were printed whenever the plan's levels matched, even if the time machine
+        # had been run for another target.
+        self.save_plan(self.tm(target=375.0))
+        notes = self.notes("TSLA")
+        self.assertFalse(any(n.startswith("time-machine:") for n in notes), notes)
+        self.assertIn(f"{self.UNTESTED} (run time_machine.py TSLA --save) - the plan's odds were for other levels",
+                      notes)
+
+    def test_levels_off_the_plan_name_them_unless_saved(self):
+        self.save_plan(self.tm())
+        notes = self.notes("TSLA", "--entry", "365", "--stop", "359", "--target", "371")
+        self.assertIn(f"{self.UNTESTED} (run time_machine.py TSLA --entry 365.00 --stop 359.00 --target 371.00 "
+                      "--save) - the plan's odds were for other levels", notes)
+        notes = self.notes("TSLA", "--entry", "365", "--stop", "359", "--target", "371", "--save")
+        self.assertIn(f"{self.UNTESTED} (run time_machine.py TSLA --save) - the plan's odds were for other levels",
+                      notes)
+        self.assertNotIn("time_machine", tc.load_plan("TSLA"))          # cleared by the save
+        self.assertIn(f"{self.UNTESTED} (run time_machine.py TSLA --save)", self.notes("TSLA"))
+
+    def test_no_target_or_no_symbol(self):
+        notes = self.notes("TSLA", "--entry", "100", "--stop", "99")
+        self.assertIn(f"{self.UNTESTED} (it needs a target to measure the odds)", notes)
+        notes = self.notes("--entry", "100", "--stop", "99", "--target", "102")
+        self.assertFalse(any(self.UNTESTED in n for n in notes), notes)  # no ticker: nothing to run
+
+
+class DirectionalOpenRiskTests(TempHomeTestCase):
+    NOW = "2026-10-30T10:15"
+
+    def test_stop_past_the_entry_is_zero_open_risk_everywhere(self):
+        # trade_initial_risk is directional: a long at 100 with its stop moved to 103 risks nothing more.
+        t = trade("TRADE-20261030-001", status="open", qty=10, entry=100.0, stop=103.0)
+        s = trade("TRADE-20261030-002", symbol="AMD", status="open", qty=10, entry=50.0, stop=51.0, side="short")
+        tc.save_ledger({"tickets": [], "trades": [t, s]})
+        _, out = run_main("show", "--json")
+        d = json.loads(out)
+        self.assertEqual([p["risk"] for p in d["open_positions"]], [0.0, 10.0])
+        self.assertEqual(d["today"]["open_risk"], 10.0)
+        self.assertEqual(d["today"]["open_risk"], sum(p["risk"] for p in d["open_positions"]))
+        self.assertEqual(d["today"]["open_risk"], tc.day_summary()["open_risk"])
+        _, out = run_main("size", "--entry", "364.18", "--stop", "358.32", "--json")
+        self.assertEqual(json.loads(out)["budget"]["open_risk"], 10.0)
 
 
 class CliTests(TempHomeTestCase):

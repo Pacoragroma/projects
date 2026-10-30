@@ -513,6 +513,25 @@ def _same_level(a: Any, b: Any) -> bool:
     return a == b
 
 
+def finished_trigger_warning(plan: Dict[str, Any], sym: str, entry: float, today: str) -> Optional[str]:
+    """The entry skill's note when the plan's entry is a trigger from a session that is already over.
+
+    entry --save after the close (or of a past --date) stores entry_signal.session_over and a note;
+    a trigger saved live whose session date is now in the past has played out just the same.
+    """
+    sig = plan.get("entry_signal")
+    if not isinstance(sig, dict) or not isinstance(sig.get("entry"), (int, float)) \
+            or not _same_level(sig["entry"], entry):
+        return None
+    day = str(sig.get("date") or "")
+    if not (sig.get("session_over") or sig.get("replay") or (day and day < today)):
+        return None
+    note = sig.get("note") or f"trigger is from the finished {day} session - re-plan from the next open"
+    when = f" at {sig['triggered_at']} ET" if sig.get("triggered_at") else ""
+    what = f"{sig.get('label') or sig.get('setup') or 'entry'}{when}"
+    return f"the saved {sym} entry {tc.fmt_price(entry)} is an entry-skill trigger ({what}): {note}"
+
+
 def stale_sections(existing: Optional[Dict[str, Any]], res: Dict[str, Any]) -> List[str]:
     """Sections of the saved plan that were computed for other levels than `res`.
 
@@ -681,6 +700,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if plan_is_old and "saved plan" in (entry_source, stop_source):
         warnings.append(f"the saved {sym} plan is from {made} - its levels may be stale; pass --entry "
                         "(and --stop) to plan from today's price")
+    if entry_source == "saved plan":
+        played_out = finished_trigger_warning(plan, sym, entry, today)
+        if played_out:
+            warnings.append(played_out)
 
     if args.side:
         side, side_source = args.side, "--side"

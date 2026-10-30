@@ -9,8 +9,8 @@ description: >-
   stop and a move-to-breakeven rule, with warnings when the stop is too tight or too wide. Saves to
   the shared trade plan. Use when the user asks "where should my stop go?", "set a stop and target
   for TSLA", "what's my exit plan?", "give me a 2R target from 364.18", "is my stop too tight?",
-  "plan the trade before I get in", "where do I take profit?", "stop 358.32, what's my R:R?", or
-  right after the entry skill triggers. Free Yahoo Finance data, no API key. Not financial advice.
+  "plan the trade before I get in", "plan a trade on TSLA and test it", "plan and test a trade",
+  "where do I take profit?", "stop 358.32, what's my R:R?", or right after the entry skill triggers. Free Yahoo Finance data, no API key. Not financial advice.
 ---
 # Exit Plan
 
@@ -19,6 +19,27 @@ stop, the target and the time stop, and shows what the trade risks and needs: ri
 reward:risk, the win rate you need just to break even, and how the stop compares with the
 stock's normal 5-minute swings (ATR). The result is "THE PLAN" card. With `--save`, the plan is
 merged into the shared trade plan that time-machine, risk, alerts and broker read.
+
+## Full desk run ("plan a trade on SYM and test it")
+
+When the user asks to plan and test a trade end to end, run the desk in this order. Every step reads
+and updates the shared plan (`plans/<SYM>.json`). Run sibling skills' scripts from their own folders.
+
+1. **scanner** — `python3 scripts/scan.py --symbols SYM`: any setup on the daily chart?
+2. **news** — `python3 scripts/news.py SYM`: anything that could move it today?
+3. **entry** — `python3 scripts/entry.py SYM --save`: if TRIGGERED, the trigger becomes the entry
+   and the opening-range stop.
+4. **exit** — after a trigger: `python3 scripts/exit_plan.py SYM --method manual --rr 1 --save`
+   (keep the entry's stop, 1R target). No trigger: `python3 scripts/exit_plan.py SYM --save`
+   (current price, ATR stop, 2R target).
+5. **time-machine** — `python3 scripts/time_machine.py SYM --save`: the honest odds for those levels.
+6. **risk** — `python3 scripts/risk.py size --symbol SYM --save`: how many shares.
+7. **budget** — `python3 scripts/budget.py check --symbol SYM`: exit 3 means BLOCKED; stop there.
+8. **broker** — `python3 scripts/broker.py ticket --symbol SYM`: show the ticket and **stop**. Confirm
+   only after the user's explicit yes in a later message.
+
+Skip any step the user rules out. Show the plan card, the Time Machine verdict and the ticket together,
+and say plainly that it is paper trading and not financial advice.
 
 ## Run
 > Scripts live in this skill's `scripts/` folder. Run them from the skill's folder (`python3 scripts/<tool>.py ...`) or by absolute path. Python 3.9+, standard library only.
@@ -72,6 +93,10 @@ Flags:
   * last price already through the stop (the plan only works as a pending order) or past the
     target. With the market closed it is the last close, so check the pre-market price;
   * a saved plan from an earlier day (its entry, stop or side reused);
+  * a saved entry that is an entry-skill trigger from a session that is already over (`entry.py
+    --save` after the close or for a past `--date`, or a trigger from an earlier day): the warning
+    repeats the entry skill's note, e.g. "trigger is from the finished 2026-10-30 session - re-plan
+    from the next open";
   * stale, halted or holiday data;
   * less than 30 minutes, or no time at all, before the time stop.
 * **Time stop:** flat by 15:55 ET by default. On early-close days (from Yahoo's trading period)

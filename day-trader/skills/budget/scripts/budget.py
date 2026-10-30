@@ -224,6 +224,9 @@ def normalize_ledger(raw: Dict[str, Any]) -> Dict[str, Any]:
             c = dict(k)
             c["status"], c["_ticket"] = "working", True
             c["side"] = str(k.get("side") or "").strip().lower()
+            if c["side"] not in ("long", "short"):   # its risk depends on the side
+                raise tc.StateError(f"ledger.json: working order {label} has side {k.get('side')!r} "
+                                    "(expected long/short) - fix or cancel it")
             c["qty"] = _need(k, label, "qty", k.get("qty"))
             c["entry_price"] = _need(k, label, "entry/limit price", _order_entry(k))
             c["stop"] = _need(k, label, "stop", k.get("stop"))
@@ -233,7 +236,12 @@ def normalize_ledger(raw: Dict[str, Any]) -> Dict[str, Any]:
         elif status == "pending":
             c = dict(k)
             q, e, s = _num(k.get("qty")), _num(k.get("entry")), _num(k.get("stop"))
-            c["risk"] = round(abs(e - s) * q, 2) if None not in (q, e, s) else None
+            side = str(k.get("side") or "").strip().lower()
+            if None in (q, e, s):
+                c["risk"] = None
+            else:   # no side: inferred from the levels, as the broker does
+                side = side if side in ("long", "short") else ("long" if s < e else "short")  # type: ignore[operator]
+                c["risk"] = order_risk({"side": side, "qty": q, "entry_price": e, "stop": s})
             pending.append(c)
     return {"trades": trades, "working": working, "pending": pending}
 
@@ -253,7 +261,9 @@ def live_pending(pending: Sequence[Dict[str, Any]], now: datetime) -> List[Dict[
 
 
 def order_risk(row: Dict[str, Any]) -> float:
-    return round(abs(float(row["entry_price"]) - float(row["stop"])) * float(row["qty"]), 2)
+    """Dollars lost if the stop is hit, exactly as tc.day_summary counts open risk: directional,
+    and 0 once the stop has moved past the entry (so the rows add up to the open-risk total)."""
+    return round(tc.trade_initial_risk(row), 2)
 
 
 def budget_view(norm: Dict[str, Any], day: str, today: str, now_iso: str) -> Dict[str, Any]:
@@ -554,16 +564,28 @@ def realized_low(closed: Sequence[Dict[str, Any]]) -> float:
 
 
 def history(norm: Dict[str, Any], settings: Dict[str, Any], end_day: str, days: int) -> Dict[str, Any]:
-    """Per-day realized P&L, trades and wins/losses for the `days` calendar days ending `end_day`."""
+    """Per-day realized P&L, trades and wins/losses for the `days` calendar days ending `end_day`
+    (today).
+
+    Working orders (confirmed limit orders not filled yet) are counted the way `status` counts them:
+    on today's row each is a trade (it can still fill), labelled as working; on a past day the
+    unfilled day order expired at that day's time stop, so it is not a trade there (as in
+    `status --date`) and is only labelled as never synced.
+    """
     end = datetime.strptime(end_day, "%Y-%m-%d")
     start = (end - timedelta(days=days - 1)).strftime("%Y-%m-%d")
     led = {"tickets": [], "trades": [t for t in norm["trades"] if t["status"] in ("open", "closed")]}
+    working: Dict[str, List[Dict[str, Any]]] = {}
+    for w in norm["working"]:
+        wd = _day(w.get("opened_at")) or end_day          # no confirmation time: today (as `status`)
+        working.setdefault(wd, []).append(dict(w, status="open", _working=True, opened_at=w.get("opened_at") or wd))
     active = sorted({d for t in led["trades"] for d in (_day(t.get("opened_at")), _day(t.get("closed_at")))
-                     if d and start <= d <= end_day})
+                     if d and start <= d <= end_day} | {d for d in working if start <= d <= end_day})
     max_loss = float(settings["daily_max_loss"])
     rows = []
     for d in active:
-        s = tc.day_summary(led, d)
+        live = working.get(d, []) if d == end_day else []
+        s = tc.day_summary({"tickets": [], "trades": led["trades"] + live}, d)
         closed = [t for t in led["trades"] if t["status"] == "closed" and _day(t.get("closed_at")) == d]
         rs = [t["r_multiple"] for t in closed if t.get("r_multiple") is not None]
         streak = max_loss_streak(closed)
@@ -583,6 +605,7 @@ def history(norm: Dict[str, Any], settings: Dict[str, Any], end_day: str, days: 
             "realized_pnl": s["realized_pnl"], "realized_low": low,
             "r_total": round(sum(rs), 2) if rs else None,
             "risked": s["risked_today"], "max_loss_streak": streak, "still_open": still_open,
+            "working": len(live), "unsynced_working": 0 if d == end_day else len(working.get(d, [])),
             "flags": flags,
         })
     closed_n = sum(r["closed"] for r in rows)
@@ -591,6 +614,7 @@ def history(norm: Dict[str, Any], settings: Dict[str, Any], end_day: str, days: 
     totals = {
         "days_with_activity": len(rows),
         "trades": sum(r["trades"] for r in rows),
+        "working": sum(r["working"] for r in rows),
         "closed": closed_n, "wins": wins, "losses": sum(r["losses"] for r in rows),
         "win_rate_pct": round(wins / closed_n * 100.0, 1) if closed_n else None,
         "realized_pnl": round(sum(r["realized_pnl"] for r in rows), 2),
@@ -771,12 +795,16 @@ def render_history(r: Dict[str, Any]) -> str:
     rows = [[x["date"], x["weekday"], x["trades"], x["closed"], x["wins"], x["losses"],
              tc.fmt_money(x["realized_pnl"], signed=True),
              "-" if x["r_total"] is None else f"{x['r_total']:+.2f}",
-             ", ".join(x["flags"] + ([f"{x['still_open']} still open"] if x["still_open"] else []))]
+             ", ".join(x["flags"] + ([f"{x['still_open']} still open"] if x["still_open"] else [])
+                       + ([f"{x['working']} working (not filled)"] if x.get("working") else [])
+                       + ([f"{x['unsynced_working']} working never synced (run broker sync)"]
+                          if x.get("unsynced_working") else []))]
             for x in r["rows"]]
     lines.append(tc.table(rows, ["date", "day", "trades", "closed", "W", "L", "realized", "R", "flags"]))
     t = r["totals"]
     wr = "-" if t["win_rate_pct"] is None else f"{t['win_rate_pct']:.0f}%"
-    lines.append(f"Total: {t['trades']} trades · {t['wins']} W / {t['losses']} L (win rate {wr} of closed) · "
+    working = f" ({t['working']} working, not filled)" if t.get("working") else ""
+    lines.append(f"Total: {t['trades']} trades{working} · {t['wins']} W / {t['losses']} L (win rate {wr} of closed) · "
                  f"net {tc.fmt_money(t['realized_pnl'], signed=True)} · {_plural(t['green_days'], 'green day')}, "
                  f"{_plural(t['red_days'], 'red day')} · limits broken on {_plural(t['limit_days'], 'day')}")
     lines.append(tc.DISCLAIMER)
@@ -954,9 +982,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         r["marks"] = fetch_marks(r["positions"])
         for m in r["marks"]["positions"]:
             if m.get("note", "").startswith("THROUGH STOP"):
+                more = (f" - the loss may exceed its {tc.fmt_money(m['risk'])} planned risk" if m["risk"] > 0
+                        else " (its stop is past the entry, so it risks no loss)")
                 r["cautions"].append(f"{m['symbol']} ({m['id']}) is trading through its stop at "
-                                     f"{tc.fmt_price(m['last'])} - the loss may exceed its "
-                                     f"{tc.fmt_money(m['risk'])} planned risk; run the broker's sync")
+                                     f"{tc.fmt_price(m['last'])}{more}; run the broker's sync")
         if r["cautions"] and r["status"] == OPEN:
             r["status"] = CAUTION
     elif args.mark:

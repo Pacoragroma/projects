@@ -4,7 +4,8 @@
 There is no live mode, no --live flag and no code path that contacts a real broker. The only
 network calls are Yahoo Finance price data (through trader_common) used to simulate fills.
 
-  ticket    create a pending ticket after validating the levels and the daily budget
+  ticket    create a pending ticket after validating the levels and the daily budget (outside the
+            session: the same checks, printed as a PREVIEW that is not saved and cannot be confirmed)
   confirm   the ONLY path that opens a paper position, and only with --yes
   sync      apply stops / targets / the time stop from 5-minute bars; fill working limit orders
   close     manual exit at the current quote or a given price
@@ -162,6 +163,42 @@ def order_window_problem(now: datetime, time_stop: int, ttl_minutes: Optional[in
         return (f"pre-market ({now:%H:%M} ET): a ticket made now expires in {ttl_minutes} min, before "
                 "the 09:30 ET open - create it closer to the open")
     return None
+
+
+def preview_banner(now: datetime, cutoff: int, close_min: Optional[int] = None) -> str:
+    """The last line of a ticket made outside the session: a preview, nothing to confirm."""
+    m = minute_f(now)
+    weekday = now.weekday() < 5
+    if weekday and tc.MARKET_OPEN <= m < (close_min or tc.MARKET_CLOSE):
+        head = f"PAST THE {tc.hhmm(cutoff)} ET TIME STOP"
+    else:
+        head = "MARKET CLOSED"
+    when = "after 09:30 ET" if weekday and m < tc.MARKET_OPEN else "after 09:30 ET on the next trading day"
+    return f"{head} — preview only. Re-run ticket {when} to get a ticket you can confirm."
+
+
+def price_arg(x: float) -> str:
+    """A price as a command-line argument (no thousands separators)."""
+    return f"{x:.2f}" if abs(x) >= 1 else f"{x:.4f}"
+
+
+def tm_display(tm: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """Time-machine odds as the time machine prints them: its saved one-decimal `display_pct`
+    (largest-remainder rounded, adds up to 100.0), else the raw *_pct values (shown with :.1f)."""
+    disp = tm.get("display_pct") if isinstance(tm.get("display_pct"), dict) else {}
+    out: Dict[str, Optional[float]] = {}
+    for key in ("target_first", "stop_first", "open_at_close"):
+        for v in (disp.get(key), tm.get(f"{key}_pct")):
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+                out[key] = float(v)
+                break
+        else:
+            out[key] = None
+    return out
+
+
+def fmt_odds(v: Optional[float]) -> str:
+    return "-" if v is None else f"{v:.1f}%"
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +518,25 @@ def budget_ledger(led: Dict[str, Any], day: str, exclude: Optional[str] = None) 
     return {"tickets": [], "trades": rows(led, "trades") + synth}
 
 
+def working_risk(orders: Sequence[Dict[str, Any]]) -> float:
+    """Risk reserved by working orders, counted exactly as tc.day_summary counts open risk
+    (directional: 0 if a hand-edited stop sits past the limit)."""
+    return round(sum(tc.trade_initial_risk({"id": k.get("id"), "side": k.get("side"), "qty": k.get("qty"),
+                                            "entry_price": k.get("entry"), "stop": k.get("stop")})
+                     for k in orders), 2)
+
+
+def safe_working_risk(orders: Sequence[Dict[str, Any]]) -> float:
+    """working_risk for display: a malformed order counts 0 here (the budget check refuses it)."""
+    total = 0.0
+    for k in orders:
+        try:
+            total += working_risk([k])
+        except tc.StateError:
+            continue
+    return round(total, 2)
+
+
 def check_budget(led: Dict[str, Any], new_risk: float, settings: Dict[str, Any], day: str,
                  exclude: Optional[str] = None) -> Dict[str, Any]:
     try:
@@ -489,7 +545,7 @@ def check_budget(led: Dict[str, Any], new_risk: float, settings: Dict[str, Any],
         raise tc.StateError(f"ledger.json has a malformed trade or order ({e!r}) - fix or remove it") from None
     wk = working_orders(led, day, exclude)
     res["working_orders"] = len(wk)
-    res["working_risk"] = round(sum(abs(float(k["entry"]) - float(k["stop"])) * float(k["qty"]) for k in wk), 2)
+    res["working_risk"] = working_risk(wk)
     return res
 
 
@@ -506,6 +562,20 @@ def _plan_levels_match(plan: Optional[Dict[str, Any]], side: str, entry: float, 
         pt = plan.get("target")
         ok = ok and ((pt is None and target is None) or same_level(pt, target))
     return ok
+
+
+def untested_note(symbol: str, plan: Optional[Dict[str, Any]], side: str, entry: float, stop: float,
+                  target: Optional[float], stale: bool = False) -> str:
+    """The note for levels the time machine has not tested (no odds, or odds for other levels)."""
+    if target is None:
+        return "not tested by the time machine for these levels (it needs a target to measure the odds)"
+    if _plan_levels_match(plan, side, entry, stop, target, with_target=True):
+        cmd = f"time_machine.py {symbol} --save"
+    else:
+        cmd = (f"time_machine.py {symbol} --entry {price_arg(entry)} --stop {price_arg(stop)} "
+               f"--target {price_arg(target)} --save")
+    return (f"not tested by the time machine for these levels (run {cmd})"
+            + (" - the plan's odds were for other levels" if stale else ""))
 
 
 def resolve_order(symbol: str, plan: Optional[Dict[str, Any]], *, today: str, side: Optional[str] = None,
@@ -608,12 +678,13 @@ def resolve_order(symbol: str, plan: Optional[Dict[str, Any]], *, today: str, si
     t_stop = parse_time_stop(ts_value or DEFAULT_TIME_STOP)
     tm = None
     tm_plan = plan.get("time_machine") if isinstance(plan, dict) else None
-    if isinstance(tm_plan, dict):
-        if _plan_levels_match(tm_plan, side, entry, stop, target, with_target=True):
-            tm = {k: tm_plan.get(k) for k in ("verdict", "target_first_pct", "stop_first_pct",
-                                              "open_at_close_pct", "expected_r", "as_of")}
-        else:
-            notes.append("the plan's time-machine odds were for other levels - not attached")
+    if isinstance(tm_plan, dict) and _plan_levels_match(tm_plan, side, entry, stop, target, with_target=True):
+        tm = {k: tm_plan.get(k) for k in ("verdict", "target_first_pct", "stop_first_pct",
+                                          "open_at_close_pct", "expected_r", "as_of")}
+        if isinstance(tm_plan.get("display_pct"), dict):
+            tm["display_pct"] = tm_plan["display_pct"]
+    else:
+        notes.append(untested_note(symbol, plan, side, entry, stop, target, isinstance(tm_plan, dict)))
     return {"symbol": symbol, "side": side, "qty": int(qty), "type": order_type, "entry": float(entry),
             "stop": float(stop), "target": None if target is None else float(target),
             "setup": setup, "time_stop": tc.hhmm(t_stop), "time_stop_min": t_stop,
@@ -622,8 +693,9 @@ def resolve_order(symbol: str, plan: Optional[Dict[str, Any]], *, today: str, si
 
 
 def order_checks(order: Dict[str, Any], settings: Dict[str, Any], last: Optional[Dict[str, Any]],
-                 today: str) -> Tuple[List[str], List[str]]:
-    """Warnings and notes about a proposed order (pure). Raises ValueError for hard limits."""
+                 today: str, preview: bool = False) -> Tuple[List[str], List[str]]:
+    """Warnings and notes about a proposed order (pure). Raises ValueError for hard limits.
+    `preview`: the market is closed, so the last price is the last session's and nothing fills now."""
     warnings: List[str] = []
     notes: List[str] = []
     side, e, s, t, q = order["side"], order["entry"], order["stop"], order["target"], order["qty"]
@@ -653,7 +725,8 @@ def order_checks(order: Dict[str, Any], settings: Dict[str, Any], last: Optional
         p = last["price"]
         qd = last.get("date")
         if qd and qd != today:
-            notes.append(f"latest {order['symbol']} quote is from {qd} (holiday, halt or delayed data?)")
+            notes.append(f"latest {order['symbol']} quote is from {qd} "
+                         + ("(the last session's price)" if preview else "(holiday, halt or delayed data?)"))
         through_stop = p <= s if side == "long" else p >= s
         past_target = t is not None and (p >= t if side == "long" else p <= t)
         if through_stop:
@@ -668,12 +741,28 @@ def order_checks(order: Dict[str, Any], settings: Dict[str, Any], last: Optional
             marketable = p <= e if side == "long" else p >= e
             if marketable:
                 notes.append(f"limit is {'at/above' if side == 'long' else 'at/below'} the last price "
-                             f"{tc.fmt_price(p)}: on yes it fills right away at about {tc.fmt_price(p)}")
+                             f"{tc.fmt_price(p)}: " + ("at that price a confirmed ticket would fill right away"
+                                                       if preview else
+                                                       f"on yes it fills right away at about {tc.fmt_price(p)}"))
             else:
                 notes.append(f"last {tc.fmt_price(p)} is {'above' if side == 'long' else 'below'} your limit: "
-                             "on yes it rests as a working day order until a 5-minute bar trades through "
+                             + ("at that price a confirmed ticket would rest" if preview else "on yes it rests")
+                             + " as a working day order until a 5-minute bar trades through "
                              f"{tc.fmt_price(e)}")
     return warnings, notes
+
+
+def preview_order(order: Dict[str, Any]) -> Dict[str, Any]:
+    """The ticket's order fields without an id, status or expiry (also what a preview shows)."""
+    e, s, t = order["entry"], order["stop"], order["target"]
+    return {
+        "symbol": order["symbol"], "side": order["side"], "qty": order["qty"], "type": order["type"],
+        "entry": e, "stop": s, "target": t, "setup": order["setup"], "time_stop": order["time_stop"],
+        "risk": round(abs(e - s) * order["qty"], 2),
+        "rr": None if t is None else round(tc.reward_risk(order["side"], e, s, t), 2),
+        "time_machine": order["time_machine"],
+        "levels_source": order["levels_source"], "qty_source": order["qty_source"],
+    }
 
 
 def new_ticket(led: Dict[str, Any], order: Dict[str, Any], now: datetime, settings: Dict[str, Any],
@@ -682,17 +771,11 @@ def new_ticket(led: Dict[str, Any], order: Dict[str, Any], now: datetime, settin
     today = now.strftime("%Y-%m-%d")
     cutoff = effective_time_stop(order["time_stop_min"], session_end)
     expires = min(now.timestamp() + settings["ticket_ttl_minutes"] * 60, at_minute(today, cutoff))
-    e, s, t = order["entry"], order["stop"], order["target"]
-    return {
-        "id": tc.new_id("TKT", [str(k.get("id", "")) for k in rows(led, "tickets")]),
-        "symbol": order["symbol"], "side": order["side"], "qty": order["qty"], "type": order["type"],
-        "entry": e, "stop": s, "target": t, "setup": order["setup"], "time_stop": order["time_stop"],
-        "risk": round(abs(e - s) * order["qty"], 2),
-        "rr": None if t is None else round(tc.reward_risk(order["side"], e, s, t), 2),
-        "status": "pending", "mode": "paper", "created_at": iso(now.timestamp()), "expires_at": iso(expires),
-        "trade_id": None, "time_machine": order["time_machine"],
-        "levels_source": order["levels_source"], "qty_source": order["qty_source"],
-    }
+    ticket = {"id": tc.new_id("TKT", [str(k.get("id", "")) for k in rows(led, "tickets")])}
+    ticket.update(preview_order(order))
+    ticket.update(status="pending", mode="paper", created_at=iso(now.timestamp()), expires_at=iso(expires),
+                  trade_id=None)
+    return ticket
 
 
 def symbol_exposure(led: Dict[str, Any], symbol: str, today: str) -> List[Dict[str, Any]]:
@@ -898,10 +981,6 @@ def cmd_ticket(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
         parse_time_stop(args.time_stop)
     if args.qty is not None and not 1 <= args.qty <= MAX_QTY:
         raise ValueError(f"--qty must be a whole number of shares from 1 to {MAX_QTY:,}")
-    window = order_window_problem(now, parse_time_stop(args.time_stop or DEFAULT_TIME_STOP),
-                                  settings["ticket_ttl_minutes"])
-    if window:
-        raise ValueError(window)
     plan = tc.load_plan(sym)
     quote, quote_err = best_effort_quote(sym)
     if args.order_type == "market" and args.entry is None and args.stop is not None and quote is None:
@@ -910,16 +989,18 @@ def cmd_ticket(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
                           target=args.target, qty=args.qty, order_type=args.order_type, setup=args.setup,
                           time_stop=args.time_stop, last_price=quote["price"] if quote else None)
     early = early_close_today(sym, today) if quote is not None else None   # no 2nd slow retry when offline
-    window = order_window_problem(now, effective_time_stop(order["time_stop_min"], early),
-                                  settings["ticket_ttl_minutes"])
-    if window:
-        window += early_close_note(early)
-        if args.time_stop is None and order["time_stop"] != DEFAULT_TIME_STOP:
-            window += (f" (the {order['time_stop']} time stop comes from the saved exit plan; pass --time-stop "
-                       "to choose another)")
-        raise ValueError(window)
+    cutoff = effective_time_stop(order["time_stop_min"], early)
+    # Outside the session (weekend, pre-open, past the time stop) everything is still checked, but
+    # the result is a PREVIEW: nothing is saved, so there is nothing a yes could confirm.
+    closed = order_window_problem(now, cutoff, settings["ticket_ttl_minutes"])
     warnings, notes = list(order["warnings"]), list(order["notes"])
-    w2, n2 = order_checks(order, settings, quote, today)
+    if closed:
+        closed += early_close_note(early)
+        if args.time_stop is None and order["time_stop"] != DEFAULT_TIME_STOP:
+            closed += (f" (the {order['time_stop']} time stop comes from the saved exit plan; pass --time-stop "
+                       "to choose another)")
+        notes.insert(0, f"no ticket: {closed}")
+    w2, n2 = order_checks(order, settings, quote, today, preview=bool(closed))
     warnings += w2
     notes += n2
     if quote is None:
@@ -938,16 +1019,27 @@ def cmd_ticket(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
                                  "ticket would net against it in a real account - close or cancel it first")
             warnings.append(f"adds to your {x['side']} {sym} {x['kind']} ({x['id']}, {x['qty']} shares)")
         budget = check_budget(led, risk, settings, today)
-        res: Dict[str, Any] = {"action": "ticket", "mode": "paper", "real_money": False,
+        res: Dict[str, Any] = {"action": "ticket", "preview": bool(closed), "mode": "paper", "real_money": False,
                                "last_price": quote["price"] if quote else None, "budget": budget,
                                "account_size": settings["account_size"],
+                               "ticket_ttl_minutes": settings["ticket_ttl_minutes"],
                                "warnings": warnings, "notes": notes, "sync": synced,
                                "disclaimer": tc.DISCLAIMER}
+        if closed:
+            res.update(market_closed=closed, banner=preview_banner(now, cutoff, early))
         if not budget["ok"]:
             tc.save_ledger(led)
+            if closed:
+                notes.append(f"checked against today's ({today}) budget; realized losses, the trade count and "
+                             "the loss streak start fresh on the next session's date")
             res.update(ok=False, blocked=True, reasons=budget["reasons"],
                        order={k: v for k, v in order.items() if k not in ("warnings", "notes", "time_stop_min")})
             return res, EXIT_BLOCKED
+        if closed:
+            tc.save_ledger(led)                      # only what sync/expiry changed; no ticket
+            k = dict(preview_order(order), status="preview", mode="paper")
+            res.update(ok=True, status="preview", order=k, card=f"{order_words(k)} · {PAPER} · {res['banner']}")
+            return res, 0
         ticket = new_ticket(led, order, now, settings, early)
         superseded = []
         for k in rows(led, "tickets"):
@@ -1097,6 +1189,18 @@ def cmd_sync(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     return res, 0
 
 
+def traded_range(bars: Sequence[tc.Bar], since_ts: Optional[float],
+                 now_ts: float) -> Optional[Tuple[float, float]]:
+    """(low, high) of the 5-minute bars from the one holding `since_ts` (the fill) through the bar in
+    progress at `now_ts`, or None when there are no such bars. Pure."""
+    if since_ts is None:
+        return None
+    seen = [b for b in bars if b.ts + BAR > since_ts and b.ts < now_ts]
+    if not seen:
+        return None
+    return min(b.low for b in seen), max(b.high for b in seen)
+
+
 def cmd_close(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     now = tc.now_et()
     now_ts = now.timestamp()
@@ -1118,6 +1222,18 @@ def cmd_close(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     apply_sync(preview, data, now, {tid})
     pt = find(preview, "trades", tid)
     quote = None
+    if pt is not None and pt.get("status") == "open" and args.price is not None:
+        # A manual exit records real-looking P&L, and realized profit widens today's loss budget, so
+        # the price must be one that traded since the fill (checked whenever the bars are available).
+        span = traded_range(data.get(sym, ([], {}))[0], parse_ts(pt.get("opened_at")), now_ts)
+        if span is None:
+            notes.append(f"--price {tc.fmt_price(args.price)} not checked against traded prices "
+                         "(no 5-minute bars since the fill)")
+        elif not span[0] - 0.005 <= args.price <= span[1] + 0.005:
+            raise ValueError(f"--price {tc.fmt_price(args.price)} is outside what {sym} traded since the fill "
+                             f"({tc.fmt_price(span[0])}-{tc.fmt_price(span[1])} in the 5-minute bars to "
+                             f"{tc.et_hhmm(now_ts)} ET) - a manual exit must be at a price that traded; "
+                             "omit --price to close at the current price")
     if pt is not None and pt.get("status") == "open" and args.price is None:
         quote = get_quote(sym)                                    # FetchError -> exit 2
         if quote["date"] and quote["date"] != now.strftime("%Y-%m-%d"):
@@ -1230,8 +1346,7 @@ def cmd_positions(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     tot_unreal = [p["unrealized"] for p in positions if p["unrealized"] is not None]
     res = {"ok": True, "action": "positions", "as_of": iso(now_ts), "positions": positions, "working": work_rows,
            "pending_tickets": [k["id"] for k in pending],
-           "working_risk": round(sum(abs(float(k.get("entry") or 0) - float(k.get("stop") or 0)) * float(k.get("qty") or 0)
-                                     for k in working_orders(led, today)), 2),
+           "working_risk": safe_working_risk(working_orders(led, today)),
            "unrealized_total": round(sum(tot_unreal), 2) if tot_unreal and len(tot_unreal) == len(positions) else None,
            "summary": safe_summary(led, today), "warnings": warnings,
            "errors": [{"symbol": s, "error": m} for s, m in sorted(errors.items())],
@@ -1315,12 +1430,17 @@ def render_ticket(res: Dict[str, Any]) -> str:
                  f"Risk {tc.fmt_money(risk)} - BLOCKED by today's budget:"]
         lines += [f"  - {r}" for r in res["reasons"]]
         lines += _flag_lines(res)
-        lines += ["No ticket was created. Check: budget skill (budget.py status).", tc.DISCLAIMER]
+        lines += ["No ticket was created. Check: budget skill (budget.py status)."]
+        if res.get("preview"):
+            lines.append(res["banner"])
+        lines.append(tc.DISCLAIMER)
         return "\n".join(lines)
-    k = res["ticket"]
+    preview = bool(res.get("preview"))
+    k = res["order"] if preview else res["ticket"]
     e, s, t, q = k["entry"], k["stop"], k["target"], k["qty"]
     per = abs(e - s)
-    lines = [f"ORDER TICKET · {k['id']}", f"{order_words(k)} · {PAPER}"]
+    lines = ["ORDER TICKET · PREVIEW (not a ticket - nothing to confirm)" if preview else f"ORDER TICKET · {k['id']}",
+             f"{order_words(k)} · {PAPER}"]
     rr = f" · reward {tc.fmt_money(abs(t - e) * q)} · R:R {k['rr']:.2f}" if t is not None else " · no target"
     lines.append(f"  Risk      {tc.fmt_money(k['risk'])} ({tc.fmt_price(per)}/share x {q}){rr}")
     acct = res.get("account_size")
@@ -1328,19 +1448,25 @@ def render_ticket(res: Dict[str, Any]) -> str:
     last = f" · last {tc.fmt_price(res['last_price'])}" if res.get("last_price") is not None else ""
     lines.append(f"  Notional  {tc.fmt_money(e * q)}{pct}{last}")
     lines.append(f"  Budget    {budget_line(res['budget'], k['risk'])}")
-    mins = int(round((parse_ts(k['expires_at']) - parse_ts(k['created_at'])) / 60))  # type: ignore[operator]
-    lines.append(f"  Expires   {hm(k['expires_at'])} ET ({mins} min) · day order · flat by {k['time_stop']} ET")
+    if preview:
+        ttl = res.get("ticket_ttl_minutes")
+        life = f"a real ticket lasts {ttl} min" if ttl else "a real ticket expires after a few minutes"
+        lines.append(f"  Expires   - (preview; {life}) · day order · flat by {k['time_stop']} ET")
+    else:
+        mins = int(round((parse_ts(k['expires_at']) - parse_ts(k['created_at'])) / 60))  # type: ignore[operator]
+        lines.append(f"  Expires   {hm(k['expires_at'])} ET ({mins} min) · day order · flat by {k['time_stop']} ET")
     extra = []
     if k.get("setup"):
         extra.append(f"setup {k['setup']}")
     tm = k.get("time_machine")
     if tm and tm.get("verdict"):
-        extra.append(f"time-machine: {tm['verdict']} (target first {tm.get('target_first_pct')}% / stop first "
-                     f"{tm.get('stop_first_pct')}%)")
+        odds = tm_display(tm)
+        extra.append(f"time-machine: {tm['verdict']} (target first {fmt_odds(odds['target_first'])} / stop first "
+                     f"{fmt_odds(odds['stop_first'])})")
     if extra:
         lines.append("  Plan      " + " · ".join(extra))
     lines += _flag_lines(res)
-    lines.append(f"WAITING FOR YOUR YES — reply yes to confirm ticket {k['id']}")
+    lines.append(res["banner"] if preview else f"WAITING FOR YOUR YES — reply yes to confirm ticket {k['id']}")
     lines.append(tc.DISCLAIMER)
     return "\n".join(lines)
 
@@ -1518,7 +1644,8 @@ def build_parser() -> argparse.ArgumentParser:
         tc.add_json_flag(sp)
         return sp
 
-    t = add("ticket", "create a pending paper order ticket (validates levels and the daily budget)")
+    t = add("ticket", "create a pending paper order ticket (validates levels and the daily budget); outside "
+                      "the session it prints a preview that cannot be confirmed")
     t.add_argument("--symbol", required=True, help="ticker, e.g. TSLA")
     t.add_argument("--qty", type=int, help="shares (default: the plan's sizing from the risk skill)")
     t.add_argument("--side", choices=("long", "short"), help="default: the plan's side, else inferred from the levels")
@@ -1561,7 +1688,7 @@ COMMANDS = {
 }
 
 
-FRONT_KEYS = ("ok", "action", "status", "confirmed", "blocked", "reasons", "card", "ticket", "trade")
+FRONT_KEYS = ("ok", "action", "status", "preview", "confirmed", "blocked", "reasons", "card", "ticket", "trade")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

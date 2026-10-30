@@ -124,20 +124,51 @@ def session_bounds(now: datetime, meta: Optional[Dict[str, Any]] = None) -> tupl
     return int(midnight + tc.MARKET_OPEN * 60), int(midnight + tc.MARKET_CLOSE * 60)
 
 
+def _market_time(meta: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Yahoo's regularMarketTime (time of the last trade in the data), if usable."""
+    stamp = (meta or {}).get("regularMarketTime")
+    if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and math.isfinite(stamp):
+        return float(stamp)
+    return None
+
+
 def day_progress(last: tc.Bar, now: datetime, meta: Optional[Dict[str, Any]] = None) -> float:
     """1.0 if `last` is a completed day, else the expected volume share traded by `now`."""
     if last.date != now.strftime("%Y-%m-%d"):
         return 1.0
     start, end = session_bounds(now, meta)
     t = now.timestamp()
+    # Data stamped after `now` (a $DAYTRADER_NOW replay of data fetched later) holds the volume
+    # traded up to its stamp, so pace it there; stamped at/after the close it is a completed day.
+    stamp = _market_time(meta)
+    if stamp is not None and stamp > t:
+        t = stamp
     if t >= end:
         return 1.0
-    # Data stamped at/after this session's close is a completed day even though `now` is
-    # earlier (a $DAYTRADER_NOW replay of a past session): don't pace a full day's volume.
-    stamp = (meta or {}).get("regularMarketTime")
-    if isinstance(stamp, (int, float)) and stamp >= end:
-        return 1.0
     return volume_progress((t - start) / 60.0, (end - start) / 60.0)
+
+
+def lookahead(last: tc.Bar, now: datetime, meta: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """For $DAYTRADER_NOW replays: does the as-of day's daily bar hold trading after `now`?
+
+    Live, today's bar is Yahoo's "now". Replayed mid-session from data fetched later, the bar
+    also holds the rest of that day (a daily bar cannot be cut at a time of day). None when it
+    cannot (a completed earlier day, `now` at/after the close, or data stamped by `now`), else
+    {"through": unix seconds of the latest data or None when no timestamp says, "to_close": bool}.
+    """
+    if last.date != now.strftime("%Y-%m-%d"):
+        return None
+    _, end = session_bounds(now, meta)
+    t = now.timestamp()
+    if t >= end:
+        return None
+    stamp = _market_time(meta)
+    latest = max(float(last.ts), stamp if stamp is not None else float("-inf"))
+    if latest > t:
+        return {"through": latest, "to_close": latest >= end}
+    if stamp is not None:
+        return None          # Yahoo's last trade is at/before `now`: an honest as-of view
+    return {"through": None, "to_close": False}
 
 
 def metrics_at(bars: Sequence[tc.Bar], i: int, progress: float = 1.0) -> Dict[str, Any]:
@@ -318,10 +349,12 @@ def evaluate_symbol(symbol: str, bars: Sequence[tc.Bar], now: datetime,
                     meta: Optional[Dict[str, Any]] = None, *,
                     min_price: float = DEFAULT_MIN_PRICE,
                     min_dollar_volume: float = DEFAULT_MIN_DOLLAR_VOLUME,
-                    wanted: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+                    wanted: Optional[Iterable[str]] = None, replay: bool = False) -> Dict[str, Any]:
     """One symbol through history checks, liquidity filters and setup detection.
 
-    Returns {"symbol", "status": ok|none|filtered|skipped, "reason"?, "row"?}."""
+    `replay` ($DAYTRADER_NOW set) only adds "lookahead" (see lookahead()) when the as-of day's
+    daily bar holds trading after `now`. Returns {"symbol", "status": ok|none|filtered|skipped,
+    "reason"?, "row"?, "lookahead"?}."""
     today = now.strftime("%Y-%m-%d")
     before_open = now.hour * 60 + now.minute < tc.MARKET_OPEN
     bars = normalize_daily(bars, today, before_open)
@@ -334,14 +367,16 @@ def evaluate_symbol(symbol: str, bars: Sequence[tc.Bar], now: datetime,
         return {"symbol": symbol, "status": "skipped", "kind": "stale",
                 "reason": f"no trading since {last.date} (halted or delisted?)"}
     progress = day_progress(last, now, meta)
+    ahead = lookahead(last, now, meta) if replay else None
+    extra = {"lookahead": ahead} if ahead else {}
     m = metrics_at(bars, len(bars) - 1, progress)
     if m["close"] < min_price:
         return {"symbol": symbol, "status": "filtered", "kind": "price",
-                "reason": f"price {tc.fmt_price(m['close'])} < {tc.fmt_money(min_price)}"}
+                "reason": f"price {tc.fmt_price(m['close'])} < {tc.fmt_money(min_price)}", **extra}
     if m["dollar_volume"] < min_dollar_volume:
         return {"symbol": symbol, "status": "filtered", "kind": "dollar volume",
                 "reason": f"20-day avg $ volume ${tc.fmt_big(m['dollar_volume'])} < "
-                          f"${tc.fmt_big(min_dollar_volume)}"}
+                          f"${tc.fmt_big(min_dollar_volume)}", **extra}
     coil = m if progress >= 1.0 else metrics_at(bars, len(bars) - 2, 1.0)
     found = setups_from_metrics(m, coil)
     if wanted is not None:
@@ -357,6 +392,7 @@ def evaluate_symbol(symbol: str, bars: Sequence[tc.Bar], now: datetime,
         "setups": found,
         "date": m["date"],
         "partial_day": m["partial"],
+        "after_as_of": ahead is not None,
         "volume_progress": round(progress, 3),
         "last": _px(m["close"]),
         "prior_close": _px(pc),
@@ -375,7 +411,7 @@ def evaluate_symbol(symbol: str, bars: Sequence[tc.Bar], now: datetime,
     if found:
         k = found[0]["key_level"]
         row["key_level"] = {"name": k, "price": found[0]["levels"].get(k)}
-    return {"symbol": symbol.upper(), "status": "ok" if found else "none", "row": row}
+    return {"symbol": symbol.upper(), "status": "ok" if found else "none", "row": row, **extra}
 
 
 def _is_not_found(msg: str) -> bool:
@@ -410,6 +446,30 @@ def rank(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(rows, key=lambda r: (-r["score"], -(r["rvol"] or 0.0), r["symbol"]))
 
 
+def replay_warning(ahead: Sequence[Dict[str, Any]], now: datetime) -> Optional[str]:
+    """One warning for every symbol whose as-of daily bar holds trading after `now` (replays):
+    the scanner then sees the later price, volume and setups, not the market at `now`."""
+    if not ahead:
+        return None
+    hm = now.strftime("%H:%M")
+    syms = sorted(a["symbol"] for a in ahead)
+    if len(syms) == 1:
+        who, verb = f"bar of {syms[0]}", "includes"
+    else:
+        listed = ", ".join(syms[:8]) + (", ..." if len(syms) > 8 else "")
+        who, verb = f"bars of {len(syms)} symbols ({listed})", "include"
+    known = [a["through"] for a in ahead if a.get("through") is not None]
+    if known:
+        span = ("data runs to the close" if any(a.get("to_close") for a in ahead)
+                else f"data through {tc.et_hhmm(max(known))} ET")
+        what = f"{verb} trading after {hm} ET ({span})"
+    else:
+        what = f"may {verb.rstrip('s')} trading after {hm} ET (no timestamp says otherwise)"
+    return (f"replay at {hm} ET ($DAYTRADER_NOW): the {now.strftime('%Y-%m-%d')} daily {who} {what} - "
+            f"last, change, rvol and setups reflect those later prices, not the market at {hm} "
+            "(a daily bar cannot be cut at a time of day)")
+
+
 def run_scan(universe: Sequence[Dict[str, Any]], now: datetime, *, workers: int = 8,
              top: int = 25, ttl: Optional[float] = None,
              progress: Optional[Callable[[str], None]] = None, **opts: Any) -> Dict[str, Any]:
@@ -423,6 +483,7 @@ def run_scan(universe: Sequence[Dict[str, Any]], now: datetime, *, workers: int 
     skipped: List[Dict[str, str]] = []
     filtered: List[Dict[str, str]] = []
     failures: List[Dict[str, Any]] = []
+    ahead: List[Dict[str, Any]] = []        # replays: as-of bar holds trading after `now`
     fetched = consecutive = done = 0
     stop_reason: Optional[str] = None
 
@@ -447,6 +508,8 @@ def run_scan(universe: Sequence[Dict[str, Any]], now: datetime, *, workers: int 
             else:
                 fetched += 1
                 consecutive = 0
+            if r.get("lookahead"):
+                ahead.append(dict(r["lookahead"], symbol=r["symbol"]))
             if st in ("failed", "notfound", "skipped"):
                 skip_kinds[r["kind"]] += 1
                 skipped.append({"symbol": r["symbol"], "reason": r["reason"]})
@@ -505,6 +568,7 @@ def run_scan(universe: Sequence[Dict[str, Any]], now: datetime, *, workers: int 
         "filtered_symbols": sorted(filtered, key=lambda x: x["symbol"]) if small else None,
         "incomplete": stop_reason is not None,
         "warning": stop_reason,
+        "replay_warning": replay_warning(ahead, now),
         "filters": {"min_price": opts.get("min_price", DEFAULT_MIN_PRICE),
                     "min_dollar_volume": opts.get("min_dollar_volume", DEFAULT_MIN_DOLLAR_VOLUME),
                     "setups": list(opts.get("wanted") or [])},
@@ -594,6 +658,8 @@ def render(res: Dict[str, Any]) -> str:
     lines = [f"SCANNER · {now.strftime('%a %Y-%m-%d %H:%M')} ET · {state}"]
     if res["warning"]:
         lines.append(f"WARNING: {res['warning']} - results below are partial")
+    if res.get("replay_warning"):
+        lines.append(f"WARNING: {res['replay_warning']}")
     rows = res["results"]
     if rows:
         table = [[i, r["symbol"], "+".join(s["setup"] for s in r["setups"]), r["score"],
@@ -653,12 +719,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-etfs", action="store_true", help="add ETFs to the market universe")
     p.add_argument("--workers", type=int, default=8, help="parallel downloads (default 8, max 32)")
     p.add_argument("--quiet", action="store_true", help="no progress lines on stderr")
-
-    def error(message: str) -> None:  # bad flags are bad input: exit 1, not 2 (= data error)
-        p.print_usage(sys.stderr)
-        p.exit(1, f"{p.prog}: error: {message}\n")
-    p.error = error  # type: ignore[assignment]
-    return p
+    return p   # tc's parser: bad flags are bad input, exit 1 (2 means a data source is down)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -696,7 +757,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "takes a few minutes (use --limit or --symbols for a quick run)")
     res = run_scan(deduped, now, workers=args.workers, top=args.top,
                    ttl=120 if tc.is_market_open(now) else 900, progress=say,
-                   min_price=args.min_price, min_dollar_volume=min_dv, wanted=wanted)
+                   min_price=args.min_price, min_dollar_volume=min_dv, wanted=wanted,
+                   replay=bool(os.environ.get("DAYTRADER_NOW")))
     res["filters"]["universe"] = ("symbols" if args.symbols else
                                   "us_common+etfs" if args.include_etfs else "us_common")
     res["disclaimer"] = tc.DISCLAIMER

@@ -520,6 +520,62 @@ class ReviewRegressionTests(TempHomeTestCase):
         self.assertIsNone(E.options_from_args(args, tc.parse_et("2026-10-30T13:00"))["params"]["cutoff"])
 
 
+class FinishedSessionTests(TempHomeTestCase):
+    """--save of a trigger whose session is over: saved (replays), never silently."""
+    NOW = "2026-10-30T19:30"
+    NOTE = "trigger is from the finished 2026-10-30 session - re-plan from the next open"
+
+    def full_day(self):
+        return mk(PREV, PREV_ROWS) + mk(DAY, ORB_ROWS + flat(102.2, 72))
+
+    def test_save_after_the_close_says_the_trigger_has_played_out(self):
+        res = E.evaluate("TSLA", self.full_day(), {}, tc.now_et(), "orb", None, {})
+        self.assertEqual((res["status"], res["replay"], res["session_over"]), ("TRIGGERED", False, True))
+        self.assertEqual(res["notes"], [])
+        E.save_result(res)
+        self.assertEqual(res["saved"]["note"], self.NOTE)
+        self.assertTrue(any(n.startswith(self.NOTE) for n in res["notes"]), res["notes"])
+        self.assertIn(f"note: {self.NOTE}", E.render(res))
+        sig = tc.load_plan("TSLA")["entry_signal"]
+        self.assertEqual((sig["session_over"], sig["note"], sig["date"]), (True, self.NOTE, DAY))
+        self.assertEqual(tc.load_plan("TSLA")["entry"], 101.9)          # still saved
+
+    def test_past_date_replay_names_that_session(self):
+        # --date 2026-10-29: Thursday's ORB long, replayed on Friday evening.
+        bars = mk("2026-10-28", PREV_ROWS) + mk(PREV, ORB_ROWS + flat(102.2, 72)) + mk(DAY, flat(103.0, 78))
+        res = E.evaluate("TSLA", bars, {}, tc.now_et(), "orb", None, {}, PREV)
+        self.assertEqual((res["status"], res["date"]), ("TRIGGERED", PREV))
+        self.assertTrue(res["replay"])
+        plan, _ = E.plan_from_result(res, None)
+        self.assertTrue(plan["entry_signal"]["session_over"])
+        self.assertEqual(plan["entry_signal"]["note"],
+                         f"trigger is from the finished {PREV} session - re-plan from the next open")
+        self.assertFalse(any("saved a replay trigger" in n for n in res["notes"]))
+
+    def test_live_trigger_has_no_note(self):
+        with mock.patch.dict(os.environ, {"DAYTRADER_NOW": "2026-10-30T10:05"}):
+            res = E.evaluate("TSLA", mk(PREV, PREV_ROWS) + mk(DAY, ORB_ROWS), {}, tc.now_et(), "orb", None, {})
+            E.save_result(res)
+        self.assertFalse(res["session_over"])
+        self.assertNotIn("note", res["saved"])
+        sig = tc.load_plan("TSLA")["entry_signal"]
+        self.assertFalse(sig["session_over"])
+        self.assertNotIn("note", sig)
+
+    def test_cli_save_after_the_close(self):
+        fx = self.home / "fixtures"
+        write_fixture(fx, yahoo_chart_url("TSLA", "5m", "5d"), yahoo_payload(self.full_day(), "TSLA"))
+        env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(fx), "DAYTRADER_NOW": self.NOW}
+        p = run_cli(SCRIPT, "TSLA", "--save", "--json", env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        r = json.loads(p.stdout)
+        self.assertTrue(any(n.startswith(self.NOTE) for n in r["notes"]), r["notes"])
+        plan = json.loads((self.home / "plans" / "TSLA.json").read_text())
+        self.assertEqual(plan["entry_signal"]["note"], self.NOTE)
+        p = run_cli(SCRIPT, "TSLA", "--save", env=env)
+        self.assertIn(f"note: {self.NOTE}", p.stdout)
+
+
 class CliTests(TempHomeTestCase):
     NOW = "2026-10-30T10:05"
 

@@ -6,8 +6,8 @@ description: >-
   status: OPEN FOR TRADING, CAUTION (75% of the loss budget used, last trade, one loss from the tilt
   guard) or STOP TRADING (daily max loss, max open risk, max trades or the tilt guard hit). `check`
   says OK or BLOCKED for a new trade's dollar risk and must run before every paper ticket. Also sets
-  the limits and shows per-day history. Use when the user asks "how much have I risked today?",
-  "can I still trade?", "am I done for the day?", "how much budget is left?", "check the budget
+  the limits and shows per-day history. Use when the user asks "how am I doing today?", "how much
+  have I risked today?", "can I still trade?", "am I done for the day?", "how much budget is left?", "check the budget
   for this trade", "is $46.88 of risk OK?", "set my daily max loss to $200", "max 4 trades a day",
   "stop me after 3 losses", "how did my last 10 days go?", or before any broker ticket. Reads the
   local paper ledger; no API key. Paper only; not financial advice.
@@ -44,7 +44,9 @@ python3 scripts/budget.py check --risk 46.88 --json       # --json on any comman
 * `set` flags: `--daily-max-loss $`, `--max-open-risk $`, `--max-trades N`, `--max-losses N` (all > 0).
   No flags = show. Loosening a limit while today's status is STOP TRADING is refused unless
   `--force` is passed. Tightening is always allowed.
-* `history --days N`: calendar days ending today (default 10). Only days with paper trades are listed.
+* `history --days N`: calendar days ending today (default 10). Only days with paper trades or working
+  orders are listed. Today's working orders count as trades, as in `status`, labelled "N working (not
+  filled)". A past day's never-synced working order is not a trade (it expired unfilled), only labelled.
   Flags (vs the current limits): MAX LOSS (realized P&L hit −max at any point that day, even if it
   recovered), OVER MAX TRADES, TILT (longest losing run that day reached the tilt guard).
 
@@ -54,7 +56,8 @@ BLOCKED. Only exit 0 from `check` means go.
 
 ## How it works
 * **Loss budget used** = today's realized loss (0 if you are up) + open risk. Profits do not extend
-  the budget. **Open risk** = Σ |entry − stop| × qty over open paper positions, whenever opened,
+  the budget. **Open risk** = Σ (entry − stop) × qty for longs, (stop − entry) × qty for shorts, over
+  open paper positions, whenever opened (0 once a stop is past the entry: it can no longer lose),
   plus **working orders** (confirmed limit orders not yet filled). Those can fill without another
   check, so the budget counts their risk now, and each is a trade on the day it was confirmed.
   **Pending tickets** (no yes yet) are only listed. The broker re-checks the budget when one is
@@ -98,6 +101,8 @@ Room for the next trade: $63.12 of risk (a standard trade risks $50.00)
 * Lead with the status line exactly (`STATUS: CAUTION`), then every `x` (limit hit) and `!`
   (caution) line in plain words. Then: loss budget used/left with the bar, realized P&L, open
   risk, trades today vs max, loss streak, room for the next trade.
+* "How am I doing?" → `status` answers for today. For the longer-term picture (win rate, average R,
+  setups, the paper journal over weeks), point to the **analyst** skill's `analyst.py review`.
 * For `check`, say OK or BLOCKED first, with each reason. On OK, give the "after this trade" line
   and any `!` warnings. On BLOCKED, give "Most you can risk on a new trade right now". If the
   risk skill's sizing is too big, offer to re-size to that amount. Do not suggest raising limits.
@@ -110,8 +115,8 @@ Room for the next trade: $63.12 of risk (a standard trade risks $50.00)
   `check`: `ok, verdict, new_risk, reasons[], warnings[], max_new_risk_now, max_shares_now,
   after{loss_budget_used, loss_budget_left, open_risk, trade_number}, before{...},
   working_order_risk, limits, exit_code`. `history`: `rows[{date, trades, closed, wins, losses,
-  scratches, realized_pnl, realized_low, r_total, risked, max_loss_streak, still_open, flags[]}],
-  totals`.
+  scratches, realized_pnl, realized_low, r_total, risked, max_loss_streak, still_open, working,
+  unsynced_working, flags[]}], totals{..., trades, working}`.
 
 ## Next step on the desk
 * OK → the **broker** skill writes the paper ticket (`broker.py ticket ...`), which waits for the
@@ -128,6 +133,9 @@ Room for the next trade: $63.12 of risk (a standard trade risks $50.00)
   that this loosens their own guard-rail.
 * Never call a STOP TRADING day "almost OK", and never invent or estimate budget numbers. Report only
   what the script printed. Not financial advice. Paper trading only.
+* The budget counts only the paper ledger in `$DAYTRADER_HOME` (default `~/.day-trader`). In a sandbox
+  (the Claude apps) it may be gone next conversation, and an empty ledger reads OPEN FOR TRADING: offer
+  `ledger.json` and `settings.json` as downloads before the user leaves, and restore uploads there first.
 * If the script exits with code 2 ("data error: ..."), tell the user which host failed (it is in the
   message, usually `query1`/`query2.finance.yahoo.com`). In sandboxes the host may need to be
   allow-listed. Never invent prices, headlines, or odds to fill the gap. Plain `status` (without

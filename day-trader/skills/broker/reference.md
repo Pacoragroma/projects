@@ -24,6 +24,13 @@ ticket ──► pending ──confirm --yes──► confirmed (filled now → 
 * `confirmed`: filled. `trade_id` points at the paper trade.
 * A ticket opens at most one trade. Ids: `TKT-YYYYMMDD-NNN` (day of creation) and
   `TRADE-YYYYMMDD-NNN` (day of the fill).
+* **Preview** (not a state): `ticket` outside the session - a weekend, pre-market when the ticket
+  would expire before 09:30, at or after the (early-close adjusted) time stop - runs every check
+  (levels, notional, open positions, the budget; open trades are synced first) but saves no
+  ticket and supersedes nothing. Exit 0 with `status: "preview"`, or exit 3 when the budget
+  blocks. The banner is `MARKET CLOSED — preview only. Re-run ticket after 09:30 ET [on the next
+  trading day] to get a ticket you can confirm.`, or `PAST THE HH:MM ET TIME STOP — ...` between
+  the time stop and the close.
 
 ## Fill rules
 
@@ -53,6 +60,11 @@ ticket ──► pending ──confirm --yes──► confirmed (filled now → 
   already filled, the fill (and any stop/target/time-stop exit) is recorded and the cancel is
   refused (exit 1), so a fill can never be erased after the fact. Without price data it cancels
   and says it could not check.
+* `close TRADE-... --price X` records a manual exit at X only if X traded since the fill: it must
+  lie within the low-high of the 5-minute bars from the fill bar through the bar in progress
+  (half a cent of slack), else exit 1 and nothing changes. A made-up exit price would record
+  made-up P&L, and realized profit widens the day's loss budget. Without bars (offline, or a trade
+  older than Yahoo's 60 days of 5-minute data) X is accepted with a note that it was not checked.
 
 ## Exit rules (`sync`, and `close`/`confirm`/`ticket`/`cancel` sync first)
 
@@ -80,7 +92,9 @@ starting with the bar that contains the fill:
 
 `closed_at` is the end of the bar that triggered the exit. `close` uses the time of the command.
 `pnl = (exit - entry) x qty` (short: `entry - exit`), and
-`r_multiple = pnl / (|entry_price - stop| x qty)`, rounded to 2 decimals.
+`r_multiple = pnl / ((entry_price - stop) x qty)` (short: `stop - entry_price`), rounded to 2
+decimals; `null` when that risk is 0 (a fill already at or through the stop). Open risk in
+`positions`, `sync` and the budget check uses the same directional risk (`tc.trade_initial_risk`).
 
 ## Budget check
 
@@ -136,9 +150,19 @@ Writes are atomic, behind a lock file (`ledger.lock`). Only this skill writes th
 ## JSON output by command
 
 * `ticket`:
-  * fields: `ok, action, status: "pending", card, ticket, budget, last_price, account_size,
-    superseded[], warnings[], notes[], sync, awaiting, mode: "paper", real_money: false`;
-  * blocked (exit 3): `ok: false, blocked: true, reasons[], order, budget`.
+  * fields: `ok, action, status: "pending", preview: false, card, ticket, budget, last_price,
+    account_size, ticket_ttl_minutes, superseded[], warnings[], notes[], sync, awaiting, mode:
+    "paper", real_money: false`;
+  * preview (exit 0): `status: "preview", preview: true, order {symbol, side, qty, type, entry,
+    stop, target, setup, time_stop, risk, rr, time_machine, levels_source, qty_source, status:
+    "preview"}, card, banner, market_closed` (why there is no ticket); no `ticket`, `awaiting`;
+  * blocked (exit 3): `ok: false, blocked: true, reasons[], order, budget` (plus `preview: true`,
+    `banner` outside the session).
+  * `ticket.time_machine` (when the plan's odds were computed for exactly these levels):
+    `verdict, target_first_pct, stop_first_pct, open_at_close_pct, expected_r, as_of` and, when
+    the time machine saved it, `display_pct {target_first, stop_first, open_at_close}` (the
+    one-decimal values it printed; the card shows those, else the raw values with one decimal).
+    Otherwise a note: `not tested by the time machine for these levels (run time_machine.py ...)`.
 * `confirm`:
   * fields: `ok, action, status: "filled"|"working", confirmed, ticket, trade (null if
     working), fill_price, quote {price, time, date}, budget, warnings[], notes[], sync`;

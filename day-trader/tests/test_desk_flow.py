@@ -14,10 +14,20 @@ scripts request: 5m/5d (entry, exit, broker sync), 5m/60d (time machine), 1m/1d 
 by the broker), 1d/6mo (scanner), plus the Yahoo RSS feed (news; its other sources are left
 without fixtures, so they fail and the run must carry on with a warning).
 
-Today's session: an opening range 09:30-09:45 (high 362.40, low 358.32), then the 10:10 bar
-closes at 364.18 above the range -> ORB long at 10:15, stop 358.32 (the OR low), 1R target
-370.04, 8 shares for $46.88 of risk with the default settings. After the 10:22 paper fill the
-tape either rallies through the target (11:00) or slides through the stop (10:45).
+Today's session: a 5-week base under 360 on the daily chart (20-day high 362.16), an opening
+range 09:30-09:45 (high 362.40, low 358.32), then the 10:10 bar closes at 364.18 above the
+range -> at 10:16 the scanner reports a 20-day BREAKOUT on ~2x paced volume, and entry an ORB
+long at 10:15, stop 358.32 (the OR low), 1R target 370.04, 8 shares for $46.88 of risk with the
+default settings. After the 10:22 paper fill the tape either rallies through the target (11:00)
+or slides through the stop (10:45).
+
+AfterHoursDeskFlowTest plans and tests the same trade at 19:30 and on Saturday: the plan is flagged
+as a finished session's trigger, the Time Machine simulates the next session, and the broker only
+previews (exit 0, nothing saved, nothing to confirm).
+
+ReadmeSampleTest runs the README's own desk-flow commands in text mode on the same data and
+checks that every line of the README's sample output block is really printed. To regenerate
+that block: python3 tests/test_desk_flow.py --print-morning
 """
 from __future__ import annotations
 
@@ -25,13 +35,20 @@ import json
 import math
 import os
 import random
+import shlex
+import shutil
 import sys
 import unittest
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import (TempHomeTestCase, daily_bars, et_ts, random_walk_history, run_cli,  # noqa: E402
-                     skill_script, tc, write_fixture, yahoo_chart_url, yahoo_payload)
+from helpers import (TempHomeTestCase, daily_bars, et_ts, random_walk_history,  # noqa: E402
+                     random_walk_session, run_cli, skill_script, tc, write_fixture, yahoo_chart_url,
+                     yahoo_payload)
+
+README = Path(__file__).resolve().parent.parent / "README.md"
+SAMPLE_INTRO = "On the pack's synthetic test data"   # the sentence right before the sample block
 
 SYM = "TSLA"
 DAY = "2026-10-30"          # a Friday (EDT)
@@ -101,22 +118,26 @@ def _history_5m() -> List[tc.Bar]:
 
 
 def _history_daily() -> List[tc.Bar]:
-    """~6 months of daily bars ending yesterday at today's open."""
-    rng = random.Random(5)
+    """~6 months of daily bars ending yesterday at today's open: an uptrend into a 5-week base
+    just under 360 (20-day high 362.16), so the scanner sees today's 10:16 push to 364.18 on
+    ~2x paced volume as a 20-day breakout - the video's first card, "TSLA · BREAKOUT"."""
+    rng = random.Random(7)
     closes = [100.0]
-    for _ in range(124):
-        closes.append(closes[-1] * math.exp(rng.gauss(0.001, 0.02)))
-    k = OPEN_PX / closes[-1]
+    for _ in range(99):
+        closes.append(closes[-1] * math.exp(rng.gauss(0.003, 0.02)))
+    k = 350.0 / closes[-1]
     closes = [round(c * k, 2) for c in closes]
-    return daily_bars(PREV, closes, volumes=[90_000_000 + 1_000_000 * (i % 7) for i in range(len(closes))])
+    closes += [round(354.0 + 4.5 * math.sin(i * 0.9), 2) for i in range(24)] + [OPEN_PX]
+    return daily_bars(PREV, closes, wick_pct=0.006,
+                      volumes=[20_000_000 + 1_000_000 * (i % 7) for i in range(len(closes))])
 
 
 HISTORY_5M = _history_5m()
 HISTORY_1D = _history_daily()
 
 
-class DeskFlowTest(TempHomeTestCase):
-    """Two complete mornings on the paper desk: one hits the target, one hits the stop."""
+class DeskTestCase(TempHomeTestCase):
+    """One shared $DAYTRADER_HOME and fixture folder; every skill runs as a real subprocess."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -148,15 +169,19 @@ class DeskFlowTest(TempHomeTestCase):
 
     # -- running the skills ----------------------------------------------------------------
 
-    def run_skill(self, skill: str, script: str, *args: str, now: str,
-                  expect: int = 0) -> Dict[str, Any]:
+    def run_text(self, skill: str, script: str, *args: str, now: str, expect: int = 0) -> str:
+        """`now` is an ET time today (10:16) or a full ET stamp (2026-10-31T11:00)."""
         env = {"DAYTRADER_HOME": str(self.state), "DAYTRADER_FIXTURES": str(self.fixtures),
-               "DAYTRADER_NOW": f"{DAY}T{now}"}
-        p = run_cli(skill_script(skill, script), *args, "--json", env=env, timeout=60)
+               "DAYTRADER_NOW": now if "T" in now else f"{DAY}T{now}"}
+        p = run_cli(skill_script(skill, script), *args, env=env, timeout=60)
         where = f"{script} {' '.join(args)} @ {now}: exit {p.returncode}\nstderr: {p.stderr}\nstdout: {p.stdout[:2000]}"
         self.assertNotIn("Traceback", p.stderr, where)
         self.assertEqual(p.returncode, expect, where)
-        return json.loads(p.stdout)
+        return p.stdout
+
+    def run_skill(self, skill: str, script: str, *args: str, now: str,
+                  expect: int = 0) -> Dict[str, Any]:
+        return json.loads(self.run_text(skill, script, *args, "--json", now=now, expect=expect))
 
     def plan(self) -> Dict[str, Any]:
         return json.loads((self.state / "plans" / f"{SYM}.json").read_text(encoding="utf-8"))
@@ -164,17 +189,30 @@ class DeskFlowTest(TempHomeTestCase):
     def ledger(self) -> Dict[str, Any]:
         return json.loads((self.state / "ledger.json").read_text(encoding="utf-8"))
 
+
+class DeskFlowTest(DeskTestCase):
+    """Two complete mornings on the paper desk: one hits the target, one hits the stop."""
+
     # -- the shared morning: scan, plan, test, size, ticket, yes ----------------------------
 
     def plan_and_fill(self, after: Sequence[tc.Bar]) -> Dict[str, Any]:
         session = _bars(MORNING) + list(after)
 
-        # Scanner and news at 10:16 (daily bars + RSS).
+        # Scanner and news at 10:16 (daily bars + RSS): the video's first card, TSLA · BREAKOUT.
         self.publish("10:16", session, 364.18)
         scan = self.run_skill("scanner", "scan.py", "--symbols", SYM, now="10:16")
         self.assertEqual((scan["scanned"], scan["skipped"], scan["passed_filters"]), (1, 0, 1), scan)
         self.assertTrue(scan["partial_day"])
-        self.assertIn(SYM, [r["symbol"] for r in scan["results"]] + (scan["no_setup"] or []))
+        self.assertEqual([r["symbol"] for r in scan["results"]], [SYM], scan)
+        hit = scan["results"][0]
+        self.assertEqual([s["setup"] for s in hit["setups"]], ["breakout"], hit)
+        self.assertEqual((hit["bias"], hit["last"], hit["key_level"]), ("long", ENTRY, {"name": "high_20d",
+                                                                                         "price": 362.16}))
+        self.assertGreaterEqual(hit["rvol"], 1.5)                  # the breakout's volume confirmation
+        self.assertIn("above the 20-day high 362.16", hit["setups"][0]["detail"])
+        # The data is stamped 10:15:55, so this replay is honest: no look-ahead warning.
+        self.assertFalse(hit["after_as_of"])
+        self.assertIsNone(scan["replay_warning"])
 
         news = self.run_skill("news", "news.py", SYM, now="10:16")
         self.assertTrue(news["warnings"], "search/SEC have no fixtures: they must fail softly")
@@ -282,7 +320,7 @@ class DeskFlowTest(TempHomeTestCase):
         self.assertEqual((al["plan"]["side"], al["plan"]["stop"], al["plan"]["target"]), ("long", STOP, TARGET))
         self.assertEqual(sorted((a["plan_role"], a["kind"], a["level"]) for a in al["added"]),
                          [("stop", "below", STOP), ("target", "above", TARGET)])
-        return {"session": session, "ticket": t, "trade": trade, "tm": tm}
+        return {"session": session, "ticket": t, "trade": trade, "tm": tm, "risk": rk}
 
     def assert_alert_fired(self, now: str, role: str, price: float) -> None:
         fired = self.run_skill("alerts", "alerts.py", "check", now=now)["fired"]
@@ -331,6 +369,17 @@ class DeskFlowTest(TempHomeTestCase):
         self.assertEqual(rv["time_machine_check"]["n"], 1)
         self.assertEqual(rv["time_machine_check"]["actual_target_pct"], 100.0)
         self.assertEqual(rv["by_time_machine"][0]["key"], _lean(m["tm"]["verdict"]))
+        # The one Time Machine result reads the same on every card: TM, risk, broker and the review.
+        shown = m["tm"]["display_pct"]
+        self.assertEqual((rv["time_machine_check"]["predicted_target_first_pct"],
+                          rv["time_machine_check"]["predicted_stop_first_pct"]),
+                         (shown["target_first"], shown["stop_first"]))
+        words = f"target first {shown['target_first']:.1f}% / stop first {shown['stop_first']:.1f}%"
+        self.assertIn(f"time-machine: {words} - {m['tm']['verdict']}", m["risk"]["notes"])
+        self.assertEqual(m["ticket"]["time_machine"]["display_pct"], shown)
+        text = self.run_text("analyst", "analyst.py", "review", now="11:03")
+        self.assertIn(f"predicted target-first {shown['target_first']:.1f}% / stop-first "
+                      f"{shown['stop_first']:.1f}%", text)
 
     def test_plan_a_trade_on_tsla_and_test_it_stop_hit(self):
         m = self.plan_and_fill(_bars(SLIDE))
@@ -366,10 +415,132 @@ class DeskFlowTest(TempHomeTestCase):
         self.assertEqual(rv["time_machine_check"]["actual_stop_pct"], 100.0)
 
 
+def _full_session() -> List[tc.Bar]:
+    """Today's whole session: the rally morning, then a quiet seeded walk to the 15:55 bar."""
+    morning = _bars(MORNING) + _bars(RALLY)
+    pad = random_walk_session(DAY, morning[-1].close, n_bars=78, vol=0.002, seed=99)[len(morning):]
+    k = morning[-1].close / pad[0].open
+    return morning + [tc.Bar(b.ts, round(b.open * k, 2), round(b.high * k, 2), round(b.low * k, 2),
+                             round(b.close * k, 2), b.volume * 6) for b in pad]
+
+
+class AfterHoursDeskFlowTest(DeskTestCase):
+    """The same desk run after the close and on the weekend: every step still runs, the plan says
+    its trigger is from a finished session, and the broker shows a preview with nothing to confirm."""
+
+    def test_plan_and_test_after_the_close_and_on_saturday(self):
+        session = _full_session()
+        for now in (f"{DAY}T19:30", "2026-10-31T11:00"):
+            with self.subTest(now=now):
+                shutil.rmtree(self.state)                 # a fresh desk for each run
+                self.state.mkdir()
+                self.publish("16:00", session, session[-1].close)
+                ent = self.run_skill("entry", "entry.py", SYM, "--save", now=now)
+                self.assertEqual((ent["status"], ent["entry"], ent["suggested_stop"]), ("TRIGGERED", ENTRY, STOP))
+                self.assertTrue(any(f"finished {DAY} session" in n for n in ent["notes"]), ent["notes"])
+                self.assertTrue(self.plan()["entry_signal"]["session_over"])
+                ex = self.run_skill("exit", "exit_plan.py", SYM, "--method", "manual", "--rr", "1", "--save", now=now)
+                self.assertEqual((ex["entry"], ex["stop"], ex["target"]), (ENTRY, STOP, TARGET))
+                self.assertTrue(any("re-plan from the next open" in w for w in ex["warnings"]), ex["warnings"])
+                tm = self.run_skill("time-machine", "time_machine.py", SYM, "--save", now=now)
+                self.assertEqual((tm["mode"], tm["start"]), ("open", "09:30"))
+                self.assertIn("market closed - simulating the next session from the open", tm["notes"])
+                shown = tm["display_pct"]
+                words = f"target first {shown['target_first']:.1f}% / stop first {shown['stop_first']:.1f}%"
+                tm_text = self.run_text("time-machine", "time_machine.py", SYM, now=now)
+                for label, key in (("HIT TARGET FIRST", "target_first"), ("HIT STOP FIRST", "stop_first")):
+                    self.assertRegex(tm_text, rf"{label}\s+{shown[key]:.1f}%")
+                rk = self.run_skill("risk", "risk.py", "size", "--symbol", SYM, "--save", now=now)
+                self.assertEqual(rk["shares"], SHARES)
+                self.assertIn(f"time-machine: {words} - {tm['verdict']}", rk["notes"])
+                chk = self.run_skill("budget", "budget.py", "check", "--symbol", SYM, now=now)
+                self.assertEqual(chk["verdict"], "OK")
+                tk = self.run_skill("broker", "broker.py", "ticket", "--symbol", SYM, now=now)
+                self.assertEqual((tk["status"], tk["preview"], tk.get("ticket")), ("preview", True, None))
+                self.assertIn("MARKET CLOSED — preview only", tk["card"])
+                card = self.run_text("broker", "broker.py", "ticket", "--symbol", SYM, now=now)
+                self.assertIn("ORDER TICKET · PREVIEW (not a ticket - nothing to confirm)", card)
+                self.assertIn(f"time-machine: {tm['verdict']} ({words})", card)
+                self.assertNotIn("WAITING FOR YOUR YES", card)
+                self.assertFalse((self.state / "ledger.json").exists() and self.ledger()["tickets"])
+                # nothing was saved, so there is nothing a "yes" could confirm
+                self.run_text("broker", "broker.py", "confirm", f"TKT-{DAY.replace('-', '')}-001", "--yes",
+                              now=now, expect=1)
+
+
+# The README's desk-flow commands, in order, and the (ET) time each one runs at.
+DESK_STEPS = [("scanner", "scan.py", "10:16"), ("news", "news.py", "10:16"), ("entry", "entry.py", "10:16:30"),
+              ("exit", "exit_plan.py", "10:17"), ("time-machine", "time_machine.py", "10:18"),
+              ("risk", "risk.py", "10:19"), ("budget", "budget.py", "10:19:30"),
+              ("broker", "broker.py", "10:20:10")]
+
+
+def readme_block(after: str, lang: str) -> List[str]:
+    """The non-blank lines of README.md's first ```<lang> block that follows the text `after`."""
+    text = README.read_text(encoding="utf-8")
+    start = text.index(f"```{lang}\n", text.index(after)) + len(lang) + 4
+    return [ln for ln in text[start:text.index("```", start)].splitlines() if ln.strip()]
+
+
+def readme_commands() -> List[Tuple[str, str, List[str]]]:
+    """(skill, script, args) for each command of the README's desk-flow block, comments dropped."""
+    out = []
+    for line in readme_block("## The desk flow", "bash"):
+        words = shlex.split(line, comments=True)
+        assert words[0] == "python3" and words[1].startswith("skills/"), line
+        _, skill, _, script = words[1].split("/")
+        out.append((skill, script, words[2:]))
+    return out
+
+
+class ReadmeSampleTest(DeskTestCase):
+    """The README's desk-flow commands work as written, and its sample output is real output."""
+
+    def morning(self) -> List[Tuple[str, str]]:
+        """Run the README's commands in text mode on the morning that hits the target."""
+        session = _bars(MORNING) + _bars(RALLY)
+        commands = readme_commands()
+        self.assertEqual([(skill, script) for skill, script, _ in commands],
+                         [(skill, script) for skill, script, _ in DESK_STEPS])
+        out = []
+        for (skill, script, args), (_, _, now) in zip(commands, DESK_STEPS):
+            if skill in ("scanner", "broker"):  # fresh quotes for the first look and for the ticket
+                self.publish(now, session, 364.18 if skill == "scanner" else 364.00)
+            out.append((f"$ {skill}/scripts/{script} {' '.join(args)}   # {DAY} {now} ET",
+                        self.run_text(skill, script, *args, now=now)))
+        return out
+
+    def test_readme_sample_lines_are_printed_by_the_readme_commands(self):
+        printed = {ln.strip() for _, text in self.morning() for ln in text.splitlines()}
+        sample = readme_block(SAMPLE_INTRO, "text")
+        self.assertGreaterEqual(len(sample), 10)
+        missing = [ln for ln in sample if ln.strip() not in printed]
+        self.assertEqual(missing, [], "README sample lines that no step printed (regenerate with "
+                                      "python3 tests/test_desk_flow.py --print-morning)")
+        for words in ("TSLA", "breakout", "ORB(15)", "THE PLAN", "TIME MACHINE", "BUDGET CHECK",
+                      "WAITING FOR YOUR YES"):
+            self.assertTrue(any(words in ln for ln in sample), words)
+
+
+def print_morning() -> None:
+    """Print every step's text output, to regenerate the README sample block."""
+    case = ReadmeSampleTest("test_readme_sample_lines_are_printed_by_the_readme_commands")
+    case.setUp()
+    try:
+        for header, text in case.morning():
+            print(header)
+            print(text)
+    finally:
+        case.doCleanups()
+
+
 def _lean(verdict: str) -> str:
     return {"ODDS LEAN YOUR WAY": "leaned your way", "ODDS LEAN AGAINST YOU": "leaned against you",
             "CLOSE TO A COIN FLIP": "coin flip"}[verdict]
 
 
 if __name__ == "__main__":
-    unittest.main()
+    if sys.argv[1:] == ["--print-morning"]:
+        print_morning()
+    else:
+        unittest.main()

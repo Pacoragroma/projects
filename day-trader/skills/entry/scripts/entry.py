@@ -537,11 +537,22 @@ def evaluate(symbol: str, bars: Sequence[tc.Bar], meta: Optional[Dict[str, Any]]
     return out
 
 
+def finished_session_note(res: Dict[str, Any]) -> Optional[str]:
+    """For a trigger whose session is already over (a replay, or a check after the close): the
+    warning that goes with it into the plan, since its entry has already played out."""
+    if res.get("status") != "TRIGGERED" or not (res.get("session_over") or res.get("replay")):
+        return None
+    return f"trigger is from the finished {res.get('date')} session - re-plan from the next open"
+
+
 def plan_from_result(res: Dict[str, Any], existing: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[str]]:
     """The plan fields to save for a TRIGGERED result, and which stale plan sections it clears.
 
     target / exit_plan / time_machine / sizing in an existing plan were computed for a different
     entry when the entry, stop or side changes, so they are reset (to null) rather than kept.
+    A trigger from a finished session is saved too (useful for replays), with
+    entry_signal.session_over = true and entry_signal.note saying so; exit and time-machine
+    repeat that note when they plan or test from this entry.
     """
     if res.get("status") != "TRIGGERED":
         raise ValueError(f"nothing to save: status is {res.get('status')}, not TRIGGERED")
@@ -550,6 +561,10 @@ def plan_from_result(res: Dict[str, Any], existing: Optional[Dict[str, Any]]) ->
                                        "trigger_bar", "cutoff", "min_rvol", "replay", "as_of")}
     if res.get("or_minutes") is not None:
         signal["or_minutes"] = res["or_minutes"]
+    note = finished_session_note(res)
+    signal["session_over"] = note is not None
+    if note:
+        signal["note"] = note
     signal["source"] = "entry"
     plan: Dict[str, Any] = {"symbol": res["symbol"], "side": res["side"], "entry": res["entry"],
                             "stop": res["suggested_stop"], "setup": res["setup"], "entry_signal": signal}
@@ -812,8 +827,10 @@ def save_result(res: Dict[str, Any]) -> None:
     plan, cleared = plan_from_result(res, existing)
     tc.save_plan(plan)
     res["saved"] = {"path": str(tc.home() / "plans" / fname), "cleared": cleared}
-    if res.get("replay"):
-        res["notes"].append(f"saved a replay trigger from {res['date']}: re-check the chart before using it today")
+    note = plan["entry_signal"].get("note")
+    if note:
+        res["saved"]["note"] = note
+        res["notes"].append(f"{note} (saved anyway, for replays; exit and time-machine will flag it)")
 
 
 def watch(opts: Dict[str, Any], as_json: bool, save: bool) -> int:

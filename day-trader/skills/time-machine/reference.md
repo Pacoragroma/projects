@@ -33,7 +33,9 @@ when an edge case shows up in the notes, or when you chain the JSON into another
    space with the same code). A touch exactly at the level counts. No hit by the last bar ->
    OPEN AT CLOSE with R = (last close - entry) / (entry - stop) for a long (mirrored for a short).
 7. **Statistics.** `target_first_pct + stop_first_pct + open_at_close_pct = 100` (largest-remainder
-   rounding). `*_se` = sqrt(p(1-p)/paths) in percentage points: Monte Carlo noise only.
+   rounding to 2 decimals). `display_pct{target_first, stop_first, open_at_close}` are the same
+   odds rounded the same way to 1 decimal - exactly what the card and the SVG print, also adding
+   up to 100.0. Other skills quote `display_pct` so one result reads the same everywhere. `*_se` = sqrt(p(1-p)/paths) in percentage points: Monte Carlo noise only.
    `expected_r` = (targets x R:R - stops + sum of open R) / paths. Minutes to resolution are to the
    end of the bar where the level was hit.
 8. **History check.** For each library session: entry = close of the last bar before the start
@@ -41,12 +43,22 @@ when an edge case shows up in the notes, or when you chain the JSON into another
    replay end with the same rules. Days with no bar at or after the start, or that only began
    trading after it (late open after a halt, or a partial first day of Yahoo's window), are
    `skipped` - never entered at a later clock time.
-9. **Trend check.** `trend.avg_move_pct` = the library sessions' average % move from the start
-   slot to the end; `t_stat` = mean / (stdev / sqrt(n)). `trend.alt` = the same replays (same
-   seed) on the other library: trend removed (each slot's shapes divided by that slot's average
-   `r_close`, so the average bar has no drift but keeps its range) - or, with `--detrend`, trend
-   left in. A note is added when the two verdicts differ, or the expected value differs by
-   >= 0.1R, or target-first by >= 5 points.
+9. **Trend check.** `trend.alt` = the same replays (same seed) on the other library: trend
+   removed (each slot's shapes divided by that slot's average `r_close`, so the average bar has
+   no drift but keeps its range) - or, with `--detrend`, trend left in. The drift that matters is
+   the one a trade lives through, so it is measured over `trend.horizon`: from the start slot to
+   the median time to resolution (stop or target) of the trend-included replays, or the whole
+   window if none resolved. `trend.drift_pct` = the cumulative per-slot mean drift over that
+   horizon (the product of the slots' average `r_close`, minus 1 - exactly what the
+   trend-removed replays take out); `trend.drift_r` = that move in R, i.e. divided by the stop
+   distance, signed for the trade (+ = in its favour, so negative drift helps a short);
+   `trend.horizon_t_stat` = mean / (stdev / sqrt(n)) of the past sessions' own moves over the
+   horizon. `trend.avg_move_pct` / `t_stat` = the same over the whole window, start to close.
+   A note is added when the two verdicts differ, or the expected value differs by >= 0.1R, or
+   target-first by >= 5 points. It names the drift as the cause only when it is >= 0.05R and
+   points the way the two answers differ; otherwise it says the odds are sensitive to small
+   time-of-day drifts. (A whole-window move near 0% can hide a drift in the first bars that is a
+   sizeable share of a tight stop - the horizon measure shows it.)
 10. **Seed.** Default = first 48 bits of sha256("SYMBOL|YYYY-MM-DD"). Same symbol, same day, same
     flags -> the same numbers. The SVG's 300 drawn paths are the first 300 replays; their
     continuation after an exit uses a separate generator, so `--svg` never changes the odds.
@@ -77,6 +89,10 @@ when an edge case shows up in the notes, or when you chain the JSON into another
 * `only N past sessions` (< 20) - rough odds. `newest 5-minute data is from ...` (> 7 days) -
   halted/delisted/stale.
 * `past sessions only have bars until HH:MM` - the replays stop early (only half days at that time).
+* `the saved SYM entry X is an entry-skill trigger (ORB(15) at 10:15 ET): trigger is from the
+  finished <date> session - re-plan from the next open` - the plan's entry came from `entry.py
+  --save` after that session had closed (or for a past `--date`), or from a trigger on an earlier
+  day. The move has played out; the odds describe a replay of those levels, not a live setup.
 
 ## JSON fields (`--json`)
 * Plan: `symbol, side, entry, stop, target, rr, stop_pct, target_pct, levels_source{entry,stop,
@@ -86,19 +102,22 @@ when an edge case shows up in the notes, or when you chain the JSON into another
 * Sample: `paths, block, seed, sessions_used, sessions_at_start, sessions_requested,
   first_session, last_session`.
 * Odds: `counts{target,stop,open,ambiguous}, target_first_pct, stop_first_pct, open_at_close_pct,
-  ambiguous_pct, target_first_se, stop_first_se, open_at_close_se, avg_r_open, expected_r,
+  display_pct{target_first, stop_first, open_at_close}, ambiguous_pct, target_first_se, stop_first_se, open_at_close_se, avg_r_open, expected_r,
   breakeven_win_rate_pct, resolved_target_share_pct, median_minutes_to_resolution,
   median_minutes_to_target, median_minutes_to_stop, day_sample_uncertainty_pct`.
 * `history{sessions, target, stop, open, ambiguous, skipped, target_pct, stop_pct, open_pct,
   avg_r_open, expected_r, results[{date, entry, outcome, at, r}]}`.
-* `trend{sessions, avg_move_pct, t_stat, detrended, alt{target_first_pct, stop_first_pct,
-  open_at_close_pct, expected_r, verdict}}`, `today_range_ratio`.
+* `trend{sessions, avg_move_pct, t_stat, horizon{start, end, end_slot, minutes,
+  basis: median_resolution|window}, drift_pct, drift_r, horizon_avg_move_pct, horizon_t_stat,
+  detrended, alt{target_first_pct, stop_first_pct, open_at_close_pct, expected_r, verdict}}`,
+  `today_range_ratio`.
 * `verdict, verdict_notes[], warnings[], notes[], svg, saved, plan_file, dropped_sections[],
   disclaimer`.
 
 ## Saved plan section (`--save`)
 `plans/<SYM>.json` gets `time_machine{side, entry, stop, target, rr, start, mode,
 target_first_pct, stop_first_pct, neither_pct (= open_at_close_pct), open_at_close_pct,
-ambiguous_pct, expected_r, avg_r_open, paths, sessions, block, seed, detrended, verdict,
-history{sessions,target,stop,open}, as_of}`. Readers should check its levels still match the
-plan's before quoting it.
+display_pct{target_first, stop_first, open_at_close}, ambiguous_pct, expected_r, avg_r_open,
+paths, sessions, block, seed, detrended, verdict, history{sessions,target,stop,open}, as_of}`. Readers should check its levels still match the
+plan's before quoting it, and print `display_pct` when present (else the `*_pct` values with
+one decimal), so the odds read exactly as the Time Machine printed them.

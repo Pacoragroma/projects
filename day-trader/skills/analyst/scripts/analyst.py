@@ -103,6 +103,15 @@ def _r(x: Optional[float], nd: int = 2) -> Optional[float]:
     return 0.0 if v == 0 else v   # no "-0.0"
 
 
+def _tm_pct(tm: Dict[str, Any], key: str) -> Optional[float]:
+    """The Time Machine's `key` odds ('target_first' / 'stop_first') as its card printed them: the
+    one-decimal `display_pct` it saved (so the review quotes the same numbers as the time-machine,
+    risk and broker cards), else the raw `<key>_pct` of an older ticket."""
+    disp = tm.get("display_pct")
+    shown = _num(disp.get(key)) if isinstance(disp, dict) else None
+    return shown if shown is not None else _num(tm.get(f"{key}_pct"))
+
+
 def _pct_from(price: Optional[float], ref: Optional[float]) -> Optional[float]:
     """How far `price` is from `ref`, in % of ref."""
     if price is None or not ref:
@@ -982,15 +991,15 @@ def review_stats(rows: Sequence[Dict[str, Any]], account: Optional[float] = None
     dd = max_drawdown(rows)
     if account:
         dd["pct_account"] = _r(dd["usd"] / account * 100)
-    tm_rows = [r for r in rows if r["tm"] and _num(r["tm"].get("target_first_pct")) is not None
-               and _num(r["tm"].get("stop_first_pct")) is not None]
+    tm_rows = [r for r in rows if r["tm"] and _tm_pct(r["tm"], "target_first") is not None
+               and _tm_pct(r["tm"], "stop_first") is not None]
     tm_check = None
     if tm_rows:
         k = len(tm_rows)
         tm_check = {
             "n": k,
-            "predicted_target_first_pct": _r(_mean([_num(r["tm"]["target_first_pct"]) for r in tm_rows]), 1),
-            "predicted_stop_first_pct": _r(_mean([_num(r["tm"]["stop_first_pct"]) for r in tm_rows]), 1),
+            "predicted_target_first_pct": _r(_mean([_tm_pct(r["tm"], "target_first") for r in tm_rows]), 1),
+            "predicted_stop_first_pct": _r(_mean([_tm_pct(r["tm"], "stop_first") for r in tm_rows]), 1),
             "actual_target_pct": _r(sum(r["exit"] == "target" for r in tm_rows) / k * 100, 1),
             "actual_stop_pct": _r(sum(r["exit"] == "stop" for r in tm_rows) / k * 100, 1),
         }
@@ -1110,7 +1119,7 @@ def takeaways(st: Dict[str, Any]) -> List[str]:
     c = st["time_machine_check"]
     if c and c["n"] >= 5:
         out.append(f"Calibration: for {c['n']} trades the Time Machine gave target-first "
-                   f"{c['predicted_target_first_pct']:.0f}% on average; {c['actual_target_pct']:.0f}% actually "
+                   f"{c['predicted_target_first_pct']:.1f}% on average; {c['actual_target_pct']:.0f}% actually "
                    "exited at the target" + (" (small sample - wide error bars)." if c["n"] < 30 else "."))
     h = st["avg_hold_minutes"]
     if (st["wins"] >= MIN_BUCKET and st["losses"] >= MIN_BUCKET and h["wins"] and h["losses"]
@@ -1211,7 +1220,7 @@ def render_review(r: Dict[str, Any]) -> str:
     if c:
         lines.append("")
         lines.append(f"Time Machine check ({_plural(c['n'], 'trade')}): predicted target-first "
-                     f"{c['predicted_target_first_pct']:.0f}% / stop-first {c['predicted_stop_first_pct']:.0f}% · "
+                     f"{c['predicted_target_first_pct']:.1f}% / stop-first {c['predicted_stop_first_pct']:.1f}% · "
                      f"actual exits target {c['actual_target_pct']:.0f}% / stop {c['actual_stop_pct']:.0f}% / "
                      f"other {c['actual_other_pct']:.0f}%")
     lines.append("")
@@ -1233,14 +1242,6 @@ def render_review(r: Dict[str, Any]) -> str:
 # CLI
 # ---------------------------------------------------------------------------
 
-class _Parser(argparse.ArgumentParser):
-    """Bad flags are bad input: exit 1, not argparse's 2 (2 means a data source is down)."""
-
-    def error(self, message: str) -> None:  # type: ignore[override]
-        self.print_usage(sys.stderr)
-        self.exit(1, f"{self.prog}: error: {message}\n")
-
-
 def _symbol(value: str) -> str:
     s = (value or "").strip().upper()
     if not SYMBOL_RE.match(s):
@@ -1261,9 +1262,9 @@ def _int_range(lo: int, hi: int) -> Callable[[str], int]:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # tc's parser (and its subparsers): bad flags are bad input, exit 1 (2 means a data source is down).
     p = tc.make_parser("Analyst: pre-trade ticker brief and post-trade review of the paper journal.")
-    p.error = _Parser.error.__get__(p)  # type: ignore[method-assign]
-    sub = p.add_subparsers(dest="command", metavar="{brief,review}", parser_class=_Parser)
+    sub = p.add_subparsers(dest="command", metavar="{brief,review}")
     b = sub.add_parser("brief", help="trend, key levels, ATR, liquidity, relative volume, gap and SEC context")
     b.add_argument("symbol", type=_symbol, help="ticker, e.g. TSLA")
     b.add_argument("--no-sec", action="store_true", help="skip SEC EDGAR (Yahoo data only)")

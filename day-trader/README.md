@@ -52,28 +52,55 @@ python3 skills/budget/scripts/budget.py check --symbol TSLA                     
 python3 skills/broker/scripts/broker.py ticket --symbol TSLA                    # paper ticket: waits for your yes
 ```
 
-On the pack's offline test data (synthetic bars, not a real quote), that morning looks like this:
+On the pack's synthetic test data (made-up bars from `tests/test_desk_flow.py`, not real TSLA
+prices), run at 10:16–10:20 ET, these are the key lines each step prints, top to bottom: scanner,
+news, entry, exit, time machine, risk, budget, broker:
 
 ```text
+TSLA  breakout 52: trading 0.6% above the 20-day high 362.16 on 2.3x volume (pace-adjusted)
+HIGH  09:05 ET  1h 11m ago  TSLA  Yahoo Finance · EARNINGS
+      Tesla beats third-quarter earnings estimates as deliveries rise
 TSLA 5m · ORB(15) · TRIGGERED 10:15 ET · LONG @ 364.18 (OR 358.32–362.40)
 THE PLAN — TSLA LONG · manual stop
 ENTRY 364.18 / STOP 358.32 / TARGET 370.04 / R:R 1.0
 TIME MACHINE · TSLA · LONG from 10:15 ET · 10,000 replays from TSLA's past 59 sessions
-HIT TARGET FIRST    31.6%  ±0.5
-HIT STOP FIRST      31.6%  ±0.5
+HIT TARGET FIRST    31.6%  ±0.5         median 2h 50m
+HIT STOP FIRST      31.6%  ±0.5         median 3h 10m
 OPEN AT CLOSE       36.8%  (avg -0.05R)
 VERDICT: CLOSE TO A COIN FLIP
 BUY 8 TSLA @ 364.18 · STOP 358.32 · TARGET 370.04 · PAPER
 BUDGET CHECK · TSLA · new risk $46.88 -> OK
+ORDER TICKET · TKT-20261030-001
 BUY 8 TSLA · LIMIT 364.18 · TARGET 370.04 · STOP 358.32 · PAPER · REAL MONEY: OFF
 WAITING FOR YOUR YES — reply yes to confirm ticket TKT-20261030-001
 ```
+
+Every line above is real output: `tests/test_desk_flow.py` runs the eight commands exactly as
+written here on that data and checks each line, and `python3 tests/test_desk_flow.py
+--print-morning` prints the full output of every step.
 
 Only after you reply **yes**, in a later message, does Claude run
 `python3 skills/broker/scripts/broker.py confirm TKT-... --yes`. After that, `broker.py sync` applies
 the stop, the target and the 15:55 ET time stop from 5-minute bars, `budget.py status` shows what
 you have risked so far, and `analyst.py review` shows what is and isn't working.
-`tests/test_desk_flow.py` runs this whole chain end to end, offline.
+`tests/test_desk_flow.py` runs this whole chain end to end, offline, through both endings (target
+hit and stop hit).
+
+**Outside market hours the ticket is only a preview.** On a weekend, before about 09:15 ET (with
+the default 15-minute ticket life, a ticket made earlier would expire before the 09:30 open) or
+after the 15:55 ET time stop, `broker.py ticket` still runs every check (levels, size, notional,
+budget) and prints the whole card, but headed `ORDER TICKET · PREVIEW (not a ticket - nothing to
+confirm)` and ending with:
+
+```text
+MARKET CLOSED — preview only. Re-run ticket after 09:30 ET to get a ticket you can confirm.
+```
+
+After the close or on a weekend that line says `after 09:30 ET on the next trading day`; between
+the time stop and the close it starts `PAST THE 15:55 ET TIME STOP`. A preview exits 0 (JSON
+`"status": "preview"`, `"preview": true`), has no ticket id and saves nothing, so there is nothing
+to say yes to, and Claude does not ask for one. A budget block still exits 3. Re-run `ticket`
+during the session to get a ticket you can confirm.
 
 ## Safety
 
@@ -82,6 +109,7 @@ you have risked so far, and `analyst.py review` shows what is and isn't working.
 * **No trade until you say yes.** The broker opens a paper position only through
   `confirm <ticket> --yes`. Claude is told to show the ticket and wait for your explicit yes in a
   later message. "Looks good?" or "maybe" is not a yes, and a yes counts only for that ticket.
+  Outside market hours you get a preview, which has no ticket id and cannot be confirmed.
 * **Daily limits are enforced.** A ticket that would break your loss budget, open-risk limit,
   trade count or tilt guard is refused.
 * **Not financial advice.** Scanner hits, news tags and entry triggers are prompts to do your own
@@ -92,37 +120,91 @@ you have risked so far, and `analyst.py review` shows what is and isn't working.
 
 ## Install
 
-**Claude Code (plugin)**
+The pack is 11 skill folders under `skills/`. Each one ships its own copy of `trader_common.py`,
+so any single skill also works on its own.
+
+**Claude Code, as a plugin (recommended).** Type these two commands into Claude Code yourself.
+They are slash commands, which Claude cannot run for you:
 
 ```text
 /plugin marketplace add Pacoragroma/projects
 /plugin install day-trader@pacoragroma-projects
 ```
 
-**Claude Code (manual).** Copy the skill folders into your personal skills folder:
+Plugin skills are listed under the plugin's name (for example `day-trader:news`), so they don't
+collide with skills you already have.
+
+**Claude Code, manual copy.** Personal skills live in `~/.claude/skills/<name>/`, and several
+folder names here are generic: `news`, `risk`, `budget`, `alerts`, `entry`, `exit`, `broker`,
+`analyst` and `scanner` may already be taken by skills of your own. Check with
+`ls ~/.claude/skills`, then copy without overwriting anything:
 
 ```bash
 git clone https://github.com/Pacoragroma/projects.git
-mkdir -p ~/.claude/skills && cp -r projects/day-trader/skills/* ~/.claude/skills/
+mkdir -p ~/.claude/skills
+for d in projects/day-trader/skills/*; do
+  n=$(basename "$d")
+  if [ -e ~/.claude/skills/"$n" ]; then echo "skipped $n: ~/.claude/skills/$n already exists"
+  else cp -rn "$d" ~/.claude/skills/; fi
+done
 ```
 
-**Claude apps (claude.ai, desktop).** Build one zip per skill, then upload each one under
-**Settings → Capabilities → Skills**:
+`cp -n` (no-clobber) never overwrites an existing file. On its own, though, `cp -rn` would still
+copy files into an existing folder of the same name and mix them into your skill, so the loop
+skips such folders entirely. A skipped skill is not installed: use the plugin instead, or move
+your own skill out of the way first. (Recent GNU `cp` warns that `-n` is non-portable; that is
+harmless here.) If the new skills don't show up, restart Claude Code.
+
+**Claude apps (claude.ai, Claude Desktop).** Skills run in Claude's code-execution environment, so
+code execution has to be on. Build one zip per skill, then upload each zip in Claude's settings,
+under Skills (only the ones you want, if you like):
 
 ```bash
-cd projects/day-trader && python3 tools/package_skills.py     # writes dist/<skill>.zip
+git clone https://github.com/Pacoragroma/projects.git
+cd projects/day-trader && python3 tools/package_skills.py     # writes dist/<skill>.zip (11 zips)
 ```
 
-**Or** paste the repository link into a chat with Claude and ask it to install the skills.
+Then read [Running in Claude's apps / sandboxes](#running-in-claudes-apps--sandboxes): the data
+hosts may need to be allowed, and your paper ledger may not survive to the next conversation.
 
-Each skill folder ships its own copy of `trader_common.py`, so any single skill works on its own.
+**"Here's the link, install it."** You can paste the repository link into a chat and ask Claude
+to install the skills. This is what actually happens:
+
+* **In Claude Code,** Claude can clone the repository and copy the skill folders into
+  `~/.claude/skills` the way the manual copy above does, skipping any folder that already exists
+  and telling you which ones it skipped. Or it tells you the two `/plugin` commands to type.
+* **In the Claude apps,** Claude cannot add skills to your account. If its sandbox can reach
+  GitHub, it can clone the repository, build the 11 zips with `tools/package_skills.py` and give
+  them to you as files. You then upload each one in Claude's settings, under Skills.
+
+## Running in Claude's apps / sandboxes
+
+In the Claude apps the scripts run in Claude's code-execution sandbox, and two things work
+differently there. The same goes for other sandboxes, such as cloud coding environments.
+
+* **Outbound network may be blocked by default.** Then every data skill stops with a one-line
+  error that names the host, for example `data error: TSLA: blocked by proxy for
+  https://query1.finance.yahoo.com/... (Tunnel connection failed: 403 Forbidden) - access denied;
+  if you are in a sandbox, query1.finance.yahoo.com may need to be allow-listed`. In the settings
+  for code execution / network access, allow network egress to the hosts in the
+  [Network access](#network-access) table. A skill needs only its own hosts: `pelosi`, for
+  example, needs only `disclosures-clerk.house.gov`.
+* **State may not persist between conversations.** Everything the pack remembers lives in
+  `$DAYTRADER_HOME` (default `~/.day-trader`): the paper `ledger.json` (positions, trade history,
+  and what the daily budget counts), `settings.json` (account size, risk and budget limits),
+  `plans/` and `alerts.json`. In a sandbox that folder can be gone in the next conversation.
+  Before you finish, ask Claude to give you `ledger.json` and `settings.json` as files to
+  download; next time, upload them and ask Claude to put them back in `~/.day-trader/`. Where
+  your environment has a folder that persists, set `DAYTRADER_HOME` to it instead.
 
 ## Network access
 
-The scripts call these hosts over HTTPS and nothing else. In a sandbox, these hosts need to be on
-the allow-list. When a host a command needs is unreachable, the script prints a one-line
-`data error: ...` naming it and exits with code 2. Optional sources, such as one of the news
-feeds, only add a warning. Nothing makes up prices or headlines to fill the gap.
+The scripts call these hosts over HTTPS and nothing else. In a sandbox, these hosts need to be
+allowed (see [Running in Claude's apps / sandboxes](#running-in-claudes-apps--sandboxes)). When a
+host a command needs is unreachable, the script prints a one-line `data error: ...` naming it and
+exits with code 2. Optional sources, such as one of the news feeds, only add a warning. Nothing
+makes up prices or headlines to fill the gap. `python3 tools/smoke_live.py` checks every host
+below in one go (see [Development](#development)).
 
 | Host | Used by | For |
 |---|---|---|
@@ -153,16 +235,18 @@ The values above are the defaults. Two settings have no command: `ticket_ttl_min
 |---|---|
 | `DAYTRADER_HOME` | where state is kept (default `~/.day-trader`) |
 | `DAYTRADER_CONTACT` | your email for the User-Agent that SEC EDGAR asks automated clients to send (or set `contact_email`) |
-| `DAYTRADER_NOW` | pretend it is this US/Eastern time, for replays and demos, e.g. `DAYTRADER_NOW=2026-10-29T10:15`; bars that start after it are ignored |
+| `DAYTRADER_NOW` | pretend it is this US/Eastern time, for replays and demos, e.g. `DAYTRADER_NOW=2026-10-29T10:15`. Intraday (5-minute) bars that start after it are ignored; the bar in progress at that time is used as the data has it, so with data fetched later it already shows that bar's later prices (e.g. the entry skill's `since trigger` high/low). A daily bar can't be cut at a time of day, so if the data was fetched later, that day's daily bar includes the later prices: the scanner then prints `WARNING: replay ...`, and the analyst brief builds today from 5-minute bars and warns when it has to fall back to the daily bar |
 
 ## Development
 
 ```bash
 cd day-trader
 python3 -m unittest discover -s tests       # the full offline test suite (no network)
+python3 tools/smoke_live.py                 # live check of every data source (needs the network)
 python3 tools/sync_common.py                # after editing shared/trader_common.py: refresh every copy
 python3 tools/sync_common.py --check        # fail if any skill's copy is stale (CI)
 python3 tools/package_skills.py --check     # validate every SKILL.md frontmatter (CI)
+python3 tests/test_desk_flow.py --print-morning   # the desk-flow sample run, in full
 ```
 
 `shared/trader_common.py` is the one canonical shared library; never edit the vendored copies in
@@ -170,8 +254,24 @@ python3 tools/package_skills.py --check     # validate every SKILL.md frontmatte
 `$DAYTRADER_FIXTURES` (see `tests/helpers.py`), so the suite never touches the network. CI runs
 the suite on Python 3.9 and 3.12.
 
+`tools/smoke_live.py` is the live counterpart, for a machine where the network is open (it is not
+part of CI). It makes one real request per data source through the skills' own code: Yahoo
+5-minute and daily bars and the quote, the Nasdaq symbol lists, the news skill's RSS and search
+parsers, SEC filings, and the House index plus one recent electronic PTR (skipped if none was
+filed in the last 60 days). Each check asserts the parse is sane (bar spacing, prices above 0,
+recent timestamps, plausible counts), not just that the host answered. It prints a PASS/FAIL
+table with the host for each check and exits 0 only if every check that ran passed; one failure
+never stops the others. `--json` gives the same as JSON, `--symbol NVDA` changes the ticker and
+`--only yahoo-5m,sec-filings` runs a subset. Behind a proxy that blocks a host, that row fails
+within seconds with the allow-list message. If SEC answers HTTP 403, set `DAYTRADER_CONTACT` first.
+
 ## Limitations
 
+* **Parsers were developed against synthetic data.** The pack was built where none of the data
+  hosts could be reached, so every parser (Yahoo charts, search and RSS, the Nasdaq lists, SEC
+  EDGAR, the House index and PTR PDFs) has been tested only on synthetic payloads modelled on
+  each documented format. Before relying on it, run `tools/smoke_live.py` first, where the
+  network is open: it checks each live source through the skills' own parsers.
 * **Unofficial Yahoo endpoints.** Yahoo Finance has no official free API. Its chart and search
   endpoints can change, rate-limit or block without notice.
 * **About 60 days of 5-minute history.** That is all Yahoo keeps, so the Time Machine learns from

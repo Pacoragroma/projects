@@ -948,13 +948,7 @@ def build_parser():
                    help=f"only these tags, comma-separated (any match): {','.join(TAGS)} or HIGH")
     p.add_argument("--new-only", action="store_true",
                    help="only headlines not shown by an earlier --new-only run (remembered in news_seen.json)")
-
-    def usage_error(message: str) -> None:  # argparse exits 2, but 2 means "data source down" here
-        p.print_usage(sys.stderr)
-        print(f"{p.prog}: error: {message}", file=sys.stderr)
-        sys.exit(1)
-    p.error = usage_error  # type: ignore[method-assign]
-    return p
+    return p   # tc's parser: usage errors exit 1 (2 means "data source down" here)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

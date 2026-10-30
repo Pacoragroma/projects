@@ -75,12 +75,17 @@ Re-running within ~2 minutes (market open) or ~15 minutes (closed) reuses the do
 
 Limits: daily bars only (no pre-market: before 09:30 ET the scan shows the last completed day;
 today's gaps appear after the open). Early closes come from Yahoo's trading period when it
-reports one; exchange holidays are otherwise not modelled. Yahoo data can be
+reports one; exchange holidays are otherwise not modelled. Replays (`$DAYTRADER_NOW` set
+mid-session): a daily bar cannot be cut at a time of day, so if the data was fetched later, that
+day's bar holds the later trading too and the scan says so (`WARNING: replay ...`). Yahoo data can be
 delayed or wrong for thinly traded names. A score ranks how strongly a chart fits a pattern; it is
 not a probability of profit.
 
 ## Reading the output / how to present it to the user
 - Header: time (ET) and whether today's bar is still forming. Mid-session, say "rvol is projected".
+- `WARNING: replay at HH:MM ET ...` (JSON `replay_warning`; `after_as_of: true` on each affected
+  row): the as-of day's daily bar includes trading after that time, so last, change, rvol and
+  setups show the later picture. Relay it; do not present those numbers as "at HH:MM".
 - Table: rank, symbol, setups (best first), score, last price, % change vs prior close, rvol,
   and the key level (20-day high for breakouts, 20-day low for breakdowns, prior close = gap-fill
   level for gaps, 20-SMA for pullbacks, the NR7 high/low range).
@@ -93,9 +98,10 @@ not a probability of profit.
   (`bias` in JSON: `long`, `short`, or `either` for NR7). Always add that these are candidates
   to research, not recommendations.
 - JSON (`--json`): `results[]` has `symbol, score, bias, setups[] {setup, score, bias, detail,
-  levels, key_level, components}, last, change_pct, gap_pct, rvol, partial_day, atr14, atr_pct,
-  sma20, sma50, rsi14, high_20d, low_20d, dollar_volume_20d, key_level {name, price}`; top level
-  has `scanned, skipped, skipped_by_reason, filtered, matched, incomplete, warning, filters`.
+  levels, key_level, components}, last, change_pct, gap_pct, rvol, partial_day, after_as_of, atr14,
+  atr_pct, sma20, sma50, rsi14, high_20d, low_20d, dollar_volume_20d, key_level {name, price}`; top
+  level has `scanned, skipped, skipped_by_reason, filtered, matched, incomplete, warning,
+  replay_warning, filters`.
 
 ## Next step on the desk
 - **news** skill: check each candidate for a catalyst (earnings, deal, FDA, offering) before

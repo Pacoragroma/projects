@@ -167,6 +167,14 @@ class PackReadmeTests(unittest.TestCase):
         for h in sorted(hosts):
             self.assertIn(f"`{h}`", self.readme, f"{h} is used by the code but not in README's network table")
 
+    def test_replay_row_says_what_a_replay_cannot_cut(self):
+        # $DAYTRADER_NOW drops bars that start later, but the bar in progress and the day's daily bar
+        # keep whatever the data has (a replay of data fetched later can show those later prices).
+        row = next(ln for ln in self.readme.splitlines() if ln.startswith("| `DAYTRADER_NOW` |"))
+        for phrase in ("bars that start after it are ignored", "the bar in progress at that time is used as the data has it",
+                       "`since trigger`", "daily bar can't be cut", "WARNING: replay"):
+            self.assertIn(phrase, row)
+
 
 if __name__ == "__main__":
     unittest.main()

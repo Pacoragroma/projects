@@ -45,10 +45,10 @@ inferred: stop below entry = long), `--entry/--stop/--target` (all from flags or
 saved plan, never mixed; a stop is mandatory, a target optional), `--type limit|market` (default
 `limit`; a market ticket may omit `--entry` and uses the last price as its reference),
 `--setup orb` (journal label; default the plan's), `--time-stop HH:MM` (default the exit plan's,
-else 15:55). Every command takes `--json`. Exit codes: 0 ok, 1 bad input or refused (no `--yes`,
-expired, already used, price through the stop), 2 data source down (`data error: ...`), 3
-blocked by the daily budget. An argparse usage error (unknown flag) also exits 2 but prints
-`usage:`. More detail, the ledger schema and JSON fields: `reference.md`.
+else 15:55). Every command takes `--json`. Exit codes: 0 ok (also a `ticket` preview), 1 bad
+input or refused (no `--yes`, expired, already used, price through the stop, an unknown flag), 2
+data source down (`data error: ...`), 3 blocked by the daily budget. More detail, the ledger
+schema and JSON fields: `reference.md`.
 
 ## How it works
 * **ticket** validates the levels (`tc.validate_levels`, cents only), refuses notional above 4x
@@ -56,9 +56,15 @@ blocked by the daily budget. An argparse usage error (unknown flag) also exits 2
   `|entry - stop| x qty`. Today's working limit orders count as open risk and as trades. Blocked:
   exit 3, no ticket. Otherwise a `pending` ticket expires after `ticket_ttl_minutes` (15) or at the
   time stop. A new ticket replaces an older pending one in the same symbol. A ticket opposite an
-  open position or working order in that symbol is refused. Tickets need the session: weekdays,
-  before the time stop (5 min before an early close Yahoo reports; full holidays are caught at
-  confirm, which needs today's quote).
+  open position or working order in that symbol is refused. A confirmable ticket needs the
+  session: weekdays, before the time stop (5 min before an early close Yahoo reports; full
+  holidays are caught at confirm, which needs today's quote).
+* **Outside the session** (weekend, before ~09:15, after the time stop) `ticket` runs the same
+  checks and prints the full card as a **PREVIEW**: exit 0, `status: "preview"`, `preview: true`,
+  no ticket id, nothing saved, so nothing can be confirmed. It ends with "MARKET CLOSED — preview
+  only. Re-run ticket after 09:30 ET to get a ticket you can confirm." A budget block still exits 3.
+* A note says when the levels were **not tested by the time machine** (no odds in the plan, or
+  odds for other levels). Odds print as the time machine printed them (`display_pct`).
 * **confirm --yes** is the only path that opens a position. It refuses expired, cancelled and
   used tickets, and refuses a yes that comes less than 10 seconds after the ticket. It also needs
   09:30 ET up to the time stop and today's quote. It syncs open trades first, so stops already
@@ -78,8 +84,10 @@ blocked by the daily budget. An argparse usage error (unknown flag) also exits 2
     better gap open. Unfilled at the time stop → `expired`.
   * Each close records `exit_price, exit_reason (stop|target|eod|manual), pnl, r_multiple`.
 * **close** first syncs the trade. If its stop or target had already been hit, it reports that
-  and changes nothing else. **cancel** of a working order first checks the bars: if it had
-  already filled, the fill (and any exit) is recorded and nothing is cancelled (exit 1).
+  and changes nothing else. `--price` must be a price that traded since the fill (checked against
+  the 5-minute bars; without bars a note says it was not checked). **cancel** of a working order
+  first checks the bars: if it had already filled, the fill (and any exit) is recorded and nothing
+  is cancelled (exit 1).
   **positions** shows unrealized P&L at the latest quote (best-effort: no price shows `-`).
 * **Limits:** a simulation, not an execution. No queue position, partial fills, commissions,
   borrow fees or halts. Prices can be delayed. Trading through a stop gets the stop price unless
@@ -90,15 +98,20 @@ blocked by the daily budget. An argparse usage error (unknown flag) also exits 2
   358.32 · PAPER · REAL MONEY: OFF`). Then give the risk in $, the R:R, the budget line, the expiry
   time and every `!` warning. End with the ticket's own prompt: **"reply yes to confirm ticket
   TKT-..."**. Then stop and wait.
+* A **preview** (`status: "preview"`, "ORDER TICKET · PREVIEW"): show the card and the numbers,
+  say plainly it is a preview because the market is closed, and give its last line (re-run
+  `ticket` after 09:30 ET). **Never ask for a yes on a preview**: there is no ticket to confirm.
+* Relay the "not tested by the time machine for these levels" note; offer the command it names.
 * Blocked (exit 3): lead with "BLOCKED", list the reasons, and say nothing was created. Suggest
   the budget skill; never work around it (e.g. by splitting the order).
 * After `confirm`: FILLED (price, trade id) or WORKING (it rests until a bar trades through the
   limit). Mention `sync` and `positions`. Market fills say when risk differs from the ticket.
 * After `sync`/`close`: for each exit give reason, price, bar time, P&L in $ and R. Say "counted
   as stop" for `ambiguous` exits.
-* JSON: `ok, action, status, ticket{id, symbol, side, qty, type, entry, stop, target, risk, rr,
-  status, expires_at, time_stop, setup, time_machine}, trade{id, entry_price, opened_at, status,
-  exit_price, exit_reason, pnl, r_multiple}, budget, warnings[], notes[], real_money: false`.
+* JSON: `ok, action, status, preview, ticket{id, symbol, side, qty, type, entry, stop, target,
+  risk, rr, status, expires_at, time_stop, setup, time_machine}, trade{id, entry_price, opened_at,
+  status, exit_price, exit_reason, pnl, r_multiple}, budget, warnings[], notes[], real_money:
+  false`. A preview has `order{...}` (no id) and `banner` instead of `ticket`.
 
 ## Next step on the desk
 * Before a ticket: **exit** (the plan), **time-machine** (the odds), **risk** (the size,
@@ -113,6 +126,8 @@ blocked by the daily budget. An argparse usage error (unknown flag) also exits 2
 * **The yes rule.** Show the ticket, then wait for the user's explicit yes **in a later
   message**. Never run `confirm --yes` in the same turn that created the ticket. Never chain
   `ticket ... && confirm --yes`, and never pass `--yes` on the user's behalf.
+* A preview is not a ticket. Never ask for a yes on it and never treat a yes to a preview as a yes
+  to a later ticket: re-run `ticket` in the session and ask again for that ticket id.
 * A yes given before the ticket existed ("buy it and confirm", "auto-confirm") does not count:
   the user must have seen this ticket. A yes counts **only for that specific ticket id**. If the
   levels, size or side change, make a new ticket and ask again. One yes never covers several
@@ -123,6 +138,9 @@ blocked by the daily budget. An argparse usage error (unknown flag) also exits 2
   it without a fresh yes to the new ticket id.
 * Never move a stop wider or retry a refused fill to get around a rule. Report only what the
   script printed. Never invent fills, prices or P&L.
+* The ledger (`ledger.json`) and `settings.json` live in `$DAYTRADER_HOME` (default `~/.day-trader`).
+  In a sandbox (the Claude apps) that folder may be gone next conversation: before the user leaves,
+  offer both as files to download; when they upload them later, copy them back there first.
 * Not financial advice. Paper results and fills are simulations, not guarantees (`tc.DISCLAIMER`).
 * If a command exits 2 ("data error: ..."), tell the user which host failed. It is in the
   message, usually `query1`/`query2.finance.yahoo.com`. In sandboxes the host may need to be

@@ -178,9 +178,9 @@ def fixture_name(url: str) -> str:
     return f"{slug}__{hashlib.sha1(url.encode('utf-8')).hexdigest()[:10]}"
 
 
-def _host_hint(url: str, status: int) -> str:
+def _host_hint(url: str, status: int, proxy: bool = False) -> str:
     host = urllib.parse.urlsplit(url).hostname or ""
-    if status == 403 and (host == "sec.gov" or host.endswith(".sec.gov")) and not (
+    if status == 403 and not proxy and (host == "sec.gov" or host.endswith(".sec.gov")) and not (
             os.environ.get("DAYTRADER_CONTACT") or load_settings().get("contact_email")):
         return (" - SEC asks for a contact email in the User-Agent: set DAYTRADER_CONTACT=you@example.com"
                 " (or the contact_email setting); in a sandbox the host may also need to be allow-listed")
@@ -231,7 +231,7 @@ def http_get(url: str, *, headers: Optional[Dict[str, str]] = None, timeout: flo
             reason = getattr(e, "reason", e)
             if _PROXY_DENIED.search(str(reason)):
                 # A proxy refusing the tunnel is a policy decision, not a blip: don't retry.
-                raise FetchError(f"blocked by proxy for {url} ({reason}){_host_hint(url, 403)}") from e
+                raise FetchError(f"blocked by proxy for {url} ({reason}){_host_hint(url, 403, proxy=True)}") from e
             if attempt < retries:
                 time.sleep(min(2 ** attempt, 8) + random.random() * 0.3)
                 continue
@@ -858,7 +858,10 @@ def trade_initial_risk(trade: Dict[str, Any]) -> float:
         e, st, q = float(trade["entry_price"]), float(trade["stop"]), float(trade["qty"])
     except (KeyError, TypeError, ValueError) as err:
         raise StateError(f"ledger trade {trade.get('id', '?')} is missing entry_price/stop/qty") from err
-    per_share = (e - st) if trade.get("side", "long") == "long" else (st - e)
+    side = trade.get("side")
+    if side not in ("long", "short"):
+        raise StateError(f"ledger trade {trade.get('id', '?')} has side {side!r}; expected long or short")
+    per_share = (e - st) if side == "long" else (st - e)
     return max(0.0, per_share) * q
 
 
