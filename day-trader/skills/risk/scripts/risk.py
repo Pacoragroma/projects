@@ -1,0 +1,979 @@
+#!/usr/bin/env python3
+"""Risk: position sizing and pre-trade risk checks for a paper day trade.
+
+Sizes the trade so that hitting the stop loses at most your risk budget (default 0.2% of the
+account), caps it by the max position size and buying power, and checks it before you ask the
+broker for a ticket: reward:risk, a stop that is inside the noise, 0 shares, margin / buying
+power, today's loss budget (from the paper ledger), and a pattern-day-trader heads-up.
+
+Usage:
+  python3 scripts/risk.py size --entry 364.18 --stop 358.32                  # BUY 8 shares
+  python3 scripts/risk.py size --symbol TSLA                                 # levels from plans/TSLA.json
+  python3 scripts/risk.py size --symbol TSLA --entry 364.18 --stop 358.32 --target 370.04 --save
+  python3 scripts/risk.py size --symbol TSLA --stop 358.32                   # entry = current price
+  python3 scripts/risk.py size --entry 364.18 --stop 370.04 --risk-dollars 100   # stop above = short
+  python3 scripts/risk.py size --entry 50 --stop 49.9 --max-position-pct 200 --leverage 4
+  python3 scripts/risk.py config --account 30000 --risk-pct 0.25 --max-position-pct 25 --min-rr 1.5
+  python3 scripts/risk.py config                                             # show settings
+  python3 scripts/risk.py show                                               # settings + open risk today
+  python3 scripts/risk.py --json size --symbol TSLA                          # --json works anywhere
+
+Exit codes: 0 ok, 1 bad input or state (including `size --save` that could not save),
+2 data source unreachable (only `size` without an entry anywhere fetches the current price).
+"""
+from __future__ import annotations
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import trader_common as tc  # noqa: E402
+
+import argparse  # noqa: E402
+import math  # noqa: E402
+import re  # noqa: E402
+from datetime import datetime  # noqa: E402
+from typing import Any, Dict, Iterable, List, Optional, Sequence  # noqa: E402
+
+PDT_MIN_EQUITY = 25000.0      # FINRA pattern-day-trader minimum equity (as of this writing)
+PDT_NOTE = ("pattern-day-trader rules may limit day trades depending on your broker and current "
+            "FINRA rules")
+NOISE_STOP_PCT = 0.1          # stop closer than this % of price is inside normal noise
+BIG_RISK_PCT = 2.0            # risking more than this % of the account on one trade -> warn
+TINY_RISK_PCT = 0.01          # below this the user probably typed a fraction, not a percent
+MAX_RISK_PCT = 100.0
+MAX_POSITION_PCT = 400.0      # 4x intraday buying power is the most any account gets
+LEVERAGES = (1, 2, 4)         # cash, Reg T margin, pattern-day-trader intraday margin
+EPS = 1e-9
+# Plan sections other skills computed for specific levels; stale once the levels change.
+DEPENDENT_SECTIONS = ("exit_plan", "time_machine")
+NUMERIC_SETTINGS = ("account_size", "risk_per_trade_pct", "max_position_pct", "min_reward_risk",
+                    "daily_max_loss", "max_open_risk")
+INT_SETTINGS = ("max_trades_per_day", "max_consecutive_losses")
+CAP_LABELS = {"risk": "risk budget", "max_position_pct": "max position size",
+              "buying_power": "buying power"}
+
+
+# ---------------------------------------------------------------------------
+# Pure core
+# ---------------------------------------------------------------------------
+
+def _floor_shares(x: float) -> int:
+    """Whole shares; the epsilon keeps float noise (9.99999999) from costing a share."""
+    return max(0, int(math.floor(x + EPS)))
+
+
+def _same(a: Optional[float], b: Optional[float]) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(a)))
+
+
+def _num(value: Any) -> Optional[float]:
+    """A positive finite price from a plan field, else None."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v > 0 else None
+
+
+def infer_side(entry: float, stop: float) -> str:
+    if stop < entry:
+        return "long"
+    if stop > entry:
+        return "short"
+    raise ValueError("entry and stop must differ")
+
+
+def resolve_levels(plan: Optional[Dict[str, Any]], entry: Optional[float] = None,
+                   stop: Optional[float] = None, target: Optional[float] = None,
+                   side: Optional[str] = None, last_price: Optional[float] = None) -> Dict[str, Any]:
+    """Merge the flags with the saved plan (flags win) and validate the result.
+
+    * entry: --entry, else the plan's entry, else `last_price` (the current quote).
+    * stop: --stop, else the plan's stop.
+    * side: --side; else the plan's side when any level came from the plan (so a typo cannot
+      silently flip a long into a short); else inferred (stop below entry = long).
+    * target: --target; else the plan's target only if it was set for this side and entry.
+    """
+    plan = plan or {}
+    p_entry, p_stop, p_target = _num(plan.get("entry")), _num(plan.get("stop")), _num(plan.get("target"))
+    p_side = plan.get("side") if plan.get("side") in ("long", "short") else None
+    src: Dict[str, str] = {}
+    notes: List[str] = []
+
+    if entry is not None:
+        src["entry"] = "flag"
+    elif p_entry is not None:
+        entry, src["entry"] = p_entry, "plan"
+    elif last_price is not None:
+        entry, src["entry"] = float(last_price), "quote"
+    else:
+        raise ValueError("no entry price: pass --entry (or --symbol SYM to use its saved plan "
+                         "or current price)")
+    if stop is not None:
+        src["stop"] = "flag"
+    elif p_stop is not None:
+        stop, src["stop"] = p_stop, "plan"
+    else:
+        raise ValueError("no stop price: pass --stop (the stop decides the size)")
+
+    from_plan = "plan" in (src["entry"], src["stop"])
+    if side:
+        src["side"] = "flag"
+    elif p_side and from_plan:
+        side, src["side"] = p_side, "plan"
+    else:
+        side, src["side"] = infer_side(entry, stop), "inferred"
+        if p_side and p_side != side:
+            notes.append(f"side {side.upper()} follows your levels (the saved plan was {p_side})")
+
+    if target is not None:
+        src["target"] = "flag"
+    elif p_target is not None:
+        if side == p_side and _same(entry, p_entry):
+            target, src["target"] = p_target, "plan"
+        else:
+            notes.append(f"the saved target {tc.fmt_price(p_target)} was not used: it was set for a "
+                         "different entry or side (pass --target)")
+
+    errs = tc.validate_levels(side, float(entry), float(stop), None if target is None else float(target))
+    if errs:
+        where = ", ".join(f"{k} {tc.fmt_price(v)} ({_SOURCE_WORDS[src[k]]})"
+                          for k, v in (("entry", entry), ("stop", stop), ("target", target))
+                          if v is not None)
+        raise ValueError(f"{'; '.join(errs)} - {side} with {where}")
+    return {"side": side, "entry": float(entry), "stop": float(stop),
+            "target": None if target is None else float(target), "sources": src, "notes": notes}
+
+
+_SOURCE_WORDS = {"flag": "your flag", "plan": "saved plan", "quote": "current price",
+                 "inferred": "inferred"}
+
+
+def levels_changed(plan: Optional[Dict[str, Any]], lv: Dict[str, Any]) -> bool:
+    """True when side/entry/stop/target differ from the saved plan's."""
+    if not plan:
+        return False
+    return not (plan.get("side") == lv["side"]
+                and _same(_num(plan.get("entry")), lv["entry"])
+                and _same(_num(plan.get("stop")), lv["stop"])
+                and _same(_num(plan.get("target")), lv["target"]))
+
+
+def size_position(side: str, entry: float, stop: float, target: Optional[float] = None,
+                  settings: Optional[Dict[str, Any]] = None, account: Optional[float] = None,
+                  risk_pct: Optional[float] = None, risk_dollars: Optional[float] = None,
+                  max_position_pct: Optional[float] = None,
+                  leverage: Optional[int] = None) -> Dict[str, Any]:
+    """Whole shares so a stop-out loses at most the risk budget, capped by max position and
+    buying power (account x leverage). Uses tc.position_size for the first two caps."""
+    s = dict(tc.DEFAULT_SETTINGS) if settings is None else settings
+    errs = tc.validate_levels(side, entry, stop, target)
+    if errs:
+        raise ValueError("; ".join(errs))
+    acct = float(account if account is not None else s["account_size"])
+    if not math.isfinite(acct) or acct <= 0:
+        raise ValueError("account size must be positive - set it with: risk.py config --account N")
+    if risk_dollars is not None:
+        pct, budget, budget_source = None, float(risk_dollars), "risk_dollars"
+    else:
+        pct = float(risk_pct if risk_pct is not None else s["risk_per_trade_pct"])
+        budget, budget_source = acct * pct / 100.0, "risk_pct"
+    if not math.isfinite(budget) or budget <= 0:
+        raise ValueError("the risk budget must be positive (--risk-pct / --risk-dollars, or "
+                         "risk.py config --risk-pct X)")
+    cap_pct = float(max_position_pct if max_position_pct is not None else s["max_position_pct"])
+    if not math.isfinite(cap_pct) or cap_pct <= 0:
+        raise ValueError("max position % must be positive (--max-position-pct, or risk.py config)")
+    lev = int(leverage) if leverage is not None else 1
+    if lev not in LEVERAGES:
+        raise ValueError(f"leverage must be one of {', '.join(map(str, LEVERAGES))}")
+
+    base = tc.position_size(entry, stop, account=acct, risk_dollars=budget,
+                            max_position_pct=cap_pct, settings=s)
+    per_share = abs(entry - stop)
+    max_notional = acct * cap_pct / 100.0
+    buying_power = acct * lev
+    limits = {"risk": _floor_shares(budget / per_share),
+              "max_position_pct": _floor_shares(max_notional / entry),
+              "buying_power": _floor_shares(buying_power / entry)}
+    shares, capped_by = int(base["shares"]), base["capped_by"]
+    if shares > limits["buying_power"]:
+        shares, capped_by = limits["buying_power"], "buying_power"
+
+    risk_used = shares * per_share
+    notional = shares * entry
+    out: Dict[str, Any] = {
+        "side": side,
+        "action": "BUY" if side == "long" else "SELL SHORT",
+        "shares": shares,
+        "entry": entry, "stop": stop, "target": target,
+        "risk_per_share": round(per_share, 4),
+        "stop_pct": round(per_share / entry * 100.0, 4),
+        "risk_budget": round(budget, 2),
+        "risk_budget_source": budget_source,
+        "risk_pct": pct,
+        "risk_used": round(risk_used, 2),
+        "risk_used_pct": round(risk_used / acct * 100.0, 4),
+        "notional": round(notional, 2),
+        "position_pct": round(notional / acct * 100.0, 2),
+        "account": acct,
+        "max_position_pct": cap_pct,
+        "max_notional": round(max_notional, 2),
+        "leverage": lev,
+        "leverage_given": leverage is not None,
+        "buying_power": round(buying_power, 2),
+        "capped_by": capped_by,
+        "limits": limits,
+        "rr": None, "reward_per_share": None, "reward_at_target": None, "breakeven_win_rate_pct": None,
+    }
+    if target is not None:
+        rr = tc.reward_risk(side, entry, stop, target)
+        reward = abs(target - entry)
+        out.update(rr=round(rr, 4), reward_per_share=round(reward, 4),
+                   reward_at_target=round(shares * reward, 2),
+                   breakeven_win_rate_pct=round(100.0 / (1.0 + rr), 2))
+    return out
+
+
+def budget_ledger(ledger: Dict[str, Any], day: str) -> Dict[str, Any]:
+    """The ledger as the broker's budget check sees it (pure).
+
+    A working limit order confirmed on `day` can still fill without another check, so the broker
+    counts it as an open trade opened today: its risk and its trade slot are already committed.
+    tc.day_summary only looks at trades, so without this the risk skill would say OK to a trade
+    the broker then refuses. Rows added here carry `_working: True`.
+    """
+    trades = [t for t in ledger.get("trades") or [] if isinstance(t, dict)]
+    linked = {t.get("ticket_id") for t in trades if t.get("ticket_id")}
+    synth = []
+    for k in ledger.get("tickets") or []:
+        if (not isinstance(k, dict) or k.get("status") != "working" or k.get("id") in linked
+                or str(k.get("confirmed_at") or "")[:10] != day):
+            continue
+        synth.append({"id": k.get("id"), "symbol": k.get("symbol"), "side": k.get("side"),
+                      "qty": k.get("qty"), "entry_price": k.get("entry"), "stop": k.get("stop"),
+                      "status": "open", "opened_at": k.get("confirmed_at"), "_working": True})
+    return {"tickets": [], "trades": trades + synth}
+
+
+def budget_view(bc: Dict[str, Any], risk_per_share: float, risk_used: float,
+                ledger: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """tc.budget_check result + what is left after this trade and the most shares that fit now.
+    `ledger` is the budget_ledger() view the check ran on (for the working-order share of risk)."""
+    lim, summ = bc["limits"], bc["summary"]
+    used = float(bc["loss_budget_used"])
+    count_blocked = (summ["trades_today"] >= lim["max_trades_per_day"]
+                     or summ["loss_streak"] >= lim["max_consecutive_losses"])
+    # trade count / tilt guard block any new risk, whatever dollars are left
+    room = 0.0 if count_blocked else max(0.0, min(float(lim["daily_max_loss"]) - used,
+                                                  float(lim["max_open_risk"]) - float(summ["open_risk"])))
+    max_shares = 0 if count_blocked or risk_per_share <= 0 else _floor_shares(room / risk_per_share)
+    working = [t for t in (ledger or {}).get("trades") or [] if t.get("_working")]
+    return {
+        "ok": bool(bc["ok"]),
+        "reasons": list(bc["reasons"]),
+        "date": summ["date"],
+        "realized_pnl": summ["realized_pnl"],
+        "open_risk": summ["open_risk"],
+        "working_order_risk": round(sum(tc.trade_initial_risk(t) for t in working), 2),
+        "working_orders": len(working),
+        "open_positions": summ["open_positions"] - len(working),
+        "trades_today": summ["trades_today"],
+        "loss_streak": summ["loss_streak"],
+        "loss_budget_used": round(used, 2),
+        "loss_budget_left": bc["loss_budget_left"],
+        "loss_budget_left_after": round(max(0.0, float(lim["daily_max_loss"]) - used - risk_used), 2),
+        "max_risk_now": round(room, 2),
+        "max_shares_now": max_shares,
+        "limits": dict(lim),
+    }
+
+
+def _ceil_to(x: float, places: int) -> float:
+    """Round up (so a suggested setting is always enough), ignoring float noise."""
+    f = 10 ** places
+    return math.ceil(x * f - 1e-9) / f
+
+
+def zero_shares_reason(sz: Dict[str, Any]) -> str:
+    """Why the size came out at 0 shares: every cap that allows 0, and what 1 share would need."""
+    entry, acct, lim = sz["entry"], sz["account"], sz["limits"]
+    per = abs(sz["entry"] - sz["stop"])
+    parts: List[str] = []
+    if lim["risk"] == 0:
+        pct = _ceil_to(per / acct * 100.0, 4)
+        flags = f"--risk-dollars {_ceil_to(per, 2):.2f}"
+        if pct <= MAX_RISK_PCT:
+            flags += f" or --risk-pct {pct:g}"
+        parts.append(f"the stop is {tc.fmt_money(per)}/share away but the risk budget is "
+                     f"{tc.fmt_money(sz['risk_budget'])}; one share needs {tc.fmt_money(per)} of risk "
+                     f"({flags}) or a stop within {tc.fmt_money(sz['risk_budget'])} of the entry")
+    need_pct = _ceil_to(entry / acct * 100.0, 2)     # max position % that fits one share
+    if need_pct > MAX_POSITION_PCT:
+        parts.append(f"one share costs {tc.fmt_money(entry)}, more than 4x the {tc.fmt_money(acct)} "
+                     "account - no max position or leverage setting allows it")
+    else:
+        if lim["max_position_pct"] == 0:
+            parts.append(f"one share costs {tc.fmt_money(entry)}, more than the max position "
+                         f"{tc.fmt_money(sz['max_notional'])} ({sz['max_position_pct']:g}% of the account); "
+                         f"one share needs --max-position-pct {need_pct:g}")
+        if lim["buying_power"] == 0:
+            lev = next((x for x in LEVERAGES if acct * x >= entry - EPS), LEVERAGES[-1])
+            parts.append(f"one share costs {tc.fmt_money(entry)}, more than the "
+                         f"{tc.fmt_money(sz['buying_power'])} buying power at {sz['leverage']}x; it needs "
+                         f"--leverage {lev} (only if your account really has that margin)")
+    return "0 shares: " + "; and ".join(parts)
+
+
+def risk_checks(sz: Dict[str, Any], settings: Dict[str, Any], budget: Optional[Dict[str, Any]] = None,
+                open_items: Iterable[str] = (), plan_date: Optional[str] = None,
+                today: Optional[str] = None) -> List[str]:
+    """Warnings for a sized trade (pure). Empty list = nothing to flag."""
+    w: List[str] = []
+    if sz["shares"] == 0:          # first: the text card points at the first warning
+        w.append(zero_shares_reason(sz))
+    elif sz["capped_by"] == "buying_power":
+        w.append(f"size capped by {sz['leverage']}x buying power ({tc.fmt_money(sz['buying_power'])}); pass "
+                 "--leverage 2 or 4 only if your account really has that margin")
+    min_rr = float(settings.get("min_reward_risk") or 0)
+    if sz["rr"] is not None and sz["rr"] < min_rr - 1e-6:
+        w.append(f"R:R {sz['rr']:.2f} is below your minimum of {min_rr:.2f} (min_reward_risk): the target "
+                 "does not pay enough for the risk")
+    if sz["stop_pct"] < NOISE_STOP_PCT:
+        w.append(f"the stop is only {tc.fmt_money(sz['risk_per_share'])} ({sz['stop_pct']:.3f}%) from the "
+                 f"entry - under {NOISE_STOP_PCT:g}% of price is inside normal noise and the spread; "
+                 "expect to be stopped out by noise, and slippage is a big share of the risk")
+    if sz["notional"] > sz["account"] + 0.005:
+        w.append(f"the position ({tc.fmt_money(sz['notional'])}) is larger than the account "
+                 f"({tc.fmt_money(sz['account'])}): it needs margin ({sz['leverage']}x buying power)")
+    if sz["leverage"] == 4 and sz["account"] < PDT_MIN_EQUITY:
+        w.append(f"4x intraday buying power normally needs a pattern-day-trader margin account with at "
+                 f"least {tc.fmt_money(PDT_MIN_EQUITY)} equity")
+    if sz["side"] == "short" and sz["leverage_given"] and sz["leverage"] == 1:
+        w.append("a cash account (1x) cannot sell short - shorting needs a margin account")
+    if sz["risk_used_pct"] > BIG_RISK_PCT:
+        w.append(f"this risks {sz['risk_used_pct']:.2f}% of the account on one trade - above "
+                 f"{BIG_RISK_PCT:g}%, an ordinary losing streak does real damage")
+    if sz["risk_pct"] is not None and sz["risk_pct"] < TINY_RISK_PCT:
+        w.append(f"risk per trade is only {sz['risk_pct']:g}% of the account - the risk % is a percent "
+                 "(0.2 means 0.2%, not 20%)")
+    if budget is not None and not budget["ok"]:
+        for r in budget["reasons"]:
+            w.append(f"daily budget: {r}")
+        n = budget["max_shares_now"]
+        if 0 < n < sz["shares"]:
+            w.append(f"daily budget: at most {n} shares ({tc.fmt_money(n * sz['risk_per_share'])} risk) "
+                     "fit what is left today")
+    for item in open_items:
+        w.append(f"you already have {item}")
+    if plan_date and today and plan_date != today:
+        w.append(f"the saved plan is from {plan_date} - check its levels still make sense today")
+    if sz["account"] < PDT_MIN_EQUITY:
+        w.append(f"account under {tc.fmt_money(PDT_MIN_EQUITY)}: {PDT_NOTE} (a heads-up, not a block)")
+    return w
+
+
+def settings_warnings(s: Dict[str, Any]) -> List[str]:
+    """Inconsistencies between the sizing settings and the daily budget limits (pure)."""
+    w: List[str] = []
+    per_trade = s["account_size"] * s["risk_per_trade_pct"] / 100.0
+    if s["account_size"] <= 0:
+        w.append("account size is 0 - set it with: risk.py config --account N")
+        return w
+    if s["risk_per_trade_pct"] <= 0:
+        w.append("risk per trade is 0% - every size will be 0 shares; set --risk-pct")
+    elif s["risk_per_trade_pct"] < TINY_RISK_PCT:
+        w.append(f"risk per trade is only {s['risk_per_trade_pct']:g}% - the setting is a percent "
+                 "(0.2 means 0.2%)")
+    if s["risk_per_trade_pct"] > BIG_RISK_PCT:
+        w.append(f"risking {s['risk_per_trade_pct']:g}% per trade is aggressive - above {BIG_RISK_PCT:g}%, "
+                 "an ordinary losing streak does real damage")
+    if per_trade > s["daily_max_loss"] + EPS:
+        w.append(f"one full-size trade risks {tc.fmt_money(per_trade)}, more than the "
+                 f"{tc.fmt_money(s['daily_max_loss'])} daily max loss - the budget will block it "
+                 "(budget.py set --daily-max-loss X, or lower --risk-pct)")
+    elif per_trade > s["max_open_risk"] + EPS:
+        w.append(f"one full-size trade risks {tc.fmt_money(per_trade)}, more than the "
+                 f"{tc.fmt_money(s['max_open_risk'])} max open risk - the budget will block it")
+    if s["max_position_pct"] > 100:
+        w.append(f"max position {s['max_position_pct']:g}% of the account needs margin - pass "
+                 "--leverage 2 or 4 to `size`, or it is capped at 1x buying power")
+    if s["account_size"] < PDT_MIN_EQUITY:
+        w.append(f"account under {tc.fmt_money(PDT_MIN_EQUITY)}: {PDT_NOTE} (a heads-up, not a block)")
+    return w
+
+
+def _parse_time(value: Any) -> Optional[datetime]:
+    """ISO stamp -> aware ET datetime (naive stamps are ET wall-clock), or None."""
+    if not value:
+        return None
+    try:
+        return tc.parse_et(str(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def ledger_items(ledger: Dict[str, Any], now: datetime, symbol: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
+    """Open paper positions and working/pending orders (optionally for one symbol)."""
+    sym = symbol.upper() if symbol else None
+    out: Dict[str, List[Dict[str, Any]]] = {"open": [], "working": [], "pending": []}
+    for t in ledger.get("trades") or []:
+        if not isinstance(t, dict) or (sym and str(t.get("symbol", "")).upper() != sym):
+            continue
+        if t.get("status") == "open":
+            out["open"].append(t)
+        elif t.get("status") == "working":
+            out["working"].append(t)
+    for k in ledger.get("tickets") or []:
+        if not isinstance(k, dict) or (sym and str(k.get("symbol", "")).upper() != sym):
+            continue
+        if k.get("status") == "working":
+            out["working"].append(k)
+        elif k.get("status") == "pending":
+            exp = _parse_time(k.get("expires_at"))
+            if exp is None or exp > now:
+                out["pending"].append(k)
+    return out
+
+
+def _qty(row: Dict[str, Any]) -> str:
+    q = row.get("qty")
+    return f"{q:g}" if isinstance(q, (int, float)) else str(q or "?")
+
+
+def describe_items(items: Dict[str, List[Dict[str, Any]]]) -> List[str]:
+    out = []
+    for t in items["open"]:
+        out.append(f"an open {t.get('side', '?')} paper position in {t.get('symbol')}: {_qty(t)} shares @ "
+                   f"{tc.fmt_price(_num(t.get('entry_price')))} ({t.get('id', '?')})")
+    for t in items["working"]:
+        out.append(f"a working {t.get('side', '?')} order for {_qty(t)} {t.get('symbol')} ({t.get('id', '?')})")
+    for t in items["pending"]:
+        out.append(f"a pending ticket {t.get('id', '?')} for {_qty(t)} {t.get('symbol')} waiting for "
+                   "a yes")
+    return out
+
+
+def sizing_section(sz: Dict[str, Any], budget: Dict[str, Any], warnings: List[str], as_of: str) -> Dict[str, Any]:
+    """What `--save` merges into the plan as `sizing`."""
+    keys = ("shares", "side", "entry", "stop", "target", "risk_per_share", "risk_budget", "risk_pct",
+            "risk_used", "notional", "account", "max_position_pct", "leverage", "capped_by", "rr")
+    sec = {k: sz[k] for k in keys}
+    sec.update(budget_ok=budget["ok"], warnings=list(warnings), as_of=as_of)
+    return sec
+
+
+# ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+def _positive(value: str) -> float:
+    try:
+        v = float(value.replace(",", "").lstrip("$"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from None
+    if not math.isfinite(v) or v <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive number, got {value!r}")
+    return v
+
+
+def _nonneg(value: str) -> float:
+    try:
+        v = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from None
+    if not math.isfinite(v) or v < 0:
+        raise argparse.ArgumentTypeError(f"expected a number >= 0, got {value!r}")
+    return v
+
+
+def _percent(value: str) -> float:
+    return _positive(value.strip().rstrip("%"))
+
+
+def _leverage(value: str) -> int:
+    try:
+        v = float(value.strip().lower().rstrip("x"))
+    except ValueError:
+        v = float("nan")
+    if v not in LEVERAGES:
+        raise argparse.ArgumentTypeError(
+            f"leverage must be 1, 2 or 4 (cash, margin, intraday day-trader margin), got {value!r}")
+    return int(v)
+
+
+def parse_symbol(raw: str) -> str:
+    sym = (raw or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9^][A-Z0-9.\-=^]{0,14}", sym):
+        raise ValueError(f"not a ticker symbol: {raw!r}")
+    return sym
+
+
+def plan_file(sym: str) -> str:
+    return f"plans/{re.sub(r'[^A-Z0-9._-]', '_', sym.strip().upper())}.json"
+
+
+def _exit1_on_usage_error(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    def error(message: str) -> None:  # bad flags are bad input: exit 1, not 2 (= data error)
+        p.print_usage(sys.stderr)
+        p.exit(1, f"{p.prog}: error: {message}\n")
+    p.error = error  # type: ignore[assignment]
+    return p
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = _exit1_on_usage_error(tc.make_parser(
+        "Position sizing and pre-trade risk checks for paper day trades. Not financial advice."))
+    sub = p.add_subparsers(dest="command", metavar="{size,config,show}")
+    sub.required = True
+
+    s = _exit1_on_usage_error(sub.add_parser(
+        "size", help="shares to trade so a stop-out loses at most your risk budget",
+        description="Size a trade from entry and stop (or a saved plan) and run the risk checks."))
+    s.add_argument("symbol_pos", nargs="?", metavar="SYMBOL", help="ticker (same as --symbol)")
+    s.add_argument("--symbol", help="ticker; without prices, its saved plan supplies them")
+    s.add_argument("--entry", type=_positive, help="entry price (default: saved plan, else current price)")
+    s.add_argument("--stop", type=_positive, help="stop price (default: saved plan)")
+    s.add_argument("--target", type=_positive, help="target price, for R:R (default: saved plan)")
+    s.add_argument("--side", type=str.lower, choices=("long", "short"),
+                   help="default: the saved plan's side, else inferred (stop below entry = long)")
+    s.add_argument("--account", type=_positive, help="account size in $ (default: settings)")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--risk-pct", type=_percent, help="risk per trade as %% of the account (default: settings)")
+    g.add_argument("--risk-dollars", type=_positive, help="risk per trade in $")
+    s.add_argument("--max-position-pct", type=_percent, help="max position as %% of the account (default: settings)")
+    s.add_argument("--leverage", type=_leverage, help="buying power multiple: 1 (cash, default), 2 or 4")
+    s.add_argument("--save", action="store_true", help="merge `sizing` into plans/<SYMBOL>.json (needs a symbol)")
+    tc.add_json_flag(s)
+
+    c = _exit1_on_usage_error(sub.add_parser(
+        "config", help="show or change the sizing settings",
+        description="With no flags, show the settings. Flags change and save them."))
+    c.add_argument("--account", type=_positive, help="account size in $")
+    c.add_argument("--risk-pct", type=_percent, help="risk per trade, %% of the account (e.g. 0.2)")
+    c.add_argument("--max-position-pct", type=_percent, help="max position, %% of the account (e.g. 25)")
+    c.add_argument("--min-rr", type=_nonneg, help="warn when reward:risk is below this (0 = off)")
+    tc.add_json_flag(c)
+
+    sh = _exit1_on_usage_error(sub.add_parser(
+        "show", help="settings plus today's open risk and loss budget",
+        description="Settings, today's paper P&L, open risk, positions, working orders and sized plans."))
+    tc.add_json_flag(sh)
+    return p
+
+
+def clean_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Settings with numeric fields coerced (a hand-edited settings.json gives a clear error)."""
+    s = dict(raw)
+    for k in NUMERIC_SETTINGS + INT_SETTINGS:
+        try:
+            v = float(s[k])
+            if not math.isfinite(v):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise tc.StateError(f"settings.json has a bad value for {k}: {s.get(k)!r} - fix it with "
+                                "risk.py config / budget.py set, or delete the file") from None
+        s[k] = int(v) if k in INT_SETTINGS else v
+    return s
+
+
+def safe_budget_check(new_risk: float, settings: Dict[str, Any], ledger: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return tc.budget_check(new_risk, settings=settings, ledger=ledger)
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
+        raise tc.StateError(f"ledger.json has a malformed trade or working order ({e!r}) - fix or "
+                            "remove it") from None
+
+
+def _price_note(price: float, name: str) -> Optional[str]:
+    if price >= 1 and abs(round(price, 2) - price) > 1e-9:
+        return f"{name} {price:g} has sub-penny digits; stocks at $1+ are quoted in cents"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_size(args: argparse.Namespace) -> int:
+    if args.symbol and args.symbol_pos and parse_symbol(args.symbol) != parse_symbol(args.symbol_pos):
+        raise ValueError(f"two different symbols given: {args.symbol_pos} and --symbol {args.symbol}")
+    raw_sym = args.symbol or args.symbol_pos
+    sym = parse_symbol(raw_sym) if raw_sym else None
+    if args.save and not sym:
+        raise ValueError("--save needs --symbol (the sizing is stored in that ticker's plan)")
+    if args.risk_pct is not None and args.risk_pct > MAX_RISK_PCT:
+        raise ValueError("--risk-pct is a percent of the account and cannot exceed 100")
+    if args.max_position_pct is not None and args.max_position_pct > MAX_POSITION_PCT:
+        raise ValueError(f"--max-position-pct cannot exceed {MAX_POSITION_PCT:g} (4x buying power)")
+
+    settings = clean_settings(tc.load_settings())
+    plan = tc.load_plan(sym) if sym else None
+    if plan is not None and not isinstance(plan, dict):
+        raise tc.StateError(f"{plan_file(sym)} is not a plan object - fix or delete it")  # type: ignore[arg-type]
+    if args.stop is None and _num((plan or {}).get("stop")) is None:
+        if sym and plan is None:
+            raise ValueError(f"no saved plan for {sym}: pass --stop (and --entry, or the current price "
+                             "is used)")
+        if sym:
+            raise ValueError(f"the saved plan for {sym} has no usable stop: pass --stop")
+        raise ValueError("pass --entry and --stop (or --symbol SYM to use its saved plan)")
+
+    now = tc.now_et()
+    notes: List[str] = []
+    last_price = None
+    if args.entry is None and _num((plan or {}).get("entry")) is None:
+        if not sym:
+            raise ValueError("pass --entry (or --symbol SYM to use the current price)")
+        q = tc.quote(sym)
+        qt = q.get("time")
+        if isinstance(qt, (int, float)) and os.environ.get("DAYTRADER_NOW") and qt > now.timestamp() + 60:
+            raise ValueError("the live quote is newer than $DAYTRADER_NOW (a replay) - pass --entry")
+        last_price = float(q["price"])
+        when = ""
+        if isinstance(qt, (int, float)):
+            qd = tc.to_et(qt)
+            when = f" at {qd.strftime('%H:%M' if qd.date() == now.date() else '%Y-%m-%d %H:%M')} ET"
+        notes.append(f"entry = last price {tc.fmt_price(last_price)}{when} (Yahoo); a market order "
+                     "fills wherever price is when it executes")
+
+    lv = resolve_levels(plan, args.entry, args.stop, args.target, args.side, last_price)
+    notes = lv["notes"] + notes
+    sz = size_position(lv["side"], lv["entry"], lv["stop"], lv["target"], settings,
+                       account=args.account, risk_pct=args.risk_pct, risk_dollars=args.risk_dollars,
+                       max_position_pct=args.max_position_pct, leverage=args.leverage)
+    ledger = tc.load_ledger()
+    view = budget_ledger(ledger, now.strftime("%Y-%m-%d"))
+    budget = budget_view(safe_budget_check(sz["risk_used"], settings, view),
+                         sz["risk_per_share"], sz["risk_used"], view)
+    items = describe_items(ledger_items(ledger, now, sym)) if sym else []
+    used_plan = "plan" in lv["sources"].values()
+    plan_date = str(plan.get("updated_at") or plan.get("created_at") or "")[:10] if plan and used_plan else None
+    warnings = risk_checks(sz, settings, budget, items, plan_date or None, now.strftime("%Y-%m-%d"))
+
+    if used_plan:
+        notes.insert(0, "levels from the saved plan: " + ", ".join(
+            k for k in ("side", "entry", "stop", "target") if lv["sources"].get(k) == "plan"))
+    if lv["sources"]["side"] == "inferred" and lv["side"] == "short" and not any(n.startswith("side ") for n in notes):
+        notes.append("side SHORT inferred: the stop is above the entry (for a long, the stop must be below "
+                     "the entry)")
+    if sz["target"] is None and not any("saved target" in n for n in notes):
+        notes.append("no target: add --target to check reward:risk")
+    if lv["side"] == "short":
+        notes.append("short selling needs a margin account and shares available to borrow "
+                     "(hard-to-borrow fees may apply)")
+    for name in ("entry", "stop", "target"):
+        n = _price_note(sz[name], name) if sz[name] is not None else None
+        if n:
+            notes.append(n)
+    tm = (plan or {}).get("time_machine")
+    if isinstance(tm, dict) and plan and not levels_changed(plan, lv):
+        try:
+            notes.append(f"time-machine: target first {float(tm['target_first_pct']):.1f}% / stop first "
+                         f"{float(tm['stop_first_pct']):.1f}% - {tm.get('verdict', '')}".rstrip(" -"))
+        except (KeyError, TypeError, ValueError):
+            pass
+    notes.append("risk assumes the stop fills at its price; gaps, halts and slippage can lose more")
+
+    res: Dict[str, Any] = {"symbol": sym}
+    res.update(sz)
+    res.update({
+        "order": f"{sz['action']} {sz['shares']:,} {sym or 'shares'}",
+        "sizing_note": size_explanation(sz),
+        "budget": budget,
+        "warnings": warnings,
+        "notes": notes,
+        "sources": lv["sources"],
+        "plan_found": plan is not None,
+        "saved": False, "plan_file": None, "dropped_sections": [], "save_error": None,
+        "as_of": now.isoformat(timespec="seconds"),
+        "disclaimer": tc.DISCLAIMER,
+    })
+    code = 0
+    if args.save:
+        if sz["shares"] == 0:
+            res["save_error"] = "not saved: the size is 0 shares"
+            code = 1
+        else:
+            dropped = save_sizing(sym, lv, sizing_section(sz, budget, warnings, res["as_of"]), plan)
+            res.update(saved=True, plan_file=str(tc.home() / plan_file(sym)), dropped_sections=dropped)
+    tc.emit(res, args.json, render_size)
+    return code
+
+
+def save_sizing(sym: str, lv: Dict[str, Any], section: Dict[str, Any],
+                plan: Optional[Dict[str, Any]]) -> List[str]:
+    """Merge `sizing` (and the levels) into the plan; drop sections computed for old levels."""
+    payload: Dict[str, Any] = {"symbol": sym, "side": lv["side"], "entry": lv["entry"],
+                               "stop": lv["stop"], "sizing": section}
+    if lv["target"] is not None:
+        payload["target"] = lv["target"]
+    dropped: List[str] = []
+    if plan and levels_changed(plan, lv):
+        # Only sections with content: the entry skill resets them to null when its levels change.
+        dropped = [k for k in DEPENDENT_SECTIONS if plan.get(k)]
+        if lv["target"] is None and plan.get("target") is not None:
+            dropped.append("target")
+    merged = tc.save_plan(payload)
+    if dropped:
+        for k in dropped:
+            merged.pop(k, None)
+        tc.save_json(plan_file(sym), merged)
+    return dropped
+
+
+def settings_view(s: Dict[str, Any]) -> Dict[str, Any]:
+    return {"settings": {k: s[k] for k in NUMERIC_SETTINGS + INT_SETTINGS},
+            "risk_per_trade_dollars": round(s["account_size"] * s["risk_per_trade_pct"] / 100.0, 2),
+            "max_position_dollars": round(s["account_size"] * s["max_position_pct"] / 100.0, 2),
+            "warnings": settings_warnings(s)}
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    updates: Dict[str, Any] = {}
+    if args.account is not None:
+        updates["account_size"] = args.account
+    if args.risk_pct is not None:
+        if args.risk_pct > MAX_RISK_PCT:
+            raise ValueError("--risk-pct is a percent of the account and cannot exceed 100")
+        updates["risk_per_trade_pct"] = args.risk_pct
+    if args.max_position_pct is not None:
+        if args.max_position_pct > MAX_POSITION_PCT:
+            raise ValueError(f"--max-position-pct cannot exceed {MAX_POSITION_PCT:g} (4x buying power)")
+        updates["max_position_pct"] = args.max_position_pct
+    if args.min_rr is not None:
+        updates["min_reward_risk"] = args.min_rr
+    s = clean_settings(tc.save_settings(updates) if updates else tc.load_settings())
+    res = settings_view(s)
+    res["changed"] = sorted(updates)
+    res["settings_file"] = str(tc.home() / "settings.json")
+    tc.emit(res, args.json, render_config)
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    s = clean_settings(tc.load_settings())
+    ledger = tc.load_ledger()
+    now = tc.now_et()
+    view = settings_view(s)
+    full_risk = view["risk_per_trade_dollars"]
+    budget_led = budget_ledger(ledger, now.strftime("%Y-%m-%d"))
+    bc = safe_budget_check(0.0, s, budget_led)
+    nxt = safe_budget_check(full_risk, s, budget_led) if full_risk > 0 else bc
+    today = budget_view(bc, 0.0, 0.0, budget_led)
+    for k in ("max_shares_now", "loss_budget_left_after"):   # per-trade numbers; meaningless here
+        today.pop(k, None)
+    items = ledger_items(ledger, now)
+    positions = []
+    for t in items["open"]:
+        try:
+            risk = round(tc.trade_initial_risk(t), 2)
+        except (KeyError, TypeError, ValueError):
+            risk = None
+        positions.append({"id": t.get("id"), "symbol": t.get("symbol"), "side": t.get("side"),
+                          "qty": t.get("qty"), "entry_price": _num(t.get("entry_price")),
+                          "stop": _num(t.get("stop")), "target": _num(t.get("target")),
+                          "risk": risk, "opened_at": t.get("opened_at")})
+    orders = [{"id": t.get("id"), "symbol": t.get("symbol"), "side": t.get("side"), "qty": t.get("qty"),
+               "entry": _num(t.get("entry") or t.get("entry_price")), "stop": _num(t.get("stop")),
+               "status": t.get("status")} for t in items["working"] + items["pending"]]
+    sized = []
+    for p in tc.list_plans():
+        sec = p.get("sizing") if isinstance(p, dict) else None
+        if not isinstance(sec, dict):
+            continue
+        fresh = (p.get("side") == sec.get("side") and _same(_num(p.get("entry")), _num(sec.get("entry")))
+                 and _same(_num(p.get("stop")), _num(sec.get("stop"))))
+        sized.append({"symbol": p.get("symbol"), "side": sec.get("side"), "shares": sec.get("shares"),
+                      "entry": _num(sec.get("entry")), "stop": _num(sec.get("stop")),
+                      "risk_used": sec.get("risk_used"), "as_of": sec.get("as_of"), "current": fresh})
+    res = dict(view)
+    res.update({
+        "today": today,
+        "next_trade": {"risk": full_risk, "ok": nxt["ok"], "reasons": nxt["reasons"]},
+        "open_positions": positions,
+        "orders": orders,
+        "sized_plans": sized,
+        "as_of": now.isoformat(timespec="seconds"),
+        "disclaimer": tc.DISCLAIMER,
+    })
+    tc.emit(res, args.json, render_show)
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.command == "size":
+        return cmd_size(args)
+    if args.command == "config":
+        return cmd_config(args)
+    return cmd_show(args)
+
+
+# ---------------------------------------------------------------------------
+# Text output
+# ---------------------------------------------------------------------------
+
+def _pct(x: float) -> str:
+    """Percent with enough digits to be honest for small numbers (0.19%, 11.7%)."""
+    return f"{x:.2f}%" if abs(x) < 10 else f"{x:.1f}%"
+
+
+def size_explanation(sz: Dict[str, Any]) -> str:
+    lim = sz["limits"]
+    budget = tc.fmt_money(sz["risk_budget"])
+    if sz["risk_pct"] is not None:
+        budget += f" ({sz['risk_pct']:g}% of the account)"
+    if sz["capped_by"] == "risk":
+        return (f"risk budget {budget} / {tc.fmt_money(sz['risk_per_share'])} per share = {lim['risk']:,} "
+                f"shares (max position allows {lim['max_position_pct']:,})")
+    if sz["capped_by"] == "max_position_pct":
+        return (f"max position {sz['max_position_pct']:g}% of the account = {tc.fmt_money(sz['max_notional'])}"
+                f" -> {lim['max_position_pct']:,} shares (the risk budget alone allows {lim['risk']:,})")
+    return (f"buying power {tc.fmt_money(sz['buying_power'])} at {sz['leverage']}x -> {lim['buying_power']:,} "
+            f"shares (the risk budget alone allows {lim['risk']:,})")
+
+
+def _num_text(x: float) -> str:
+    """1 -> '1.0', 1.25 -> '1.25' (settings read better with one decimal)."""
+    return f"{x:.1f}" if abs(x * 10 - round(x * 10)) < 1e-9 else f"{x:g}"
+
+
+def _when(stamp: Any, today: str) -> str:
+    """'10:15' for today, '10-29 10:15' for another day, '-' if unparseable."""
+    d = _parse_time(stamp)
+    if d is None:
+        return "-"
+    return d.strftime("%H:%M") if d.strftime("%Y-%m-%d") == today else d.strftime("%m-%d %H:%M")
+
+
+def _row(label: str, value: str) -> str:
+    return f"  {label:<14}{value}"
+
+
+def render_size(r: Dict[str, Any]) -> str:
+    head = " · ".join(x for x in ("POSITION SIZE", r["symbol"], r["side"].upper()) if x)
+    card = f"{r['order']} @ {tc.fmt_price(r['entry'])} · STOP {tc.fmt_price(r['stop'])}"
+    if r["target"] is not None:
+        card += f" · TARGET {tc.fmt_price(r['target'])}"
+    card += " · PAPER"
+    if not r["shares"]:
+        card = (f"0 SHARES - no trade at entry {tc.fmt_price(r['entry'])} / stop {tc.fmt_price(r['stop'])} "
+                "with this risk (see the first ! line)")
+    lines = [head, card]
+    lines.append(_row("risk/share", f"{tc.fmt_money(r['risk_per_share'])} ({_pct(r['stop_pct'])} of price)"))
+    lines.append(_row("$ at risk", f"{tc.fmt_money(r['risk_used'])} of a {tc.fmt_money(r['risk_budget'])} "
+                                   f"budget ({_pct(r['risk_used_pct'])} of the account)"))
+    lines.append(_row("notional", f"{tc.fmt_money(r['notional'])} ({_pct(r['position_pct'])} of a "
+                                  f"{tc.fmt_money(r['account'])} account)"))
+    if r["rr"] is not None:
+        lines.append(_row("R:R", f"{r['rr']:.2f} · reward at target {tc.fmt_money(r['reward_at_target'])} · "
+                                 f"break-even win rate {r['breakeven_win_rate_pct']:.1f}%"))
+    lines.append(_row("size set by", r["sizing_note"]))
+    b = r["budget"]
+    status = "OK" if b["ok"] else "BLOCKED - the broker will refuse this ticket"
+    budget = (f"{status} · loss budget left {tc.fmt_money(b['loss_budget_left'])} -> "
+              f"{tc.fmt_money(b['loss_budget_left_after'])} after this trade")
+    if not b["ok"]:
+        budget = (f"{status} · loss budget left {tc.fmt_money(b['loss_budget_left'])} · room for new "
+                  f"risk {tc.fmt_money(b['max_risk_now'])}")
+    lines.append(_row("daily budget", budget))
+    lines += [f"! {w}" for w in r["warnings"]]
+    lines += [f"- {n}" for n in r["notes"]]
+    if r["saved"]:
+        msg = f"Saved sizing to {r['plan_file']}."
+        if r["dropped_sections"]:
+            msg += (f" Cleared {', '.join(r['dropped_sections'])}: computed for the old levels - re-run "
+                    "exit / time-machine.")
+        lines.append(msg)
+    elif r["save_error"]:
+        lines.append(f"Not saved: {r['save_error'].replace('not saved: ', '')}.")
+    elif r["symbol"]:
+        lines.append("Not saved - add --save to store this sizing in the trade plan.")
+    if r["shares"] and b["ok"]:
+        lines.append(f"Next: budget skill check (--risk {r['risk_used']:.2f}), then a paper broker ticket for "
+                     f"{r['shares']:,} shares - it waits for your yes.")
+    elif r["shares"]:
+        fit = b["max_shares_now"]
+        lines.append("Next: no ticket for this size while the daily budget blocks it"
+                     + (f" (at most {fit:,} shares fit what is left)" if 0 < fit < r["shares"] else "") + ".")
+    lines.append(r["disclaimer"])
+    return "\n".join(lines)
+
+
+def _settings_lines(v: Dict[str, Any]) -> List[str]:
+    s = v["settings"]
+    return [
+        _row("account", tc.fmt_money(s["account_size"])),
+        _row("risk/trade", f"{s['risk_per_trade_pct']:g}% = {tc.fmt_money(v['risk_per_trade_dollars'])}"),
+        _row("max position", f"{s['max_position_pct']:g}% of the account = "
+                             f"{tc.fmt_money(v['max_position_dollars'])}"),
+        _row("min R:R", f"{_num_text(s['min_reward_risk'])}" + (" (off)" if s["min_reward_risk"] == 0 else "")),
+        _row("daily limits", f"max loss {tc.fmt_money(s['daily_max_loss'])} · max open risk "
+                             f"{tc.fmt_money(s['max_open_risk'])} · {s['max_trades_per_day']} trades · "
+                             f"stop after {s['max_consecutive_losses']} losses in a row"),
+    ]
+
+
+def render_config(r: Dict[str, Any]) -> str:
+    lines = ["RISK SETTINGS"]
+    lines += _settings_lines(r)
+    lines += [f"! {w}" for w in r["warnings"]]
+    if r["changed"]:
+        lines.append(f"Saved {', '.join(r['changed'])} to {r['settings_file']}.")
+    else:
+        lines.append("Change with: risk.py config --account N --risk-pct X --max-position-pct X --min-rr X "
+                     "(daily limits: budget skill).")
+    return "\n".join(lines)
+
+
+def render_show(r: Dict[str, Any]) -> str:
+    t = r["today"]
+    lines = ["RISK SETTINGS"]
+    lines += _settings_lines(r)
+    lines.append(f"TODAY {t['date']} (paper ledger)")
+    lines.append(_row("realized P&L", f"{tc.fmt_money(t['realized_pnl'], signed=True)} · "
+                                      f"loss streak {t['loss_streak']}"))
+    open_line = (f"{tc.fmt_money(t['open_risk'])} across {t['open_positions']} open "
+                 f"position{'s' if t['open_positions'] != 1 else ''}")
+    if t["working_orders"]:
+        open_line += (f" + {t['working_orders']} working order{'s' if t['working_orders'] != 1 else ''} "
+                      f"({tc.fmt_money(t['working_order_risk'])})")
+    lines.append(_row("open risk", f"{open_line} (max {tc.fmt_money(t['limits']['max_open_risk'])})"))
+    lines.append(_row("loss budget", f"{tc.fmt_money(t['loss_budget_used'])} used of "
+                                     f"{tc.fmt_money(t['limits']['daily_max_loss'])} -> "
+                                     f"{tc.fmt_money(t['loss_budget_left'])} left"))
+    lines.append(_row("trades today", f"{t['trades_today']} of {t['limits']['max_trades_per_day']}"))
+    lines.append(_row("room for risk", tc.fmt_money(t["max_risk_now"])))
+    nx = r["next_trade"]
+    lines.append(_row("next trade", f"a full-size {tc.fmt_money(nx['risk'])} risk trade is "
+                                    + ("OK" if nx["ok"] else "BLOCKED")))
+    lines += [f"  ! {x}" for x in nx["reasons"]]
+    if r["open_positions"]:
+        lines.append("OPEN POSITIONS")
+        rows = [[p["id"] or "?", p["symbol"] or "?", p["side"] or "?", p["qty"], tc.fmt_price(p["entry_price"]),
+                 tc.fmt_price(p["stop"]), tc.fmt_money(p["risk"]), _when(p["opened_at"], t["date"])]
+                for p in r["open_positions"]]
+        lines.append(tc.table(rows, ["id", "symbol", "side", "qty", "entry", "stop", "risk", "opened"]))
+    if r["orders"]:
+        lines.append("WORKING / PENDING (today's working orders count as open risk and a trade; "
+                     "pending tickets do not until confirmed)")
+        rows = [[o["id"] or "?", o["symbol"] or "?", o["side"] or "?", o["qty"], tc.fmt_price(o["entry"]),
+                 tc.fmt_price(o["stop"]), o["status"]] for o in r["orders"]]
+        lines.append(tc.table(rows, ["id", "symbol", "side", "qty", "entry", "stop", "status"]))
+    if r["sized_plans"]:
+        lines.append("SIZED PLANS")
+        rows = [[p["symbol"] or "?", p["side"] or "?", p["shares"], tc.fmt_price(p["entry"]), tc.fmt_price(p["stop"]),
+                 tc.fmt_money(p["risk_used"]) if isinstance(p["risk_used"], (int, float)) else "-",
+                 str(p["as_of"] or "-")[:16].replace("T", " "),
+                 "current" if p["current"] else "levels changed - re-size"] for p in r["sized_plans"]]
+        lines.append(tc.table(rows, ["symbol", "side", "shares", "entry", "stop", "risk", "sized", "status"]))
+    lines += [f"! {w}" for w in r["warnings"]]
+    lines.append(r["disclaimer"])
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    tc.run(main)

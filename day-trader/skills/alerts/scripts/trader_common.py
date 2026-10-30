@@ -22,6 +22,7 @@ import copy
 import csv
 import gzip
 import hashlib
+import http.client
 import io
 import json
 import math
@@ -34,6 +35,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -114,9 +116,17 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 }
 
 
+def _load_object(name: str) -> Optional[Dict[str, Any]]:
+    """load_json for files that must hold a JSON object (None if the file is absent)."""
+    data = load_json(name, None)
+    if data is not None and not isinstance(data, dict):
+        raise StateError(f"{state_path(name)} should contain a JSON object; fix or delete it")
+    return data
+
+
 def load_settings() -> Dict[str, Any]:
     s = dict(DEFAULT_SETTINGS)
-    stored = load_json("settings.json", {}) or {}
+    stored = _load_object("settings.json") or {}
     s.update({k: v for k, v in stored.items() if k in DEFAULT_SETTINGS})
     return s
 
@@ -125,17 +135,19 @@ def save_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
     unknown = sorted(set(updates) - set(DEFAULT_SETTINGS))
     if unknown:
         raise ValueError(f"unknown setting(s): {', '.join(unknown)}")
-    stored = load_json("settings.json", {}) or {}
+    stored = _load_object("settings.json") or {}
     for k, v in updates.items():
         default = DEFAULT_SETTINGS[k]
         if isinstance(default, bool):
             v = v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes", "on")
         elif isinstance(default, int):
             v = int(v)
-        elif isinstance(default, float):
-            v = float(v)
             if v < 0:
                 raise ValueError(f"{k} must be >= 0")
+        elif isinstance(default, float):
+            v = float(v)
+            if not math.isfinite(v) or v < 0:
+                raise ValueError(f"{k} must be a number >= 0")
         stored[k] = v
     save_json("settings.json", stored)
     return load_settings()
@@ -164,6 +176,24 @@ def fixture_name(url: str) -> str:
     """File name used for `url` in $DAYTRADER_FIXTURES (offline tests and demos)."""
     slug = re.sub(r"[^A-Za-z0-9]+", "_", url.split("://", 1)[-1]).strip("_")[:120]
     return f"{slug}__{hashlib.sha1(url.encode('utf-8')).hexdigest()[:10]}"
+
+
+def _host_hint(url: str, status: int) -> str:
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if status == 403 and (host == "sec.gov" or host.endswith(".sec.gov")) and not (
+            os.environ.get("DAYTRADER_CONTACT") or load_settings().get("contact_email")):
+        return (" - SEC asks for a contact email in the User-Agent: set DAYTRADER_CONTACT=you@example.com"
+                " (or the contact_email setting); in a sandbox the host may also need to be allow-listed")
+    if status in (403, 407):
+        return f" - access denied; if you are in a sandbox, {host} may need to be allow-listed"
+    if status == 404:
+        return " - not found"
+    if status == 429:
+        return " - rate limited; wait a minute and retry with fewer requests"
+    return ""
+
+
+_PROXY_DENIED = re.compile(r"Tunnel connection failed:\s*40[37]", re.IGNORECASE)
 
 
 def http_get(url: str, *, headers: Optional[Dict[str, str]] = None, timeout: float = 20.0,
@@ -195,19 +225,16 @@ def http_get(url: str, *, headers: Optional[Dict[str, str]] = None, timeout: flo
             if e.code in (429, 500, 502, 503, 504) and attempt < retries:
                 time.sleep(min(2 ** attempt, 8) + random.random() * 0.3)
                 continue
-            hint = ""
-            if e.code == 403:
-                hint = " - access denied; if you are in a sandbox, this host may need to be allow-listed"
-            elif e.code == 404:
-                hint = " - not found"
-            elif e.code == 429:
-                hint = " - rate limited; wait a minute and retry with fewer requests"
-            raise FetchError(f"HTTP {e.code} for {url}{hint}") from e
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            raise FetchError(f"HTTP {e.code} for {url}{_host_hint(url, e.code)}") from e
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError,
+                http.client.HTTPException, EOFError, zlib.error) as e:
+            reason = getattr(e, "reason", e)
+            if _PROXY_DENIED.search(str(reason)):
+                # A proxy refusing the tunnel is a policy decision, not a blip: don't retry.
+                raise FetchError(f"blocked by proxy for {url} ({reason}){_host_hint(url, 403)}") from e
             if attempt < retries:
                 time.sleep(min(2 ** attempt, 8) + random.random() * 0.3)
                 continue
-            reason = getattr(e, "reason", e)
             raise FetchError(f"network error for {url}: {reason}") from e
     raise FetchError(f"giving up on {url}")  # pragma: no cover - loop always returns or raises
 
@@ -224,10 +251,25 @@ def cached_get(url: str, ttl: float = 0, **kw: Any) -> bytes:
         pass
     data = http_get(url, **kw)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, p)
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, p)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
     return data
+
+
+def forget_cached(url: str) -> None:
+    """Drop the cached copy of `url` (e.g. after it turned out to be an error page)."""
+    try:
+        (home() / "cache" / fixture_name(url)).unlink()
+    except FileNotFoundError:
+        pass
 
 
 def get_json(url: str, ttl: float = 0, **kw: Any) -> Any:
@@ -375,17 +417,22 @@ def yahoo_symbol(symbol: str) -> str:
 
 def parse_yahoo_chart(payload: Dict[str, Any]) -> Tuple[List[Bar], Dict[str, Any]]:
     """Turn a v8/finance/chart JSON payload into (bars, meta). Rows with gaps are dropped."""
-    chart = (payload or {}).get("chart") or {}
+    chart = payload.get("chart") if isinstance(payload, dict) else None
+    if not isinstance(chart, dict):
+        raise FetchError("unexpected Yahoo chart response")
     err = chart.get("error")
     if err:
-        raise FetchError(f"Yahoo: {err.get('code')}: {err.get('description')}")
+        if isinstance(err, dict):
+            raise FetchError(f"Yahoo: {err.get('code')}: {err.get('description')}")
+        raise FetchError(f"Yahoo: {err}")
     results = chart.get("result") or []
-    if not results:
+    if not isinstance(results, list) or not results or not isinstance(results[0], dict):
         raise FetchError("Yahoo returned no chart data")
-    r = results[0] or {}
-    meta = r.get("meta") or {}
+    r = results[0]
+    meta = r.get("meta") if isinstance(r.get("meta"), dict) else {}
     stamps = r.get("timestamp") or []
-    quote = (((r.get("indicators") or {}).get("quote")) or [{}])[0] or {}
+    quotes = (r.get("indicators") or {}).get("quote") if isinstance(r.get("indicators"), dict) else None
+    quote = quotes[0] if isinstance(quotes, list) and quotes and isinstance(quotes[0], dict) else {}
     cols = [quote.get(k) or [] for k in ("open", "high", "low", "close", "volume")]
     bars: List[Bar] = []
     for i, t in enumerate(stamps):
@@ -395,8 +442,11 @@ def parse_yahoo_chart(payload: Dict[str, Any]) -> Tuple[List[Bar], Dict[str, Any
             continue
         if o is None or h is None or l is None or c is None:
             continue
-        v = cols[4][i] if i < len(cols[4]) and cols[4][i] is not None else 0
-        o, h, l, c = float(o), float(h), float(l), float(c)
+        v = cols[4][i] if i < len(cols[4]) and isinstance(cols[4][i], (int, float)) else 0
+        try:
+            o, h, l, c = float(o), float(h), float(l), float(c)
+        except (TypeError, ValueError):
+            continue
         if not all(math.isfinite(x) and x > 0 for x in (o, h, l, c)):
             continue
         bars.append(Bar(int(t), o, max(h, o, c), min(l, o, c), c, float(v)))
@@ -411,16 +461,16 @@ def fetch_bars(symbol: str, interval: str = "5m", range_: str = "60d", prepost: 
         ttl = 30 if interval.endswith("m") else 900
     params = urllib.parse.urlencode(
         {"interval": interval, "range": range_, "includePrePost": "true" if prepost else "false"})
-    last: Optional[FetchError] = None
+    errors: List[str] = []
     for host in YAHOO_HOSTS:
         url = f"https://{host}/v8/finance/chart/{urllib.parse.quote(yahoo_symbol(symbol))}?{params}"
         try:
             return parse_yahoo_chart(get_json(url, ttl))
         except FetchError as e:
-            last = e
+            errors.append(str(e))
             if "HTTP 404" in str(e) or str(e).startswith("Yahoo:"):
                 break  # unknown symbol - the other host will say the same
-    raise FetchError(f"{symbol}: {last}")
+    raise FetchError(f"{symbol}: " + " | ".join(errors))
 
 
 def quote(symbol: str) -> Dict[str, Any]:
@@ -620,8 +670,16 @@ EIGHT_K_ITEMS = {
 def sec_ticker_map(ttl: float = 86400) -> Dict[str, Dict[str, str]]:
     data = get_json(SEC_TICKERS_URL, ttl)
     rows = data.values() if isinstance(data, dict) else data
-    return {str(v["ticker"]).upper(): {"cik": f"{int(v['cik_str']):010d}", "title": v.get("title", "")}
-            for v in rows}
+    out: Dict[str, Dict[str, str]] = {}
+    try:
+        for v in rows:
+            if isinstance(v, dict) and v.get("ticker") and v.get("cik_str") is not None:
+                out[str(v["ticker"]).upper()] = {"cik": f"{int(v['cik_str']):010d}", "title": v.get("title", "")}
+    except (TypeError, ValueError) as e:
+        raise FetchError(f"unexpected SEC ticker list format: {e}") from e
+    if not out:
+        raise FetchError("SEC ticker list was empty or in an unexpected format")
+    return out
 
 
 def sec_cik(ticker: str) -> Optional[str]:
@@ -639,17 +697,21 @@ def sec_submissions(cik: str, ttl: float = 900) -> Dict[str, Any]:
 
 
 def sec_recent_filings(ticker: str, forms: Optional[Iterable[str]] = None, limit: int = 20,
-                       since: Optional[str] = None) -> List[Dict[str, Any]]:
+                       since: Optional[str] = None, ttl: float = 900) -> List[Dict[str, Any]]:
     """Newest-first filings for a ticker. `forms` e.g. {'8-K', '4'}; `since` 'YYYY-MM-DD'."""
     cik = sec_cik(ticker)
     if not cik:
         raise FetchError(f"{ticker} is not in SEC's ticker list")
-    recent = ((sec_submissions(cik).get("filings") or {}).get("recent")) or {}
+    subs = sec_submissions(cik, ttl)
+    filings = subs.get("filings") if isinstance(subs, dict) else None
+    recent = filings.get("recent") if isinstance(filings, dict) else None
+    if not isinstance(recent, dict):
+        raise FetchError(f"unexpected SEC submissions format for {ticker}")
     wanted = set(forms) if forms else None
 
     def col(name: str, i: int) -> Any:
-        values = recent.get(name) or []
-        return values[i] if i < len(values) else None
+        values = recent.get(name)
+        return values[i] if isinstance(values, list) and i < len(values) else None
 
     out: List[Dict[str, Any]] = []
     for i in range(len(recent.get("accessionNumber") or [])):
@@ -660,13 +722,15 @@ def sec_recent_filings(ticker: str, forms: Optional[Iterable[str]] = None, limit
         if since and filed < since:
             continue
         acc = col("accessionNumber", i)
+        if not isinstance(acc, str):
+            continue
         doc = col("primaryDocument", i) or ""
         out.append({
             "form": form,
             "filed": filed,
             "accepted": col("acceptanceDateTime", i),
             "accession": acc,
-            "items": [x.strip() for x in (col("items", i) or "").split(",") if x.strip()],
+            "items": [x.strip() for x in str(col("items", i) or "").split(",") if x.strip()],
             "description": col("primaryDocDescription", i),
             "url": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-', '')}/{doc}",
         })
@@ -725,6 +789,12 @@ def save_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     merged = load_plan(plan["symbol"]) or {}
     merged.update(plan)
     merged["symbol"] = plan["symbol"].upper()
+    target = merged.get("target")
+    errs = validate_levels(merged["side"], float(merged["entry"]), float(merged["stop"]),
+                           None if target is None else float(target))
+    if errs:
+        raise ValueError("saved plan would be inconsistent: " + "; ".join(errs)
+                         + " (pass a new target, or set it to null)")
     merged.setdefault("created_at", iso_now())
     merged["updated_at"] = iso_now()
     save_json(f"plans/{_safe_symbol(plan['symbol'])}.json", merged)
@@ -732,7 +802,7 @@ def save_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def load_plan(symbol: str) -> Optional[Dict[str, Any]]:
-    return load_json(f"plans/{_safe_symbol(symbol)}.json", None)
+    return _load_object(f"plans/{_safe_symbol(symbol)}.json")
 
 
 def list_plans() -> List[Dict[str, Any]]:
@@ -753,7 +823,8 @@ def list_plans() -> List[Dict[str, Any]]:
 #
 # ledger.json = {"tickets": [ticket...], "trades": [trade...]}
 # ticket: id, symbol, side, qty, entry, stop, target, setup, status
-#         (pending|confirmed|cancelled|expired), created_at, expires_at, trade_id
+#         (pending|working|confirmed|cancelled|expired), created_at, expires_at, trade_id
+#         ("working" = confirmed limit order not filled yet; the broker skill owns ticket logic)
 # trade:  id, ticket_id, symbol, side, qty, entry_price, stop, target, setup,
 #         opened_at, status (open|closed), exit_price, closed_at, exit_reason, pnl, r_multiple
 # ---------------------------------------------------------------------------
@@ -762,9 +833,11 @@ LEDGER_FILE = "ledger.json"
 
 
 def load_ledger() -> Dict[str, Any]:
-    led = load_json(LEDGER_FILE, {"tickets": [], "trades": []}) or {}
+    led = _load_object(LEDGER_FILE) or {}
     led.setdefault("tickets", [])
     led.setdefault("trades", [])
+    if not isinstance(led["tickets"], list) or not isinstance(led["trades"], list):
+        raise StateError(f"{state_path(LEDGER_FILE)}: 'tickets' and 'trades' must be lists")
     return led
 
 
@@ -780,7 +853,13 @@ def new_id(prefix: str, existing: Iterable[str]) -> str:
 
 
 def trade_initial_risk(trade: Dict[str, Any]) -> float:
-    return abs(float(trade["entry_price"]) - float(trade["stop"])) * float(trade["qty"])
+    """Dollars lost if the stop is hit (0 once the stop has moved past the entry)."""
+    try:
+        e, st, q = float(trade["entry_price"]), float(trade["stop"]), float(trade["qty"])
+    except (KeyError, TypeError, ValueError) as err:
+        raise StateError(f"ledger trade {trade.get('id', '?')} is missing entry_price/stop/qty") from err
+    per_share = (e - st) if trade.get("side", "long") == "long" else (st - e)
+    return max(0.0, per_share) * q
 
 
 def trade_pnl(trade: Dict[str, Any], price: float) -> float:
@@ -788,8 +867,19 @@ def trade_pnl(trade: Dict[str, Any], price: float) -> float:
     return (price - e) * q if trade["side"] == "long" else (e - price) * q
 
 
+def _et_day(stamp: Optional[str]) -> Optional[str]:
+    """ET calendar date of an ISO stamp (handles 'Z' and other offsets)."""
+    if not stamp:
+        return None
+    text = str(stamp).strip()
+    try:
+        return parse_et(text[:-1] + "+00:00" if text.endswith("Z") else text).strftime("%Y-%m-%d")
+    except ValueError:
+        return text[:10]
+
+
 def _on_day(stamp: Optional[str], day: str) -> bool:
-    return bool(stamp) and str(stamp)[:10] == day
+    return _et_day(stamp) == day
 
 
 def day_summary(ledger: Optional[Dict[str, Any]] = None, day: Optional[str] = None) -> Dict[str, Any]:
@@ -862,15 +952,21 @@ def position_size(entry: float, stop: float, account: Optional[float] = None,
     """Shares so that hitting the stop loses at most the risk budget, capped by max position size."""
     s = settings or load_settings()
     account = float(account if account is not None else s["account_size"])
+    if not math.isfinite(account) or account <= 0:
+        raise ValueError("account size must be positive")
     if risk_dollars is None:
         risk_dollars = account * float(risk_pct if risk_pct is not None else s["risk_per_trade_pct"]) / 100.0
+    if not math.isfinite(float(risk_dollars)) or risk_dollars <= 0:
+        raise ValueError("risk per trade must be positive")
+    if not (math.isfinite(float(entry)) and math.isfinite(float(stop))) or entry <= 0 or stop <= 0:
+        raise ValueError("entry and stop must be positive prices")
     per_share = abs(float(entry) - float(stop))
     if per_share <= 0:
         raise ValueError("entry and stop must differ")
-    if entry <= 0:
-        raise ValueError("entry must be positive")
     shares = int(math.floor(risk_dollars / per_share + 1e-9))
     cap_pct = float(max_position_pct if max_position_pct is not None else s["max_position_pct"])
+    if not math.isfinite(cap_pct) or cap_pct <= 0:
+        raise ValueError("max position % must be positive")
     max_notional = account * cap_pct / 100.0
     capped_by = "risk"
     if shares * entry > max_notional + 1e-9:
@@ -892,8 +988,17 @@ def position_size(entry: float, stop: float, account: Optional[float] = None,
 # CLI and output helpers
 # ---------------------------------------------------------------------------
 
+class ArgumentParser(argparse.ArgumentParser):
+    """argparse with usage errors on exit code 1 (exit 2 means "data source down" in this pack)."""
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
 def make_parser(description: str) -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=description)
+    p = ArgumentParser(description=description)
     p.add_argument("--json", action="store_true", help="print machine-readable JSON")
     return p
 
@@ -918,7 +1023,10 @@ def run(main: Callable[[], Optional[int]]) -> None:
     except FetchError as e:
         print(f"data error: {e}", file=sys.stderr)
         sys.exit(2)
-    except (ValueError, StateError) as e:
+    except (ValueError, StateError, OverflowError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:  # e.g. an unusable $DAYTRADER_HOME
         print(f"error: {e}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:

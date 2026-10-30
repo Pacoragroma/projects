@@ -54,6 +54,9 @@ def temp_home(now: Optional[str] = None) -> Iterator[Path]:
         with mock.patch.dict(os.environ, env):
             if not now:
                 os.environ.pop("DAYTRADER_NOW", None)
+            # A developer's own demo/SEC settings must not leak into tests (patch.dict restores them).
+            for var in ("DAYTRADER_FIXTURES", "DAYTRADER_CONTACT"):
+                os.environ.pop(var, None)
             yield Path(d)
 
 

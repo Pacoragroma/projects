@@ -1,0 +1,38 @@
+name: day-trader
+
+on:
+  push:
+    paths:
+      - "day-trader/**"
+      - ".github/workflows/day-trader.yml"
+  pull_request:
+    paths:
+      - "day-trader/**"
+      - ".github/workflows/day-trader.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    defaults:
+      run:
+        working-directory: day-trader
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Vendored trader_common.py copies match shared/
+        run: python tools/sync_common.py --check
+      - name: Unit tests (offline, standard library only)
+        run: python -m unittest discover -s tests
+      - name: SKILL.md frontmatter
+        run: python tools/package_skills.py --check

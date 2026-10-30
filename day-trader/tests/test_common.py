@@ -1,10 +1,13 @@
 import json
 import os
+import sys
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-from helpers import (ROOT, SKILLS, TempHomeTestCase, bars_from_closes, daily_bars, et_ts,
+# Lets `python3 -m unittest tests.test_common` run on its own (discover adds tests/ itself).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from helpers import (ROOT, SKILLS, TempHomeTestCase, bars_from_closes, daily_bars, et_ts,  # noqa: E402
                      fake_http, random_walk_history, tc, write_fixture, yahoo_chart_url,
                      yahoo_payload)
 
@@ -265,6 +268,104 @@ class HttpTests(TempHomeTestCase):
         with fake_http({"example.com": "<html>blocked</html>"}):
             with self.assertRaises(tc.FetchError):
                 tc.get_json("https://example.com/y")
+
+
+class SharedLibHardeningTests(TempHomeTestCase):
+    NOW = "2026-10-30T11:00"
+
+    def test_proxy_refusal_fails_fast_with_hint(self):
+        import urllib.error
+        calls = []
+
+        def refuse(req, timeout=None):
+            calls.append(req.full_url)
+            raise urllib.error.URLError(OSError("Tunnel connection failed: 403 Forbidden"))
+        with mock.patch("urllib.request.urlopen", side_effect=refuse), mock.patch("time.sleep") as slept:
+            with self.assertRaises(tc.FetchError) as cm:
+                tc.http_get("https://query1.finance.yahoo.com/v8/finance/chart/TSLA")
+        self.assertEqual(len(calls), 1)
+        slept.assert_not_called()
+        self.assertIn("query1.finance.yahoo.com may need to be allow-listed", str(cm.exception))
+
+    def test_truncated_body_is_fetch_error(self):
+        import http.client
+        with mock.patch("urllib.request.urlopen", side_effect=http.client.IncompleteRead(b"x")), \
+                mock.patch("time.sleep"):
+            with self.assertRaises(tc.FetchError):
+                tc.http_get("https://example.com/z", retries=1)
+
+    def test_fetch_bars_reports_both_hosts(self):
+        with fake_http({"finance.yahoo.com": tc.FetchError("network error for host")}):
+            with self.assertRaises(tc.FetchError) as cm:
+                tc.fetch_bars("TSLA")
+        self.assertEqual(str(cm.exception).count("network error"), 2)
+
+    def test_non_object_state_files_are_state_errors(self):
+        for name, loader in (("ledger.json", tc.load_ledger), ("settings.json", tc.load_settings)):
+            (self.home / name).write_text("[1, 2]")
+            with self.assertRaises(tc.StateError):
+                loader()
+            (self.home / name).unlink()
+        (self.home / "plans").mkdir()
+        (self.home / "plans" / "TSLA.json").write_text('"x"')
+        with self.assertRaises(tc.StateError):
+            tc.load_plan("TSLA")
+
+    def test_save_plan_rejects_inconsistent_merge(self):
+        tc.save_plan({"symbol": "TSLA", "side": "long", "entry": 100, "stop": 99, "target": 102})
+        with self.assertRaises(ValueError):  # old target 102 would sit below a new 103 entry
+            tc.save_plan({"symbol": "TSLA", "side": "long", "entry": 103, "stop": 101})
+        p = tc.save_plan({"symbol": "TSLA", "side": "long", "entry": 103, "stop": 101, "target": None})
+        self.assertIsNone(p["target"])
+
+    def test_open_risk_is_directional(self):
+        locked = {"id": "t", "side": "long", "entry_price": 100, "stop": 103, "qty": 10}
+        self.assertEqual(tc.trade_initial_risk(locked), 0.0)
+        short = {"id": "s", "side": "short", "entry_price": 100, "stop": 101, "qty": 10}
+        self.assertEqual(tc.trade_initial_risk(short), 10.0)
+        with self.assertRaises(tc.StateError):
+            tc.trade_initial_risk({"id": "bad", "side": "long"})
+
+    def test_utc_stamps_count_on_their_et_day(self):
+        # 2026-10-31T01:00Z is still Oct 30 in New York.
+        led = {"tickets": [], "trades": [{"id": "a", "side": "long", "qty": 1, "entry_price": 10, "stop": 9,
+                                          "status": "closed", "pnl": -1, "opened_at": "2026-10-30T15:00:00Z",
+                                          "closed_at": "2026-10-31T01:00:00Z"}]}
+        s = tc.day_summary(led, "2026-10-30")
+        self.assertEqual((s["trades_today"], s["closed_today"], s["realized_pnl"]), (1, 1, -1))
+
+    def test_input_validation(self):
+        with self.assertRaises(ValueError):
+            tc.position_size(100, 99, risk_dollars=-50)
+        with self.assertRaises(ValueError):
+            tc.position_size(100, 99, account=0)
+        with self.assertRaises(ValueError):
+            tc.save_settings({"max_trades_per_day": -1})
+
+    def test_sec_unexpected_shapes_are_fetch_errors(self):
+        with fake_http({"company_tickers.json": {"error": "rate limited"}}):
+            with self.assertRaises(tc.FetchError):
+                tc.sec_cik("TSLA")
+        tickers = {"0": {"cik_str": 1318605, "ticker": "TSLA", "title": "Tesla, Inc."}}
+        with fake_http({"company_tickers.json": tickers, "CIK0001318605.json": {"filings": []}}):
+            with self.assertRaises(tc.FetchError):
+                tc.sec_recent_filings("TSLA")
+
+    def test_sec_403_hint_mentions_contact(self):
+        self.assertIn("DAYTRADER_CONTACT", tc._host_hint("https://data.sec.gov/x", 403))
+        tc.save_settings({"contact_email": "me@example.com"})
+        self.assertNotIn("DAYTRADER_CONTACT", tc._host_hint("https://data.sec.gov/x", 403))
+
+    def test_yahoo_odd_shapes(self):
+        for bad in ([], {"chart": "x"}, {"chart": {"error": "boom"}}, {"chart": {"result": [None]}}):
+            with self.assertRaises(tc.FetchError):
+                tc.parse_yahoo_chart(bad)
+
+    def test_usage_errors_exit_1(self):
+        p = tc.make_parser("x")
+        with self.assertRaises(SystemExit) as cm, mock.patch("sys.stderr"):
+            p.parse_args(["--nope"])
+        self.assertEqual(cm.exception.code, 1)
 
 
 class OutputTests(unittest.TestCase):
