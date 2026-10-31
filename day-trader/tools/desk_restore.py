@@ -2,9 +2,9 @@
 """Restore a paper desk from a backup made by tools/desk_backup.py.
 
 Writes settings.json, ledger.json, alerts.json, plans/*.json and desk_log.jsonl into
-$DAYTRADER_HOME (default ~/.day-trader). It refuses to touch a home that already holds a desk
-(settings.json present) unless --force, so a newer local state is never rolled back by an older
-backup. --candidates-out also writes the backup's candidates list (for tools/desk_snapshot.py).
+$DAYTRADER_HOME (default ~/.day-trader). It refuses to touch a home that already holds any desk
+file (settings.json, ledger.json, alerts.json, desk_log.jsonl or a plan) unless --force, so a newer
+local state is never rolled back by, or mixed with, an older backup. --candidates-out also writes the backup's candidates list (for tools/desk_snapshot.py).
 
   python3 tools/desk_restore.py /tmp/backup/data/users/me/desk_state.json --candidates-out /tmp/candidates.json
 """
@@ -13,6 +13,9 @@ import json
 import os
 import sys
 from pathlib import Path
+
+
+DESK_FILES = ("settings.json", "ledger.json", "alerts.json", "desk_log.jsonl")
 
 
 def desk_home() -> Path:
@@ -35,8 +38,12 @@ def main() -> int:
         print(f"error: {src} is not a desk backup (no settings)", file=sys.stderr)
         return 1
     home = desk_home()
-    if (home / "settings.json").exists() and not args.force:
-        print(f"error: {home} already holds a desk; keep it (back it up instead) or pass --force", file=sys.stderr)
+    present = [n for n in DESK_FILES if (home / n).exists()]
+    if (home / "plans").is_dir() and any((home / "plans").glob("*.json")):
+        present.append("plans/")
+    if present and not args.force:   # any desk file: a newer local state must never be rolled back or mixed
+        print(f"error: {home} already holds a desk ({', '.join(present)}); a restore would overwrite it. "
+              "Keep it and back it up, merge by hand, or pass --force", file=sys.stderr)
         return 1
     (home / "plans").mkdir(parents=True, exist_ok=True)
     (home / "settings.json").write_text(json.dumps(state.get("settings") or {}), encoding="utf-8")

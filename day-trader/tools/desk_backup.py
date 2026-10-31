@@ -5,7 +5,9 @@ Reads $DAYTRADER_HOME (default ~/.day-trader): settings.json, ledger.json, alert
 plans/*.json and desk_log.jsonl. Writes one JSON object:
 {saved_at, settings, ledger, alerts, desk_log, plans, candidates, note}. `candidates` (the last
 desk-checked candidates a dashboard shows) comes from --candidates, else from --previous (the
-last backup), else []. tools/desk_restore.py reverses it. Paper only; nothing leaves this machine.
+last backup), else []. tools/desk_restore.py reverses it. It refuses a home without desk_log.jsonl:
+that is a desk never restored or set up (say a recycled container where only a setting was
+written), whose backup would replace the real one. Paper only; nothing leaves this machine.
 
   python3 tools/desk_backup.py --out /tmp/desk_state.json --candidates /tmp/candidates.json
   python3 tools/desk_backup.py --out /tmp/desk_state.json --previous /tmp/old/desk_state.json
@@ -67,6 +69,11 @@ def main() -> int:
     home = desk_home()
     if not (home / "settings.json").exists() and not (home / "ledger.json").exists():
         print(f"error: {home} holds no desk (no settings.json or ledger.json) - nothing to back up", file=sys.stderr)
+        return 1
+    if not (home / "desk_log.jsonl").exists():   # a desk that was restored or set up always has its log
+        print(f"error: {home} has no desk_log.jsonl, so it was never restored or set up here (a recycled "
+              "container?). Restore it first (tools/desk_restore.py): this backup would replace the real one. "
+              "For a brand-new desk, write its first log line first.", file=sys.stderr)
         return 1
     candidates = json.loads(Path(args.candidates).read_text(encoding="utf-8")) if args.candidates else None
     previous = _unwrap(json.loads(Path(args.previous).read_text(encoding="utf-8"))) if args.previous else None

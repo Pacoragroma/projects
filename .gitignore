@@ -9,3 +9,11 @@ dist/
 desk.json
 desk_state.json
 candidates.json
+
+# A desk home or the original pack's workspace that ends up inside the repo
+ledger.json
+alerts.json
+desk_log.jsonl
+**/plans/*.json
+trader/
+*.pid
