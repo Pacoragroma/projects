@@ -20,3 +20,9 @@ into `~/.claude/skills` (some folder names are generic, so it skips any that alr
 per skill for the Claude apps, and what actually happens when you paste the link and ask Claude to
 install it. For the Claude apps and other sandboxes, also read
 [Running in Claude's apps / sandboxes](day-trader/README.md#running-in-claudes-apps--sandboxes).
+
+## Working on this repo with Claude
+
+Start with [HANDOFF.md](HANDOFF.md): the current state, what is running, and the first steps for a
+new session. It links the runbook, the architecture notes and the project history in
+[day-trader/docs/](day-trader/docs/). [CLAUDE.md](CLAUDE.md) says how to work with the owner.
