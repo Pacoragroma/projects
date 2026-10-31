@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 dist/
 .day-trader/
+
+# Desk outputs never belong in this public repo (they carry the paper ledger)
+/*.json
+/day-trader/*.json
+desk.json
+desk_state.json
+candidates.json

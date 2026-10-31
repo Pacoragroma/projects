@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 DISCLAIMER = (
     "Not financial advice. Paper trading only - nothing here can place a real order. "
     "Simulations and backtests are not guarantees."
@@ -706,7 +706,7 @@ COINBASE_API = "https://api.exchange.coinbase.com"
 COINBASE_GRANULARITY = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "60m": 3600, "6h": 21600, "1d": 86400}
 COINBASE_MAX_CANDLES = 300      # per request
 STABLECOINS = {"USDT", "USDC", "DAI", "PYUSD", "EURC", "GUSD", "USDP", "PAX", "BUSD", "TUSD", "FDUSD", "USDS",
-               "EURI", "AEUR", "EUR", "USD1", "USDE", "RLUSD", "XUSD", "BFUSD"}
+               "EURI", "AEUR", "EUR", "USD1", "USDE", "RLUSD", "XUSD", "BFUSD", "U"}
 
 
 def range_seconds(range_: str) -> int:

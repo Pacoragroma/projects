@@ -634,10 +634,11 @@ class SharedLibFixesFromBinanceReviewTests(TempHomeTestCase):
 
     def test_leveraged_filter_keeps_real_coins_and_new_stablecoins_drop(self):
         rows = [{"symbol": b + "USDT", "status": "TRADING", "baseAsset": b, "quoteAsset": "USDT", "isSpotTradingAllowed": True}
-                for b in ("BTC", "BTCUP", "JUP", "SYRUP", "USD1", "RLUSD", "A")]
+                for b in ("BTC", "BTCUP", "JUP", "SYRUP", "USD1", "RLUSD", "A", "U")]
         with fake_http({"exchangeInfo?permissions=SPOT": {"symbols": rows}}):
             syms = [r["symbol"] for r in tc.binance_crypto_symbols(ttl=0)]
         self.assertEqual(syms, ["A-USDT", "BTC-USDT", "JUP-USDT", "SYRUP-USDT"])   # BTCUP dropped: its root BTC is listed
+        # U (a dollar-pegged token, 1.00 with a 0.05% ATR) is dropped with the other stablecoins
 
     def test_bad_exchange_setting_does_not_break_stock_runs(self):
         with mock.patch.dict(os.environ, {"DAYTRADER_CRYPTO_EXCHANGE": "kraken"}):

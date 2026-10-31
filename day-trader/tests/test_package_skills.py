@@ -152,7 +152,7 @@ class PluginManifestTests(unittest.TestCase):
         for key in ("version", "description", "license", "keywords"):
             self.assertEqual(entry[key], plugin[key], key)
         self.assertRegex(plugin["version"], r"^\d+\.\d+\.\d+$")
-        self.assertEqual(plugin["version"], "1.2.0")
+        self.assertEqual(plugin["version"], "1.2.1")
         for words in ("11 Claude skills", "crypto", "BTC-USDT", "Binance", "Coinbase", "Paper trading only."):
             self.assertIn(words, plugin["description"])
         self.assertLess(plugin["description"].index("Binance"), plugin["description"].index("Coinbase"))  # the default first

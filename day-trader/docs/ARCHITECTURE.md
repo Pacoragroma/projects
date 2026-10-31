@@ -12,19 +12,22 @@ paper-only by construction.**
 CLAUDE.md                            # how to work with the owner (read first)
 HANDOFF.md                           # session handoff: state, what runs, first steps
 day-trader/
-  .claude-plugin/plugin.json         # plugin "day-trader", version 1.2.0
+  .claude-plugin/plugin.json         # plugin "day-trader", version 1.2.1
   README.md                          # user-facing docs (install, desk flow, crypto, limits)
   docs/                              # RUNBOOK.md, ARCHITECTURE.md (this), HISTORY.md
-  shared/trader_common.py            # THE shared library (canonical copy, ~1,500 lines)
+  shared/trader_common.py            # THE shared library (canonical copy, ~1,700 lines)
   skills/<skill>/SKILL.md            # instructions Claude reads (frontmatter name + description <= 1024 chars)
   skills/<skill>/scripts/*.py        # the CLI(s) + a vendored copy of trader_common.py
   skills/<skill>/reference.md        # longer method notes (broker, news, pelosi, time-machine)
   tests/                             # unittest, offline; helpers.py has fixtures and fakes
   tools/sync_common.py               # copy shared/trader_common.py into every skill (--check for CI)
   tools/package_skills.py            # build dist/<skill>.zip for the Claude apps; --check validates SKILL.md
-  tools/smoke_live.py                # live check of all 17 data sources through the skills' own parsers
-  tools/desk_snapshot.py             # the desk as one JSON file (feeds the dashboard)
+  tools/smoke_live.py                # 17 live checks across the 9 data hosts, through the skills' own parsers
+  tools/desk_snapshot.py             # the desk as one JSON file (feeds the dashboard); exits 1 if an input is missing
+  tools/desk_backup.py               # the desk state as one JSON (the dashboard's private backup)
+  tools/desk_restore.py              # a backup back into $DAYTRADER_HOME; refuses to overwrite a desk
 .github/workflows/day-trader.yml     # CI: sync check, tests, SKILL.md check on Python 3.9 and 3.12 (via uv)
+.gitignore                           # also blocks stray *.json at the root and in day-trader/ (desk outputs carry the ledger)
 ```
 
 **Rule:** edit only `shared/trader_common.py`, then run `tools/sync_common.py`. A test fails if
@@ -79,6 +82,10 @@ time-machine → risk → budget → broker, then stop and wait for the yes.
   pnl (net of fees), gross_pnl, fees, r_multiple, opened_at, closed_at, market, exchange`.
 - `alerts.json`, `news_seen.json`, `desk_log.jsonl` (written by `tools/desk_snapshot.py --event`),
   `cache/` (closed candle windows are cached for 7 days).
+- Outside the container: `tools/desk_backup.py` packs settings, ledger, alerts, plans, the desk
+  log and the last candidates into one JSON, kept in the dashboard's private store.
+  `tools/desk_restore.py` writes it back. It refuses a home that already holds a desk, so an
+  older backup never rolls back newer local state.
 
 ## Safety by construction
 
@@ -87,8 +94,9 @@ time-machine → risk → budget → broker, then stop and wait for the yes.
   list.
 - `broker.py confirm` needs `--yes`. A yes within seconds of the ticket is refused. Tickets expire
   (15 minutes). Out of hours or past the time stop you only get a preview with no id. The budget
-  is checked again at confirm. A manual close price must lie inside the bar's range, so a made-up
-  price can't book fake profit.
+  is checked again at confirm. A manual close `--price` must be a price that traded since the fill
+  (5-minute bars, within half a tick), so a made-up price can't book fake profit. With no bars
+  available, the check is skipped with a note.
 - SKILL.md rules tell Claude: show the ticket, stop, and confirm only after the owner's explicit
   yes in a later message, for that ticket id.
 
@@ -100,8 +108,10 @@ time-machine → risk → budget → broker, then stop and wait for the yes.
 - End-to-end desk flows: `test_desk_flow.py` (TSLA, US), `test_crypto_desk_flow.py` (BTC-USD on
   Coinbase), `test_binance_desk_flow.py` (BTC-USDT on Binance). The README's sample output is
   checked against real runs of these.
-- 942 tests, all offline, about 2 minutes. `tools/smoke_live.py` is the live counterpart: 17
-  checks, all passing on 2026-10-31.
+- 945 tests, all offline, about 2 minutes. `tools/smoke_live.py` is the live counterpart: 17
+  checks across 9 hosts, all passing on 2026-10-31.
+- `test_desk_snapshot.py` covers the desk tools: snapshot rows, a missing input exits 1, ORB hits
+  keep their order, and backup → restore round-trips without rolling back a newer desk.
 
 ## The video's original pack (installed alongside, not part of this repo)
 

@@ -11,7 +11,7 @@
       "name": "day-trader",
       "source": "./day-trader",
       "description": "11 Claude skills for day trading US stocks and crypto: scan thousands of charts, track breaking news, time every entry and exit, and replay every outcome before you risk a dollar. Crypto pairs such as BTC-USDT trade 24/7 on Binance's public prices (or Coinbase's), with paper fees. Paper trading only.",
-      "version": "1.2.0",
+      "version": "1.2.1",
       "license": "MIT",
       "keywords": ["day-trading", "stock-market", "crypto", "bitcoin", "binance", "coinbase", "backtesting", "paper-trading", "claude-skills"]
     }

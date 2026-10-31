@@ -4,7 +4,7 @@
 "can we implement this". We rebuilt it from scratch, then added 24/7 crypto, then switched crypto
 prices to Binance at the owner's request, then installed the video's original pack alongside.
 First full live run on 2026-10-31: 6,420 charts scanned, 10 candidates checked, no trade worth
-taking.**
+taking. Then the handoff docs for a session transfer, checked by a cold-start rehearsal.**
 
 ## The video (the spec)
 
@@ -97,12 +97,27 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
   fed by `tools/desk_snapshot.py`.
 - **Next steps chosen:** a crypto re-scan every 2 hours over the weekend, alerts on the trigger
   levels, and the Monday stock sweep at 09:50 ET.
-- **Binance hack:** about $6.3B stolen on Oct 29-30 (Chainalysis: $5.9B), the largest crypto theft
-  on record, linked by researchers to North Korea's TraderTraitor. Binance says users are safe and
-  pledged to cover the loss from SAFU and its own funds: more than $6.34B set aside, about 80%
-  already held in the affected tokens. About $3B is frozen on-chain. Withdrawals were suspended,
-  and completion is not confirmed. Recommendation given: fine for paper; wait for confirmed
-  reimbursement and reopened withdrawals before real money.
+- **Binance hack, and "are the customer funds safe?"** As reported on Oct 30-31:
+  - about $6.3B was stolen on Oct 29-30 (Chainalysis counts $5.9B), the largest crypto theft on
+    record, linked by researchers to North Korea's TraderTraitor group;
+  - Binance says users are safe and pledged to cover the loss from its SAFU reserve and its own
+    funds: more than $6.34B set aside, about 80% already held in the affected tokens;
+  - about $3B is frozen on-chain but not returned, withdrawals were suspended, and nobody has
+    confirmed the reimbursement is complete;
+  - in 2019 SAFU covered a 7,000 BTC hack without touching user balances.
+
+  Recommendation given: fine for paper; wait for confirmed reimbursement and reopened
+  withdrawals before real money. The handoff check confirmed the core facts from live headlines,
+  but could not re-verify Chainalysis's count, the 80% and the $3B, so treat those as reported.
+
+  Sources:
+  - [CNBC](https://www.cnbc.com/2026/10/29/circle-tether-freeze-funds-impacted-by-potential-binance-security-issue.html)
+  - [IBTimes](https://www.ibtimes.co.uk/binance-crypto-breach-north-korea-tradertraitor-1829097)
+  - [CryptoTicker](https://cryptoticker.io/en/binance-safu-fund-full-reimbursement/)
+  - [ABC News](https://abcnews.com/Business/binance-estimates-security-breach-impact-63-billion/story?id=137698510)
+  - [Forbes](https://www.forbes.com/sites/antoniopequenoiv/2026/10/30/binance-says-63-billion-impacted-in-record-crypto-hack-suspends-withdrawals/)
+  - [Onmanorama](https://www.onmanorama.com/news/business/2026/10/31/6-billion-binance-hack-what-failed-who-pays-and-what-customers-should-check.html)
+  - [PYMNTS](https://www.pymnts.com/cybersecurity/2026/binance-hack-tests-pledge-cover-customer-losses/)
 - **CLAUDE.md** arrived via the owner's PR #1: work style rules and "this repo is public".
 
 ### 2026-10-31: the first full scan and candidate check
@@ -115,8 +130,12 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
 - **US stocks** (Friday's close):
   - 5,907 scanned, 1,998 passed the filters, 645 setups, led by earnings gaps.
   - Down: INTC −28.6%, RDDT −29.2%, CACC −19.3%. Up: REGN +13.3%, GPN +13.0%, MEOH +14.0%.
-- **The original pack's daily scan:** 5,942 charts, 1,590 liquid, 470 setups (256 breakouts, 115
-  bull flags, 92 oversold). The two scanners agree on INTC, RDDT, REGN and GPN.
+- **The original pack's daily scan:**
+  - a 5,942-symbol universe, 1,590 liquid charts and 470 hits;
+  - the tags: 256 20-day breakouts, 115 bull flags, 92 oversold, 40 MA20 reclaims and 9 oversold
+    bounces (a hit can carry several);
+  - both scanners flag INTC, RDDT, REGN, GPN and MEOH. The original calls INTC and RDDT oversold (a
+    long idea); ours calls them breakdowns (a short).
 - **10 candidates through the whole desk** (agents, live data, throwaway homes, a skeptic per
   proposed trade). **All skipped:**
 
@@ -134,6 +153,44 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
   | GPN | Moved on an unconfirmed takeover report, and its trigger spike was rejected |
 
   Then 3 alerts were armed on the levels that would make BTC, ETH and ZAMA worth re-checking.
+
+### 2026-10-31: the 10:41 UTC re-scan
+
+- The first scheduled crypto run: 508 pairs, 78 liquid, 2 setups. ZAMA-USDT scored 59 but is
+  short-only (spot can't be shorted), and QNT-USDT scored 22. Nothing to take.
+- No alert fired: BTC was 0.19% under its trigger. The dashboard and the backup were updated.
+
+### 2026-10-31: the session handoff
+
+- The owner: "put out all MD files needed for a transfer of the session", plus a prompt to paste
+  into the new session. Written: `HANDOFF.md` and the three docs in `day-trader/docs/`. The
+  private details (dashboard link, session and task ids) go only in the owner's prompt.
+- Checked two ways:
+  - a cold-start rehearsal: a fresh agent followed only the docs, in throwaway homes;
+  - an independent audit of every number, flag and link.
+
+  The docs were then fixed:
+
+  | Found | Fix |
+  |---|---|
+  | The pass-to-ticket path failed: the throwaway home's plan never reached the real desk, so the budget check and the ticket exited 1 | `risk.py size --save`, then copy the plan to `~/.day-trader/plans/`. Verified live in throwaway homes, and fixed in both stored task prompts |
+  | The alert watcher would die after 30 minutes (the default background limit) | Start it with `timeout: 7200000`, guarded by `pgrep` |
+  | The old session would keep acting after the handoff | Wait until it is idle, disable its tasks by id, then tell it "Handoff done" and ask the owner about archiving it |
+  | Relative output paths would put desk files (with the ledger) in the public repo | Absolute scratchpad paths everywhere, plus a `.gitignore` backstop |
+  | No way to build the backup | `tools/desk_backup.py` and `tools/desk_restore.py`. The restore refuses to roll back a newer desk |
+  | Task prompts were only summarized | Copy them verbatim with `get_trigger`. The stored prompts were updated |
+  | After a container recycle the crypto job would empty the stock tables | It re-creates missing stock scans first |
+  | Tickets could expire unseen (15 minutes) | A push notification for every ticket |
+
+- Smaller fixes:
+  - U-USDT, a stablecoin, had passed the filter;
+  - `desk_snapshot.py` silently skipped a missing input, and now exits 1;
+  - ORB hits keep their order (they carry no volume);
+  - the original pack's audited commit is recorded;
+  - BTC-USD is documented as a separate plan from BTC-USDT;
+  - several numbers in the docs were corrected.
+
+  The stablecoin fix is the only change to how the skills behave. It shipped as v1.2.1.
 
 ## Decisions that shaped the design
 
@@ -156,3 +213,5 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
 - An optional Alpaca paper account for the original pack's broker (owner's call; needs paper API
   keys stored in the environment's settings, never pasted in chat).
 - SEC contact email for EDGAR (owner's call).
+- A generic stablecoin guard (price about 1 and a tiny ATR), so the next new stablecoin is dropped
+  without a list update.

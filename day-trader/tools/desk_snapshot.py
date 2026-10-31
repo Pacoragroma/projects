@@ -82,6 +82,11 @@ def main():
     ap.add_argument("--detail", default="")
     args = ap.parse_args()
 
+    for flag, paths in (("--scan", args.scan), ("--original-watchlist", [args.original_watchlist]),
+                        ("--candidates", [args.candidates])):
+        for path in paths:
+            if path and not Path(path).exists():   # a missing input would silently empty its table
+                raise ValueError(f"{flag} {path} does not exist")
     sym = args.symbol.upper()
     tc.use_market_for(sym)
     if args.event:
@@ -185,18 +190,24 @@ def main():
                          "change_pct": num(r.get("change_pct"), 2), "rvol": num(r.get("rvol"), 2),
                          "key_level": num(kl.get("price")), "detail": (setups[0].get("detail") if setups else "") or "",
                          "date": r.get("date")})
-    if args.original_watchlist and Path(args.original_watchlist).exists():
+    if args.original_watchlist:
         w = json.loads(Path(args.original_watchlist).read_text(encoding="utf-8"))
-        hits = sorted(w.get("hits") or [], key=lambda h: -(float(h.get("price") or 0) * float(h.get("volume") or 0)))
+        hits = list(w.get("hits") or [])
+        if all(h.get("volume") is not None for h in hits):   # daily scan: most traded first
+            hits.sort(key=lambda h: -(float(h.get("price") or 0) * float(h.get("volume") or 0)))
+        # an intraday ORB sweep has no volume: keep its order (earliest trigger first)
         rows.append({"kind": "scanmeta", "id": "scanmeta-original", "market": "original", "as_of": w.get("created_at"),
                      "scanned": w.get("scanned"), "universe": w.get("universe"), "matched": len(hits),
                      "source": f"original pack, {w.get('mode')} scan, {w.get('as_of')}", "incomplete": False})
         for rank, h in enumerate(hits[:args.top_scan], 1):
             rows.append({"kind": "scan", "id": f"scan-original-{h['symbol']}", "market": "original", "rank": rank,
-                         "symbol": h["symbol"], "setup": ", ".join(h.get("setups") or []), "last": num(h.get("price"), 2),
-                         "rsi": num(h.get("rsi"), 1), "dollar_volume": num(float(h.get("price") or 0) * float(h.get("volume") or 0), 0),
+                         "symbol": h["symbol"], "last": num(h.get("price"), 2),
+                         "setup": ", ".join(h.get("setups") or []) + (
+                             f" at {h['at']}, {h['pct_over']:+.2f}% over the range" if h.get("pct_over") is not None else ""),
+                         "rsi": num(h.get("rsi"), 1),
+                         "dollar_volume": None if h.get("volume") is None else num(float(h.get("price") or 0) * float(h["volume"]), 0),
                          "date": h.get("close_date")})
-    if args.candidates and Path(args.candidates).exists():
+    if args.candidates:
         for c in json.loads(Path(args.candidates).read_text(encoding="utf-8")):
             rows.append(dict({k: c.get(k) for k in (
                 "symbol", "setup", "side", "entry", "stop", "target", "tm_target_first", "tm_stop_first", "tm_open",
