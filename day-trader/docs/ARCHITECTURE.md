@@ -122,7 +122,7 @@ time-machine → risk → budget → broker, then stop and wait for the yes.
 - End-to-end desk flows: `test_desk_flow.py` (TSLA, US), `test_crypto_desk_flow.py` (BTC-USD on
   Coinbase), `test_binance_desk_flow.py` (BTC-USDT on Binance). The README's sample output is
   checked against real runs of these.
-- 945 tests, all offline, about 2 minutes. `tools/smoke_live.py` is the live counterpart: 17
+- 975 tests, all offline, about 2 minutes. `tools/smoke_live.py` is the live counterpart: 17
   checks across 9 hosts, all passing on 2026-10-31.
 - `test_desk_snapshot.py` covers the dashboard data: snapshot rows, all-time results, the shadow
   rows, equity, stale tickets, ORB order, a missing input exits 1, and the backup → restore round

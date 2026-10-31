@@ -27,7 +27,7 @@ dashboard's link, the old session's id and the scheduled tasks' ids.
 
 | Thing | Where | Notes |
 |---|---|---|
-| Our skill pack, 11 skills, v1.2.1 | `day-trader/` on branch `claude/day-trader-skills` (the repo's default branch) | Stdlib Python 3.9+, about 950 offline tests, CI on 3.9 and 3.12 |
+| Our skill pack, 11 skills, v1.2.1 | `day-trader/` on branch `claude/day-trader-skills` (the repo's default branch) | Stdlib Python 3.9+, 975 offline tests, CI on 3.9 and 3.12 |
 | The bot's tools | `day-trader/tools/` | `paper_autotrade.py` (ticket and confirm under the standing order), `desk_snapshot.py` (the dashboard data), `desk_backup.py`, `desk_restore.py`, `smoke_live.py` |
 | The video's original pack, v2.0.0 | github.com/Jakeschincariol/day-trader-skill (MIT, Jake Schincariol) | US stocks only; its ORB sweep feeds the stock runs. The jobs run a clone pinned to the audited commit `3d0f4ef6986f4984b7c6bd46f7ff4f87744c3abd` at `/home/user/day-trader-skill/` |
 | **The desk** (main paper account) | `/root/.day-trader/` in the container | Trades only the ideas that pass the desk's rules |

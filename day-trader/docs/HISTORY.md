@@ -276,3 +276,10 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
 - SEC contact email for EDGAR (owner's call).
 - A generic stablecoin guard (price about 1 and a tiny ATR), so the next new stablecoin is dropped
   without a list update.
+- `paper_autotrade.py`: confirm each ticket as soon as it is 11 seconds old, instead of after the
+  whole batch. A very slow batch (many open positions, Yahoo back-off) could otherwise let its first
+  tickets expire. Low risk at today's batch sizes (up to 10).
+- `paper_autotrade.py --plan saved`: refuse a plan not updated today, as a guard against trading a
+  stale plan when the copy from the throwaway home was skipped.
+- `desk_snapshot.py`: show crypto positions' unrealized P&L net of fees, and include crypto fees and
+  working orders in open risk, as `budget.py status` does.
