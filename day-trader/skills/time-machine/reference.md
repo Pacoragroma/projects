@@ -5,7 +5,8 @@ when an edge case shows up in the notes, or when you chain the JSON into another
 
 ## Method, step by step
 
-1. **Bars.** `tc.fetch_bars(SYM, "5m", "60d")`, regular session (09:30-16:00 ET) only, grouped by
+1. **Bars.** `tc.fetch_bars(SYM, "5m", "60d")` (crypto: Coinbase candles over `max(60, sessions + 1)`
+   days, grouped by UTC day - see 10), regular session (09:30-16:00 ET) only, grouped by
    ET date. A repeated live bar (Yahoo sometimes sends the current bar twice, or adds a separate
    row stamped with the last trade time, e.g. 10:17:43, that may carry only the latest price) is
    merged into its 5-minute slot: first open, highest high, lowest low, last close.
@@ -59,7 +60,21 @@ when an edge case shows up in the notes, or when you chain the JSON into another
    points the way the two answers differ; otherwise it says the odds are sensitive to small
    time-of-day drifts. (A whole-window move near 0% can hide a drift in the first bars that is a
    sizeable share of a tight stop - the horizon measure shows it.)
-10. **Seed.** Default = first 48 bits of sha256("SYMBOL|YYYY-MM-DD"). Same symbol, same day, same
+10. **Crypto** (Coinbase products such as BTC-USD; `tc.use_market_for` switches the market). The
+    session is the UTC day: 288 slots, 00:00-23:55 UTC, weekends included; the library is the
+    most recent `--sessions` UTC days before today (the fetch covers one day more, since the
+    window's first day is partial; today's UTC day never joins - it is not over). There is no
+    close, so the replays and the history check end at the time stop: the saved exit plan's
+    `exit_plan.time_stop` when valid, else 23:55 UTC (the last replayed bar is the one ending
+    there). Past the time stop the replays are for the next UTC day from 00:00. **Fees:**
+    `fees = fee_summary(...)` with `fee_pct = tc.fee_pct()` (setting `crypto_fee_pct`, default
+    0.6% of notional per fill): `at_target_r` / `at_stop_r` = fee x (entry + exit) / risk, the
+    open replays pay it at their average closing price, `expected_fees_r` = the count-weighted
+    mean, `expected_r_after_fees = expected_r - expected_fees_r`, `round_trip_r` = 2 x fee x entry /
+    risk, and `breakeven_win_rate_after_fees_pct` = (1 + at_stop) / (R:R - at_target + 1 + at_stop)
+    (null when even the target loses money after fees). The verdict uses `expected_r_after_fees`;
+    `expected_r` stays the before-fees value.
+11. **Seed.** Default = first 48 bits of sha256("SYMBOL|YYYY-MM-DD"). Same symbol, same day, same
     flags -> the same numbers. The SVG's 300 drawn paths are the first 300 replays; their
     continuation after an exit uses a separate generator, so `--svg` never changes the odds.
 
@@ -113,11 +128,15 @@ when an edge case shows up in the notes, or when you chain the JSON into another
   `today_range_ratio`.
 * `verdict, verdict_notes[], warnings[], notes[], svg, saved, plan_file, dropped_sections[],
   disclaimer`.
+* Crypto only: `fees{fee_pct, round_trip_r, at_target_r, at_stop_r, expected_fees_r,
+  expected_r_after_fees, breakeven_win_rate_after_fees_pct}` and
+  `trend.alt.expected_r_after_fees`.
 
 ## Saved plan section (`--save`)
 `plans/<SYM>.json` gets `time_machine{side, entry, stop, target, rr, start, mode,
 target_first_pct, stop_first_pct, neither_pct (= open_at_close_pct), open_at_close_pct,
 display_pct{target_first, stop_first, open_at_close}, ambiguous_pct, expected_r, avg_r_open,
-paths, sessions, block, seed, detrended, verdict, history{sessions,target,stop,open}, as_of}`. Readers should check its levels still match the
+paths, sessions, block, seed, detrended, verdict, history{sessions,target,stop,open}, as_of}`
+(crypto adds `fees{...}`, as in the JSON). Readers should check its levels still match the
 plan's before quoting it, and print `display_pct` when present (else the `*_pct` values with
 one decimal), so the odds read exactly as the Time Machine printed them.

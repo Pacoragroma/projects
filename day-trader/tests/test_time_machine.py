@@ -16,9 +16,10 @@ from unittest import mock
 # Works both with `unittest discover -s tests` and `python3 -m unittest tests.test_time_machine`.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from helpers import (SKILLS, TempHomeTestCase, bars_from_closes, et_ts, fake_bars, load_skill_module,  # noqa: E402
-                     random_walk_history, random_walk_session, run_cli, skill_script, tc, trading_days,
-                     write_fixture, yahoo_chart_url, yahoo_payload)
+from helpers import (SKILLS, TempHomeTestCase, bars_from_closes, crypto_history, et_ts, fake_bars,  # noqa: E402
+                     load_skill_module, random_walk_history, random_walk_session, run_cli, skill_script, tc,
+                     trading_days, utc_ts, write_coinbase_fixtures, write_fixture, yahoo_chart_url,
+                     yahoo_payload)
 
 tm = load_skill_module("time-machine", "time_machine")
 SCRIPT = skill_script("time-machine", "time_machine.py")
@@ -912,6 +913,190 @@ class CliTests(TempHomeTestCase):
             p = self.cli(*args)
             self.assertEqual(p.returncode, 1, (args, p.stdout, p.stderr))
             self.assertNotIn("Traceback", p.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Crypto: 288-slot UTC days, replays to the time stop, fees in R
+# ---------------------------------------------------------------------------
+
+SAT, FRI = "2026-10-31", "2026-10-30"   # a Saturday: crypto trades the weekend
+
+
+def crypto_library(days=59, seed=7):
+    """Past UTC days of synthetic BTC-USD bars as a library (the crypto market must be active)."""
+    return tm.build_library(list(tc.group_sessions(crypto_history(FRI, days, seed=seed)).values()))
+
+
+class CryptoTests(TempHomeTestCase):
+    def setUp(self):
+        super().setUp()
+        tc.use_market_for("BTC-USD")          # temp_home switches back to US after each test
+
+    def test_slots_follow_the_market(self):
+        self.assertEqual((tm.session_slots(), tm.SLOTS, tm.LAST_SLOT), (288, 288, 287))
+        self.assertEqual(tm.slot_of(utc_ts(SAT, "00:00")), 0)
+        self.assertEqual(tm.slot_of(utc_ts(SAT, "04:40") + 163), 56)
+        self.assertEqual(tm.slot_of(utc_ts(SAT, "23:55")), 287)
+        self.assertEqual((tm.slot_time(56), tm.slot_time(287), tm.slot_time(288)), ("04:40", "23:55", "24:00"))
+        lib = crypto_library(days=3)
+        self.assertEqual((len(lib), len(lib[0])), (3, 288))
+        self.assertTrue(all(sh is not None for sh in lib[-1]))
+        tc.set_market(tc.US)
+        self.assertEqual((tm.SLOTS, tm.LAST_SLOT, tm.slot_time(0)), (78, 77, "09:30"))
+
+    def test_start_runs_to_the_time_stop_every_day(self):
+        today = [tc.Bar(utc_ts(SAT, "04:35"), 1, 1, 1, 1, 1), tc.Bar(utc_ts(SAT, "04:40"), 1, 1, 1, 1, 1)]
+        st = tm.choose_start(tc.parse_et(f"{SAT}T04:42"), None, today, None, 1435)
+        self.assertEqual((st["start_slot"], st["end_slot"], st["mode"], st["session"]), (56, 286, "now", "today"))
+        self.assertEqual((st["market_open"], st["include_today"], st["notes"], st["warnings"]), (True, False, [], []))
+        late = tm.choose_start(tc.parse_et(f"{SAT}T23:57"), None, today, None, 1435)
+        self.assertEqual((late["start_slot"], late["end_slot"], late["mode"], late["session"]), (0, 286, "open", "next"))
+        self.assertIn("past the 23:55 UTC time stop - simulating the next UTC day from 00:00 UTC", late["notes"])
+        at = tm.choose_start(tc.parse_et(f"{SAT}T04:42"), "10:02", today, None, 1435)
+        self.assertEqual((at["start_slot"], at["mode"]), (120, "at"))
+        self.assertIn("--at 10:02 rounded down to the 10:00 5-minute bar", at["notes"])
+        with self.assertRaises(ValueError) as cm:
+            tm.choose_start(tc.parse_et(f"{SAT}T04:42"), "23:55", today, None, 1435)
+        self.assertIn("time stop", str(cm.exception))
+        stale = tm.choose_start(tc.parse_et(f"{SAT}T05:30"), None, today, None, 1435)
+        self.assertTrue(any("no trades or delayed data?" in w for w in stale["warnings"]), stale["warnings"])
+        self.assertEqual(tm.parse_at("00:00"), (0, None))
+        self.assertEqual(tm.choose_start(tc.parse_et(f"{SAT}T12:00"), None, today)["end_slot"], 287)   # no horizon
+
+    def test_fee_summary_and_the_verdict_after_fees(self):
+        up = const_library(UP, slots=288)
+        r = tm.simulate(up, 0, 100.0, 99.0, 101.0, "long", 2000, random.Random(1), end_slot=286)
+        self.assertEqual((r["counts"]["target"], r["expected_r"]), (2000, 1.0))
+        f = tm.fee_summary(r, 0.6)
+        self.assertEqual((f["round_trip_r"], f["at_target_r"], f["at_stop_r"]), (1.2, 1.206, 1.194))
+        self.assertEqual((f["expected_fees_r"], f["expected_r_after_fees"]), (1.206, -0.206))
+        self.assertIsNone(f["breakeven_win_rate_after_fees_pct"])          # a winner still loses money
+        self.assertEqual(tm.verdict(r), "ODDS LEAN YOUR WAY")               # before fees
+        r["fees"] = f
+        self.assertEqual(tm.verdict(r), "ODDS LEAN AGAINST YOU")            # what the card says
+        notes = tm.verdict_notes(dict(r, verdict=tm.verdict(r)))
+        self.assertTrue(any("the verdict counts the paper fees (0.6% per fill): about 1.21R per trade, so the "
+                            "expected value after fees is -0.21R - even the target loses money after fees at these "
+                            "levels; before fees it would be ODDS LEAN YOUR WAY" in n for n in notes), notes)
+        # Replays still open at the end pay the fee at their average closing price.
+        flat = tm.simulate(const_library(FLAT, slots=288), 0, 100.0, 99.0, 101.0, "long", 500, random.Random(1))
+        self.assertEqual(tm.fee_summary(flat, 0.6)["expected_fees_r"], 1.2)
+        short = tm.simulate(const_library(DOWN, slots=288), 0, 100.0, 101.0, 98.0, "short", 500, random.Random(1))
+        fs = tm.fee_summary(short, 0.6)
+        self.assertEqual((fs["at_target_r"], fs["expected_r_after_fees"]), (1.188, 0.812))
+        self.assertAlmostEqual(fs["breakeven_win_rate_after_fees_pct"], 100 * 2.206 / (0.812 + 2.206), places=1)
+
+    def test_performance_10000_paths_over_a_full_crypto_day(self):
+        lib = crypto_library()
+        self.assertEqual((len(lib), len(lib[0])), (59, 288))
+        t0 = time.perf_counter()
+        for keep in (300, 0):              # main runs the headline and the trend-removed replays
+            r = tm.simulate(lib, 0, 100_000.0, 50_000.0, 200_000.0, "long", 10_000, random.Random(1),
+                            end_slot=286, keep_paths=keep)               # nothing resolves: the worst case
+        elapsed = time.perf_counter() - t0
+        self.assertEqual((r["counts"]["open"], r["minutes_simulated"], r["end"]), (10_000, 1435, "23:55"))
+        self.assertLess(elapsed, 10.0)     # generous: about 1.5 s on a laptop
+
+    def test_history_check_walks_utc_days_to_the_time_stop(self):
+        days = tc.group_sessions(crypto_history(FRI, 5, seed=3))
+        h = tm.replay_history(days, 56, -50.0, 100.0, "long", end_slot=286)
+        self.assertEqual((h["sessions"], h["open"], h["skipped"]), (5, 5, 0))
+        self.assertEqual(h["results"][0]["date"], "2026-10-26")
+        full = tm.replay_history(days, 56, -50.0, 100.0, "long")             # default: the last slot
+        self.assertEqual(full["sessions"], 5)
+
+
+class CryptoCliTests(TempHomeTestCase):
+    """The real script against Coinbase fixtures on a Saturday, 04:40 UTC."""
+    NOW = f"{SAT}T04:40"
+
+    def setUp(self):
+        super().setUp()
+        tc.use_market_for("BTC-USD")
+        self.fx = self.home / "fixtures"
+        self.bars = crypto_history(SAT, 61, until="04:45", seed=21)
+        write_coinbase_fixtures(self.fx, "BTC-USD", self.bars, "5m", "60d", now_ts=utc_ts(SAT, "04:40"))
+        last = [b for b in self.bars if b.ts < utc_ts(SAT, "04:40")][-1].close
+        self.levels = ["--entry", f"{last:.2f}", "--stop", f"{last * 0.99:.2f}", "--target", f"{last * 1.02:.2f}"]
+        self.env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(self.fx), "DAYTRADER_NOW": self.NOW}
+
+    def cli(self, *args):
+        return run_cli(SCRIPT, *args, env=self.env)
+
+    def test_text_card_and_svg(self):
+        svg = self.home / "btc.svg"
+        t0 = time.perf_counter()
+        p = self.cli("BTC-USD", *self.levels, "--svg", str(svg))
+        self.assertLess(time.perf_counter() - t0, 30.0)                   # 2 x 10,000 replays over ~19 h
+        self.assertEqual(p.returncode, 0, p.stderr)
+        lines = p.stdout.splitlines()
+        self.assertEqual(lines[0], "TIME MACHINE · BTC-USD · LONG from 04:40 UTC · 10,000 replays from BTC-USD's "
+                                   "past 59 days (UTC)")
+        text = " ".join(p.stdout.split())
+        for want in ("OPEN AT TIME STOP", "per trade before fees", "Fees (paper, 0.6% per fill): round trip ≈",
+                     "expected value after fees", "History check (same UTC clock time, last 59 days)",
+                     "the past days drifted", "the verdict counts the paper fees (0.6% per fill)",
+                     "crypto never closes: the replays run to the 23:55 UTC time stop (the default)",
+                     "Replayed 04:40-23:55 UTC in 3-bar blocks from days 2026-09-02..2026-10-30"):
+            self.assertIn(want, text)
+        self.assertNotIn(" ET", p.stdout)
+        root = ET.fromstring(svg.read_text(encoding="utf-8"))
+        texts = " ".join(t.text or "" for t in root.iter("{http://www.w3.org/2000/svg}text"))
+        for want in ("TIME MACHINE · BTC-USD · LONG from 04:40 UTC", "REPLAYS FROM 59 PAST DAYS (UTC)",
+                     "OPEN AT TIME STOP", "EV AFTER FEES", "00:00", "12:00", "23:55", "the coin's own past"):
+            self.assertIn(want, texts)
+
+    def test_json_save_and_the_exit_plans_time_stop(self):
+        p = self.cli("BTC-USD", *self.levels, "--json", "--paths", "2000", "--save")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        d = json.loads(p.stdout)
+        self.assertEqual((d["start"], d["end"], d["end_slot"], d["mode"], d["session"], d["market_open"]),
+                         ("04:40", "23:55", 286, "now", "today", True))
+        self.assertEqual((d["sessions_used"], d["first_session"], d["last_session"]), (59, "2026-09-02", FRI))
+        f = d["fees"]
+        self.assertEqual(f["fee_pct"], 0.6)
+        self.assertAlmostEqual(f["round_trip_r"], 0.012 / 0.01, delta=0.002)   # 2 x 0.6% / a 1% stop
+        self.assertAlmostEqual(f["expected_r_after_fees"], d["expected_r"] - f["expected_fees_r"], places=3)
+        self.assertEqual(d["verdict"], tm.verdict(d))                       # judged after fees
+        self.assertIn("expected_r_after_fees", d["trend"]["alt"])
+        self.assertEqual(d["history"]["sessions"], 59)
+        saved = json.loads((self.home / "plans" / "BTC-USD.json").read_text())["time_machine"]
+        self.assertEqual((saved["fees"], saved["verdict"]), (f, d["verdict"]))
+        # A saved exit plan's time stop moves the end of every replay.
+        tc.save_plan({"symbol": "BTC-USD", "side": "long", "entry": float(self.levels[1]),
+                      "stop": float(self.levels[3]), "target": float(self.levels[5]),
+                      "exit_plan": {"method": "manual", "time_stop": "12:00"}})
+        d = json.loads(self.cli("BTC-USD", "--json", "--paths", "500").stdout)
+        self.assertEqual((d["end"], d["end_slot"], d["minutes_simulated"]), ("12:00", 143, 440))
+        self.assertIn("crypto never closes: the replays run to the 12:00 UTC time stop (the saved exit plan)",
+                      d["notes"])
+        p = self.cli("BTC-USD", "--at", "13:00")
+        self.assertEqual(p.returncode, 1, p.stderr)                         # after that time stop
+        self.assertIn("time stop", p.stderr)
+
+    def test_unreachable_coinbase_is_a_data_error_naming_the_host(self):
+        empty = self.home / "empty"
+        empty.mkdir()
+        p = run_cli(SCRIPT, "BTC-USD", *self.levels, env=dict(self.env, DAYTRADER_FIXTURES=str(empty)))
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("api.exchange.coinbase.com", p.stderr)
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1)
+
+
+class StockFeeRegressionTests(TempHomeTestCase):
+    NOW = "2026-10-30T10:17"
+
+    def test_stock_runs_have_no_fee_section_or_line(self):
+        bars = random_walk_history("2026-10-30", 60, start_price=364.0, vol=0.002, seed=5)
+        with fake_bars({"TSLA": bars}):
+            d = json.loads(capture(["TSLA", "--entry", "364.18", "--stop", "358.32", "--target", "370.04",
+                                    "--json", "--paths", "500"])[1])
+            text = capture(["TSLA", "--entry", "364.18", "--stop", "358.32", "--target", "370.04", "--paths", "500"])[1]
+        self.assertNotIn("fees", d)
+        self.assertNotIn("expected_r_after_fees", d["trend"]["alt"])
+        self.assertNotIn("Fees", text)
+        self.assertIn("OPEN AT CLOSE", text)
+        self.assertNotIn("before fees", text)
 
 
 if __name__ == "__main__":

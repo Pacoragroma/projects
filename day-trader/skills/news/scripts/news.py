@@ -7,12 +7,17 @@ Sources (free, no API key), merged and de-duplicated:
   * SEC EDGAR 8-K / 8-K/A / 6-K filings  www.sec.gov + data.sec.gov
 One source failing only adds a warning; all of them failing exits 2 ("data error: ...").
 
+Crypto pairs (BTC-USD, ETH-USD, ...) use the same Yahoo feeds for the symbol; SEC EDGAR is not
+applicable to them, so it is not asked (shown as "n/a", never as a failure). A run of crypto
+symbols only shows times in UTC (crypto days are UTC days); any run with a stock uses ET.
+
 Usage examples:
   python3 scripts/news.py TSLA
   python3 scripts/news.py TSLA NVDA --since 90m --tags EARNINGS,DEAL
   python3 scripts/news.py TSLA --new-only        # only headlines you have not been shown yet
   python3 scripts/news.py TSLA --since 09:30     # since the open today (ET)
   python3 scripts/news.py AAPL --since 2026-10-29 --limit 50 --json
+  python3 scripts/news.py BTC-USD ETH-USD --since 12h  # crypto: Yahoo only, times in UTC
 """
 from __future__ import annotations
 
@@ -211,7 +216,9 @@ _SINCE_RX = re.compile(r"(\d+(?:\.\d+)?)\s*(m|mins?|minutes?|h|hrs?|hours?|d|day
 
 
 def parse_since(value: str, now: datetime) -> datetime:
-    """'90m' / '24h' / '2d' / '1w' / 'today' / '09:30' (today, ET) / '2026-10-29' / '2026-10-29T08:00' (ET)."""
+    """'90m' / '24h' / '2d' / '1w' / 'today' / '09:30' (today) / '2026-10-29' / '2026-10-29T08:00'.
+
+    Clock times and dates are in the active market's zone (ET; UTC for a crypto-only run)."""
     raw = (value or "").strip()
     v = raw.lower()
     m = _SINCE_RX.fullmatch(v)
@@ -227,7 +234,7 @@ def parse_since(value: str, now: datetime) -> datetime:
     if v == "today":
         return now.replace(hour=0, minute=0, second=0, microsecond=0)
     try:
-        if re.fullmatch(r"\d{1,2}:\d{2}", v):  # a clock time means today at that ET time
+        if re.fullmatch(r"\d{1,2}:\d{2}", v):  # a clock time means today at that time (ET / UTC)
             dt = tc.parse_et(f"{now:%Y-%m-%d}T{tc.hhmm(tc.parse_hhmm(v))}")
         else:
             dt = tc.parse_et(raw)
@@ -235,7 +242,7 @@ def parse_since(value: str, now: datetime) -> datetime:
         raise ValueError(f"--since: expected a duration like 90m, 24h, 2d, a clock time like 09:30 or a date "
                          f"like 2026-10-29, got {raw!r}") from None
     if dt > now:
-        raise ValueError(f"--since {raw} is in the future (now is {now:%Y-%m-%d %H:%M} ET)")
+        raise ValueError(f"--since {raw} is in the future (now is {now:%Y-%m-%d %H:%M} {tc.tz_label()})")
     return dt
 
 
@@ -778,10 +785,22 @@ def fetch_sec(symbols: Sequence[str], since_date: str, now: datetime) -> List[Di
     return rows
 
 
+def news_market(symbols: Sequence[str]) -> tc.Market:
+    """The market whose clock a run uses: crypto when every symbol is a crypto pair, else US."""
+    return tc.CRYPTO if symbols and all(tc.is_crypto_symbol(s) for s in symbols) else tc.US
+
+
+def sec_not_applicable(symbol: str) -> Dict[str, Any]:
+    """Status row for a crypto pair: SEC EDGAR has no filer for it, so it is not asked."""
+    return {"source": "sec-edgar", "symbols": [symbol], "status": "n/a", "items": [],
+            "error": f"{symbol} is a crypto pair - SEC EDGAR does not apply"}
+
+
 def gather(symbols: Sequence[str], since: datetime, now: datetime,
            workers: int = 8) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Fetch every source for every symbol concurrently. Returns (raw items, status rows).
 
+    Crypto pairs get the Yahoo feeds only: SEC EDGAR is not asked for them (status "n/a").
     Raises FetchError only when not a single source answered for any symbol.
     """
     def run_one(source: str, sym: str, fn: Callable[[str], List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -795,9 +814,12 @@ def gather(symbols: Sequence[str], since: datetime, now: datetime,
     for s in symbols:
         jobs.append(lambda s=s: run_one("yahoo-rss", s, fetch_rss))
         jobs.append(lambda s=s: run_one("yahoo-search", s, fetch_search))
-    jobs.append(lambda: fetch_sec(symbols, since.strftime("%Y-%m-%d"), now))
+    stocks = [s for s in symbols if not tc.is_crypto_symbol(s)]
+    if stocks:
+        jobs.append(lambda: fetch_sec(stocks, since.strftime("%Y-%m-%d"), now))
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(jobs)))) as ex:
         results = [row for rows in ex.map(lambda job: job(), jobs) for row in rows]
+    results += [sec_not_applicable(s) for s in symbols if tc.is_crypto_symbol(s)]
     if not any(r["status"] == "ok" for r in results):
         firsts: Dict[str, str] = {}
         for r in results:
@@ -833,17 +855,18 @@ def source_summary(rows: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]]
 # Rendering
 # ---------------------------------------------------------------------------
 
-def _when(item: Dict[str, Any], now: datetime) -> str:
+def _when(item: Dict[str, Any], now: datetime, tz: str = "ET") -> str:
     d = datetime.fromisoformat(item["published"])
     if item.get("time_et") is None:
-        return d.strftime("%b %d") + " ET"
+        return d.strftime("%b %d") + f" {tz}"
     if item["date_et"] == now.strftime("%Y-%m-%d"):
-        return d.strftime("%H:%M") + " ET"
-    return d.strftime("%b %d %H:%M") + " ET"
+        return d.strftime("%H:%M") + f" {tz}"
+    return d.strftime("%b %d %H:%M") + f" {tz}"
 
 
 def render(res: Dict[str, Any]) -> str:
     now = datetime.fromisoformat(res["as_of"])
+    tz = res.get("tz") or "ET"
     items = res["items"]
     head = f"NEWS · {' '.join(res['symbols'])} · {res['since_label']}"
     if res["new_only"]:
@@ -868,14 +891,14 @@ def render(res: Dict[str, Any]) -> str:
         high = sum(1 for it in items if it["impact"] == "HIGH")
         more = f" (newest {len(items)} of {res['total']}; raise --limit for more)" if res["total"] > len(items) else ""
         lines.append(f"{len(items)} headline{'s' if len(items) != 1 else ''}, {high} high impact{more}"
-                     f" · as of {now:%a %b %d %H:%M} ET")
-        when_w = max(len(_when(it, now)) for it in items)
+                     f" · as of {now:%a %b %d %H:%M} {tz}")
+        when_w = max(len(_when(it, now, tz)) for it in items)
         ago_w = max(len(it["ago"]) for it in items)
         sym_w = max(len(",".join(it["symbols"])) for it in items)
         for it in items:
             lines.append("")
             meta = [it["publisher"]] + ([" ".join(it["tags"])] if it["tags"] else [])
-            lines.append(f"{'HIGH' if it['impact'] == 'HIGH' else '    '}  {_when(it, now).ljust(when_w)}  "
+            lines.append(f"{'HIGH' if it['impact'] == 'HIGH' else '    '}  {_when(it, now, tz).ljust(when_w)}  "
                          f"{it['ago'].ljust(ago_w)}  {','.join(it['symbols']).ljust(sym_w)}  {' · '.join(meta)}")
             lines.extend(textwrap.wrap(it["title"], width=96, initial_indent="      ", subsequent_indent="      "))
             if it["link"]:
@@ -938,11 +961,13 @@ def parse_tags(value: str) -> List[str]:
 
 def build_parser():
     p = tc.make_parser("Breaking headlines that could move your tickers: Yahoo Finance news + SEC 8-K/6-K "
-                       "filings, merged, de-duplicated, tagged and newest first.")
-    p.add_argument("symbols", nargs="+", metavar="SYMBOL", help="one or more tickers (TSLA NVDA or TSLA,NVDA)")
+                       "filings (stocks only; crypto pairs like BTC-USD get Yahoo news), merged, de-duplicated, "
+                       "tagged and newest first.")
+    p.add_argument("symbols", nargs="+", metavar="SYMBOL",
+                   help="one or more tickers or crypto pairs (TSLA NVDA, TSLA,NVDA or BTC-USD)")
     p.add_argument("--since", default="24h",
                    help="how far back: 90m, 24h (default), 2d, 1w, today, a clock time today like 09:30, "
-                        "or an ET date/time like 2026-10-29 or 2026-10-29T08:00")
+                        "or a date/time like 2026-10-29 or 2026-10-29T08:00 (ET; UTC for crypto-only runs)")
     p.add_argument("--limit", type=int, default=20, help="max headlines to show (default 20)")
     p.add_argument("--tags", default="",
                    help=f"only these tags, comma-separated (any match): {','.join(TAGS)} or HIGH")
@@ -961,11 +986,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     tags = parse_tags(args.tags)
     if args.limit < 1:
         raise ValueError("--limit must be at least 1")
+    mkt = tc.set_market(news_market(symbols))   # before now_et: $DAYTRADER_NOW is read in its zone
     now = tc.now_et()
     since = parse_since(args.since, now)
     rel = _SINCE_RX.fullmatch(args.since.strip().lower())
     since_label = (f"last {args.since.strip()}" if rel
-                   else f"since {since:%a %b %d %H:%M} ET")
+                   else f"since {since:%a %b %d %H:%M} {mkt.tz_label}")
 
     seen = None
     if args.new_only:
@@ -980,7 +1006,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     sources, warnings = source_summary(rows)
     res = {
-        "symbols": symbols, "as_of": now.isoformat(timespec="seconds"),
+        "symbols": symbols, "market": mkt.key, "tz": mkt.tz_label, "as_of": now.isoformat(timespec="seconds"),
         "since": since.isoformat(timespec="seconds"), "since_label": since_label,
         "new_only": bool(args.new_only), "tags_filter": tags,
         "total": feed["total"], "shown": len(feed["items"]),

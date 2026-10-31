@@ -2,16 +2,16 @@
 name: analyst
 description: >-
   Day-trading desk: pre-trade ticker brief and post-trade review of the paper journal. The brief
-  shows trend (price vs the 20/50-day SMAs, 20-day slope), key levels (prior day high/low/close,
-  20-day and 6-month high/low, today's VWAP), daily ATR in $ and %, average dollar volume,
-  relative volume vs the same time of day, today's gap, and SEC context: shares outstanding,
-  recent 8-K items, 10-Q/10-K, possible dilution (S-1/S-3/424B) and insider Form 4s. The review
-  grades closed paper trades: win rate, average win/loss in $ and R, profit factor, expectancy,
-  max drawdown, and breakdowns by setup, side, entry hour, exit and Time Machine verdict, with
-  plain-language takeaways. Use for "brief me on TSLA", "what are the key levels for NVDA?", "is
-  AAPL trending?", "is volume heavy today?", "any recent filings or dilution?", "review my
-  trades", "how am I doing overall / this month?", "what's my win rate?", "which setups work for
-  me?". Free Yahoo Finance + SEC EDGAR data, no API key. Not financial advice.
+  shows trend (20/50-day SMAs, 20-day slope), key levels (prior day high/low/close, 20-day and
+  6-month high/low, VWAP), daily ATR in $ and %, average dollar volume, relative volume vs the
+  same time of day, the gap, and SEC context: shares outstanding, recent 8-K items, 10-Q/10-K,
+  possible dilution and insider Form 4s. Crypto pairs (BTC-USD): Coinbase data, UTC days, no SEC.
+  The review grades closed paper trades: win rate, average win/loss in $ and R, profit factor,
+  expectancy, max drawdown, and breakdowns by setup, side, entry hour, exit, market and Time
+  Machine verdict, with takeaways. Use for "brief me on TSLA", "key levels for NVDA?", "is AAPL
+  trending?", "is volume heavy today?", "any recent filings or dilution?", "review my trades",
+  "how am I doing overall / this month?", "what's my win rate?", "which setups work for me?".
+  Free Yahoo Finance, Coinbase and SEC EDGAR data, no API key. Not financial advice.
 ---
 # Analyst
 
@@ -33,12 +33,14 @@ python3 scripts/analyst.py review                        # closed paper trades, 
 python3 scripts/analyst.py review --days 90 --symbol TSLA
 python3 scripts/analyst.py review --days 3650            # "overall": the whole journal (max 10 years)
 python3 scripts/analyst.py review --json
+python3 scripts/analyst.py brief BTC-USD                 # crypto pair: Coinbase, UTC day, no SEC
+python3 scripts/analyst.py review --market crypto        # only crypto trades (or --market us)
 ```
 
 * `brief SYMBOL`: one ticker per run. `--filing-days N` (1-365, default 30) sets the SEC window.
 * `review`: `--days N` = today and the previous N-1 calendar days, by close date (default 30).
-  `--symbol` keeps one ticker. "This month" = `--days` set to today's day of the month (e.g.
-  `--days 30` on Oct 30); "overall" = `--days 3650`.
+  `--symbol` keeps one ticker, `--market us|crypto` one market. "This month" = `--days` set to
+  today's day of the month (e.g. `--days 30` on Oct 30); "overall" = `--days 3650`.
 * `--json` on either command gives the machine-readable result for chaining. Exit codes: 0 ok,
   1 bad input or a broken state file, 2 a data source is unreachable.
 
@@ -74,11 +76,18 @@ EDGAR are optional. If they fail, the brief still prints and says what is missin
   * filings in the window: 8-K/6-K items by name (2.02 = earnings), 10-Q/10-K/20-F, possible
     dilution (S-1, S-3, F-1, F-3, 424B*, 8-K item 3.02), 13D/13G holders, and counts of
     Form 4 (insider trades) and Form 144 (planned insider sales).
+* **Crypto pairs** (`BTC-USD`, `ETH-USD`, ...): Coinbase Exchange candles (daily 6 months, 5-minute
+  21 days), no API key. Crypto trades 24/7, so "today" and "prior day" are UTC days (levels read
+  `prior UTC day high/low/close` and `VWAP (UTC day)`), the header says `24/7 (UTC day)`, relative
+  volume compares against the same UTC clock time on up to 20 prior days, there is no gap (a UTC
+  day opens where the last one closed), liquidity is in coins, and SEC is `n/a` - not asked, not
+  a failure.
 
 **review.** Reads closed trades from `ledger.json` (the broker skill writes it) in
 `$DAYTRADER_HOME`.
 * **Classifying trades:** win = P&L > 0, loss < 0, scratch = 0. R = P&L / initial risk
-  (|entry - stop| × shares).
+  (|entry - stop| × shares). Crypto P&L and R are net of the paper fees the broker charged
+  (`Crypto paper fees $X` line).
 * **Headline numbers:**
   * profit factor = gross wins / gross losses;
   * expectancy = average R per trade;
@@ -86,12 +95,16 @@ EDGAR are optional. If they fail, the brief still prints and says what is missin
   * break-even win rate = 1 / (1 + average win R / |average loss R|), compared with the win rate
     of decided trades (`win_rate_ex_scratches_pct`; scratches neither win nor lose).
 * **Breakdowns:** setup, side, entry hour (ET), entry window (09:30-10:30, 10:30-14:00,
-  14:00-16:00), exit reason (target, stop, time stop, manual), symbol, and the Time Machine
+  14:00-16:00; crypto trades in UTC: hours and the quarters 00:00-06:00 ... 18:00-24:00, in their own
+  `entry hour UTC` / `entry window UTC` tables), exit reason (target, stop, time stop, manual), symbol, and the Time Machine
   verdict carried on the ticket (leaned your way, coin flip, leaned against you, not checked).
   The Time Machine check compares its average predicted target-first % with how often trades
   actually exited at the target.
 * **Takeaways:** fixed rules that name a bucket only when it has 3 or more trades, and that
   always state the sample size.
+* **Both markets:** each trade's dates and hours are read in its own clock (a crypto close date is
+  a UTC date). With stock and crypto trades in the window, the review adds a per-market line each,
+  a `market` table and a by-market takeaway (JSON `markets`, `by_market`).
 
 Limits: Yahoo data can be delayed, and exchange holidays are not modelled. SEC "recent filings"
 holds a company's last ~1,000 filings, so for very heavy filers the window can be cut short (the
@@ -111,7 +124,8 @@ twenty paper trades cannot show an edge.
 * "Possible dilution" means a registration or prospectus was filed, not that shares were sold.
   Say "worth checking", not "they are diluting".
 * **Brief JSON keys:**
-  * price data: `symbol, name, as_of, market, price, session{...}, prior_day{...}`;
+  * price data: `symbol, name, as_of, market (open/closed/...), market_type (us|crypto), tz, price,
+    session{...}, prior_day{...}`;
   * analysis: `trend{label, sma20, sma50, slope_20d_pct_per_day, ...}`,
     `levels[{name, price, from_last_pct, from_last_atr}]`,
     `volatility{atr14, atr14_pct}`, `liquidity{avg_dollar_volume_20d, avg_volume_20d}`,
@@ -129,8 +143,9 @@ twenty paper trades cannot show an edge.
   give today's budget status first, then this review for the trend.
 * **Review JSON keys:** the headline numbers `count, win_rate_pct, net_pnl, expectancy_r,
   profit_factor, max_drawdown{usd, peak_at, trough_at}`, the breakdowns `by_setup, by_side,
-  by_hour, by_window, by_exit, by_time_machine, by_symbol` (each a list of bucket stats), plus
-  `time_machine_check`, `takeaways[]` and `trades[]`.
+  by_hour, by_window, by_exit, by_time_machine, by_symbol, by_market` (each a list of bucket
+  stats), plus `time_machine_check`, `crypto_fees`, `markets` (per-market stats when both exist),
+  `takeaways[]` and `trades[]`.
 
 ## Next step on the desk
 * After a **brief**: the **entry** skill watches for the trigger (an ORB, a VWAP reclaim, or a
@@ -152,7 +167,7 @@ twenty paper trades cannot show an edge.
 * Be honest about sample size in reviews. Under ~30 trades, patterns are hints, and the script
   says so. Do not present a takeaway as proven.
 * If the script exits with code 2 ("data error: ..."), tell the user which host failed. It is
-  in the message: `query1`/`query2.finance.yahoo.com` for bars, and `www.sec.gov` /
+  in the message: `query1`/`query2.finance.yahoo.com` (crypto: `api.exchange.coinbase.com`) for bars, and `www.sec.gov` /
   `data.sec.gov` failures show in the SEC section of an otherwise working brief. In sandboxes the host
   may need to be allow-listed. Never invent prices, headlines, or odds to fill the gap. Use
   `--no-sec` if only SEC is blocked. Exit code 1 means bad input or a broken state file: show

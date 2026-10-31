@@ -12,7 +12,8 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from helpers import (TempHomeTestCase, bars_from_closes, et_ts, fake_bars, load_skill_module,  # noqa: E402
-                     run_cli, skill_script, tc, write_fixture, yahoo_chart_url, yahoo_payload)
+                     run_cli, skill_script, tc, write_coinbase_products, write_fixture, yahoo_chart_url,
+                     yahoo_payload)
 
 risk = load_skill_module("risk", "risk")
 SCRIPT = skill_script("risk", "risk.py")
@@ -562,6 +563,127 @@ class DirectionalOpenRiskTests(TempHomeTestCase):
         self.assertEqual(json.loads(out)["budget"]["open_risk"], 10.0)
 
 
+class CryptoSizingTests(TempHomeTestCase):
+    """Crypto: fractional sizes floored to the product's step, fees of both fills in the loss, fees in R."""
+    NOW = "2026-10-31T04:40"          # a Saturday, read as UTC once the symbol makes the market crypto
+
+    def setUp(self):
+        super().setUp()
+        self.fx = self.home / "fx"
+        write_coinbase_products(self.fx)
+        env = mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(self.fx)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def btc(self, *extra, entry="100000", stop="99500", target="101000"):
+        argv = ["size", "--symbol", "BTC-USD", "--entry", entry, "--stop", stop]
+        if target is not None:
+            argv += ["--target", target]
+        code, out = run_main(*argv, *extra, "--json")
+        return code, json.loads(out)
+
+    def test_size_position_fractional_with_fees(self):
+        sz = risk.size_position("long", 100000.0, 99500.0, 101000.0, SETTINGS, market=tc.CRYPTO)
+        # loss per BTC = 500 + 0.6% x (100000 + 99500) = 1697 -> $50 / 1697 = 0.02946375 (floored to 1e-8)
+        self.assertEqual((sz["shares"], sz["market"], sz["step"], sz["fee_pct"]), (0.02946375, "crypto", 1e-8, 0.6))
+        self.assertEqual((sz["risk_used"], sz["fees_at_stop"], sz["max_loss"]), (14.73, 35.27, 50.0))
+        self.assertEqual((sz["fees_r"], sz["rr"], sz["rr_after_fees"], sz["fees_at_target"]), (2.394, 2.0, -0.1214, 35.53))
+        self.assertEqual(sz["limits"], {"risk": 0.02946375, "max_position_pct": 0.0625, "buying_power": 0.25})
+        us = risk.size_position("long", 364.18, 358.32, 370.04, SETTINGS)       # stocks unchanged
+        self.assertEqual((us["shares"], us["max_loss"], us["market"]), (8, 46.88, "us"))
+        self.assertNotIn("fees_r", us)
+
+    def test_card_shows_the_fractional_order_and_what_fees_cost(self):
+        code, d = self.btc()
+        self.assertEqual(code, 0)
+        self.assertEqual((d["order"], d["shares"], d["unit"], d["tick"]), ("BUY 0.02946375 BTC-USD", 0.02946375, "BTC", 0.01))
+        self.assertTrue(d["budget"]["ok"])
+        self.assertTrue(any(w.startswith("round-trip fees ≈ 2.39R at these levels") for w in d["warnings"]), d["warnings"])
+        self.assertTrue(any("after fees the R:R is -0.12" in w for w in d["warnings"]))
+        self.assertTrue(any(n.startswith("fees: 0.6% per fill (paper, crypto_fee_pct) · round-trip fees ≈ 2.39R")
+                            for n in d["notes"]), d["notes"])
+        self.assertFalse(any("pattern-day-trader" in w for w in d["warnings"]))  # FINRA's PDT rule is about stocks
+        code, text = run_main("size", "--symbol", "BTC-USD", "--entry", "100000", "--stop", "99500", "--target", "101000")
+        self.assertIn("BUY 0.02946375 BTC-USD @ 100,000.00 · STOP 99,500.00 · TARGET 101,000.00 · PAPER · "
+                      "Coinbase prices", text)
+        self.assertIn("  risk/BTC      $500.00 (0.50% of price) + $1,197.00 fees = $1,697.00", text)
+        self.assertIn("  $ at risk     $50.00 ($14.73 + $35.27 fees at the stop) of a $50.00 budget", text)
+        self.assertIn("/ $1,697.00 per BTC (stop distance + fees) = 0.02946375 BTC (max position allows 0.0625)", text)
+        self.assertIn("Next: budget skill check (--symbol BTC-USD --risk 50.00), then a paper broker ticket for "
+                      "0.02946375 BTC-USD", text)
+
+    def test_size_step_comes_from_the_product_and_falls_back_offline(self):
+        eth = self.home / "ethfx"
+        write_fixture(eth, f"{tc.COINBASE_API}/products",
+                      [{"id": "ETH-USD", "base_currency": "ETH", "quote_currency": "USD", "base_increment": "0.0001",
+                        "quote_increment": "0.01", "status": "online"}])
+        with mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(eth)}):
+            code, out = run_main("size", "--symbol", "ETH-USD", "--entry", "3500", "--stop", "3450", "--json")
+        d = json.loads(out)
+        self.assertEqual((d["shares"], d["step"], d["order"]), (0.5452, 0.0001, "BUY 0.5452 ETH-USD"))  # 50 / 91.7
+        empty = self.home / "nofx"
+        empty.mkdir()
+        with mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(empty)}):
+            code, out = run_main("size", "--symbol", "BTC-USD", "--entry", "100000", "--stop", "99500", "--json")
+        d = json.loads(out)
+        self.assertEqual((code, d["shares"], d["step"]), (0, 0.02946375, 1e-8))
+        self.assertTrue(any("Coinbase product rules unavailable" in n for n in d["notes"]))
+        code, out = run_main("size", "--symbol", "BTC-USD", "--entry", "100000.005", "--stop", "99500", "--json")
+        self.assertTrue(any("not on BTC-USD's price tick 0.01" in n for n in json.loads(out)["notes"]))
+
+    def test_save_stores_the_fractional_sizing_the_broker_and_budget_read(self):
+        code, d = self.btc("--save")
+        self.assertEqual((code, d["saved"]), (0, True))
+        sec = tc.load_plan("BTC-USD")["sizing"]
+        self.assertEqual((sec["shares"], sec["market"], sec["max_loss"], sec["fee_pct"], sec["step"]),
+                         (0.02946375, "crypto", 50.0, 0.6, 1e-8))
+
+    def test_daily_budget_counts_fees_and_offers_a_fractional_fit(self):
+        tc.save_ledger({"tickets": [], "trades": [
+            trade("L", symbol="ETH-USD", pnl=-120.0, qty=1.0, entry=3500.0, stop=3400.0,
+                  opened="2026-10-31T01:00:00+00:00", closed="2026-10-31T02:00:00+00:00")]})
+        code, d = self.btc()
+        self.assertFalse(d["budget"]["ok"])
+        self.assertEqual(d["budget"]["max_shares_now"], 0.01767825)          # $30 left / $1,697 per BTC
+        self.assertIn("daily budget: at most 0.01767825 BTC ($30.00 risk incl. fees) fit what is left today",
+                      d["warnings"])
+        # that loss was on the UTC day 2026-10-31 (still 10-30 in New York): a stock check does not see it
+        code, out = run_main("size", "--entry", "364.18", "--stop", "358.32", "--json")
+        self.assertTrue(json.loads(out)["budget"]["ok"])
+
+    def test_open_crypto_risk_includes_fees_in_show(self):
+        tc.save_ledger({"tickets": [], "trades": [
+            {"id": "TRADE-20261031-001", "symbol": "BTC-USD", "market": "crypto", "side": "long", "qty": 0.01,
+             "entry_price": 101234.56, "stop": 99000.0, "status": "open", "fee_pct": 0.6,
+             "opened_at": "2026-10-31T04:41:00+00:00"}]})
+        code, out = run_main("show", "--market", "crypto", "--json")
+        d = json.loads(out)
+        # 22.3456 of price risk + 0.6% x (101234.56 + 99000) x 0.01 = 12.0141 of fees at the stop
+        self.assertEqual((d["today"]["open_risk"], d["open_positions"][0]["risk"], d["market"]), (34.36, 34.36, "crypto"))
+        code, text = run_main("show", "--market", "crypto")
+        self.assertIn("TODAY 2026-10-31 (the UTC day, paper ledger)", text)
+        self.assertIn("  open risk     $34.36 across 1 open position", text)
+
+    def test_leverage_shorts_and_fee_setting(self):
+        code, d = self.btc("--leverage", "2", target=None)
+        self.assertTrue(any(w.startswith("spot crypto is paid in full - 2x buying power") for w in d["warnings"]))
+        code, d = self.btc(entry="3500", stop="3550", target=None)
+        self.assertEqual(d["side"], "short")
+        self.assertTrue(any("spot crypto cannot be sold short on Coinbase" in n for n in d["notes"]))
+        code, out = run_main("config", "--crypto-fee-pct", "0.4")
+        self.assertIn("  crypto fees   0.4% per fill (paper; Coinbase prices)", out)
+        self.assertEqual(tc.load_settings()["crypto_fee_pct"], 0.4)
+        code, d = self.btc()
+        self.assertEqual((d["fee_pct"], d["shares"]), (0.4, 0.0385208))     # 50 / (500 + 0.4% x 199500)
+        with self.assertRaises(ValueError):
+            run_main("config", "--crypto-fee-pct", "60")
+        code, out = run_main("config")
+        self.assertIn("crypto fees", out)                                 # shown once it differs from the default
+        tc.save_settings({"crypto_fee_pct": 0.6})
+        code, out = run_main("config")
+        self.assertNotIn("crypto fees", out)                               # the stock card is unchanged
+
+
 class CliTests(TempHomeTestCase):
     NOW = "2026-10-30T10:15"
 
@@ -603,6 +725,17 @@ class CliTests(TempHomeTestCase):
             r = run_cli(SCRIPT, *bad, env=env)
             self.assertEqual(r.returncode, 1, (bad, r.stderr))
             self.assertNotIn("Traceback", r.stderr)
+
+    def test_cli_crypto_size_on_a_saturday(self):
+        fx = self.home / "fx"
+        write_coinbase_products(fx)
+        env = dict(self._env(fx), DAYTRADER_NOW="2026-10-31T04:40")
+        r = run_cli(SCRIPT, "size", "BTC-USD", "--entry", "100000", "--stop", "99500", "--target", "101000", "--save",
+                    env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("BUY 0.02946375 BTC-USD @ 100,000.00", r.stdout)
+        self.assertIn("round-trip fees ≈ 2.39R at these levels", r.stdout)
+        self.assertEqual(tc.load_plan("BTC-USD")["sizing"]["shares"], 0.02946375)
 
 
 if __name__ == "__main__":

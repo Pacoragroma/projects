@@ -14,6 +14,10 @@ checks is not missed. A repeating alert fires at most once per bar and re-arms o
 5-minute bar closes back across the level (by --rearm-pct, default 0.25%); --once alerts switch off
 after firing.
 
+Crypto pairs (BTC-USD, ETH-USD, ...) use Coinbase Exchange 5-minute candles and work 24/7: each
+alert runs in its own symbol's market (a crypto "session" - for VWAP and the previous close - is
+the UTC day, and its times print in UTC), so one check can mix stock and crypto alerts.
+
 Usage:
   python3 scripts/alerts.py add TSLA --above 370.04 --note "plan target"
   python3 scripts/alerts.py add TSLA --below 358.32 --once
@@ -25,6 +29,7 @@ Usage:
   python3 scripts/alerts.py check --json
   python3 scripts/alerts.py watch --interval 60 --max-minutes 120 --bell
   python3 scripts/alerts.py remove ALR-20261030-001 | --symbol TSLA | --fired | --all
+  python3 scripts/alerts.py add BTC-USD --below 98000 --once     # crypto: 24/7, UTC days
 
 Exit codes: 0 ok, 1 bad input/state, 2 data source unreachable, 130 watch stopped with Ctrl-C.
 State: $DAYTRADER_HOME/alerts.json.
@@ -38,12 +43,13 @@ import trader_common as tc  # noqa: E402
 
 import argparse  # noqa: E402
 import copy  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
 import json  # noqa: E402
 import math  # noqa: E402
 import re  # noqa: E402
 import time  # noqa: E402
 from datetime import datetime  # noqa: E402
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple  # noqa: E402
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple  # noqa: E402
 
 ALERTS_FILE = "alerts.json"
 BAR_SECONDS = 300               # 5-minute bars
@@ -54,6 +60,15 @@ FAR_LEVEL_PCT = 50.0            # warn (typo?) when a level is this far from the
 PLAN_ROLES = ("entry", "stop", "target")
 VWAP_DIRECTIONS = ("any", "above", "below")
 EPS = 1e-9
+CRYPTO_CONTEXT_RANGE = "2d"     # today's UTC day + the previous one (its close), ~2-3 Coinbase pages
+
+
+def alert_market(a: Dict[str, Any]) -> tc.Market:
+    """The market an alert's symbol trades in (BTC-USD -> crypto); its stored `market` if no symbol."""
+    sym = str(a.get("symbol") or "").strip()
+    if sym:
+        return tc.market_for(sym)
+    return tc.MARKETS.get(str(a.get("market") or "").lower(), tc.US)
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +264,8 @@ def make_alert(symbol: str, kind: str, ctx: Dict[str, Any], now: datetime, exist
     now_ts = int(now.timestamp())
     last = float(ctx["last"])
     a: Dict[str, Any] = {
-        "id": tc.new_id("ALR", existing_ids), "symbol": symbol.upper(), "kind": kind,
+        "id": tc.new_id("ALR", existing_ids), "symbol": symbol.upper(), "market": tc.market_for(symbol).key,
+        "kind": kind,
         "once": bool(once), "note": note, "source": source, "plan_role": plan_role,
         "rearm_pct": float(rearm_pct), "status": "active",
         "created_at": now.isoformat(timespec="seconds"), "created_ts": now_ts,
@@ -322,7 +338,8 @@ def _effective_range(a: Dict[str, Any], b: tc.Bar) -> Tuple[float, float, bool]:
 
 
 def _event(a: Dict[str, Any], b: tc.Bar, complete: bool, **extra: Any) -> Dict[str, Any]:
-    e = {"id": a["id"], "symbol": a["symbol"], "kind": a["kind"], "condition": condition_text(a),
+    e = {"id": a["id"], "symbol": a["symbol"], "market": alert_market(a).key, "kind": a["kind"],
+         "condition": condition_text(a),
          "date": b.date, "bar_time": b.time, "bar_ts": b.ts, "bar_complete": complete,
          "bar": {"open": b.open, "high": b.high, "low": b.low, "close": b.close},
          "note": a.get("note") or "", "once": a["once"], "source": a.get("source"),
@@ -469,7 +486,7 @@ def waiting_reason(a: Dict[str, Any]) -> str:
     """What an alert is waiting for, in words."""
     if a.get("status") != "active":
         f = (a.get("fires") or [None])[-1]
-        when = f" {f['date']} {f['bar_time']} ET" if f else ""
+        when = f" {f['date']} {f['bar_time']} {alert_market(a).tz_label}" if f else ""
         return f"fired{when}; one-shot, now off"
     if a["kind"] == "vwap_cross":
         d = a.get("direction", "any")
@@ -496,8 +513,8 @@ def waiting_reason(a: Dict[str, Any]) -> str:
 def summary_row(a: Dict[str, Any]) -> Dict[str, Any]:
     d = distance_pct(a)
     last_fire = (a.get("fires") or [None])[-1]
-    return {"id": a["id"], "symbol": a["symbol"], "kind": a["kind"], "condition": condition_text(a),
-            "status": status_text(a), "once": a["once"], "last_price": a.get("last_price"),
+    return {"id": a["id"], "symbol": a["symbol"], "market": alert_market(a).key, "kind": a["kind"],
+            "condition": condition_text(a), "status": status_text(a), "once": a["once"], "last_price": a.get("last_price"),
             "distance_pct": None if d is None else round(d, 2), "waiting_for": waiting_reason(a),
             "fire_count": a.get("fire_count", 0), "last_fired": last_fire, "note": a.get("note") or "",
             "source": a.get("source"), "plan_role": a.get("plan_role"),
@@ -663,9 +680,12 @@ def parse_symbol(raw: str) -> str:
     return sym
 
 
-def range_for(cursor_ts: int, now_ts: int) -> str:
-    """Smallest Yahoo 5m range that reaches back to `cursor_ts`."""
+def range_for(cursor_ts: int, now_ts: int, m: Optional[tc.Market] = None) -> str:
+    """Smallest 5m range that reaches back to `cursor_ts` (Yahoo's 5d/1mo/60d; crypto: whole days,
+    since every calendar day trades and Coinbase pages by 300 candles)."""
     days = (now_ts - cursor_ts) / 86400.0
+    if (m or tc.market()).every_day:
+        return f"{min(60, max(2, int(math.ceil(days)) + 1))}d"
     if days <= 4:
         return "5d"
     if days <= 25:
@@ -678,14 +698,38 @@ def fetch(symbol: str, range_: str = "5d", ttl: Optional[float] = None) -> Tuple
         bars, meta = tc.fetch_bars(symbol, "5m", range_, ttl=ttl)
     except tc.FetchError as e:
         msg = str(e)
+        if tc.is_crypto_symbol(symbol) and ("HTTP 404" in msg or "no candles" in msg):
+            raise ValueError(f"{symbol}: Coinbase has no candles for this pair (not a listed product?)") from e
         if "HTTP 404" in msg or "Yahoo: Not Found" in msg:
             raise ValueError(f"{symbol}: Yahoo has no chart for this symbol (unknown or delisted ticker?)") from e
         raise
     return bars, meta
 
 
+@contextmanager
+def same_instant(now: datetime, pin: bool = True) -> Iterator[None]:
+    """While checking a mix of markets, pin a naive $DAYTRADER_NOW (read in each active market's own
+    zone) to the one instant the check runs at, so every symbol sees the same 'now'."""
+    old = os.environ.get("DAYTRADER_NOW")
+    if old is None or not pin:
+        yield
+        return
+    os.environ["DAYTRADER_NOW"] = now.isoformat()
+    try:
+        yield
+    finally:
+        os.environ["DAYTRADER_NOW"] = old
+
+
+def open_at(m: tc.Market, ts: float) -> bool:
+    """Is market `m` open at unix time `ts`? (US: weekday session hours; crypto: always.)"""
+    with tc.market_scope(m):
+        return tc.is_market_open(tc.to_local(ts))
+
+
 def context_for(symbol: str) -> Tuple[Dict[str, Any], datetime]:
-    bars, meta = fetch(symbol, "5d")
+    """Market facts for a new alert. The active market must be the symbol's (tc.use_market_for)."""
+    bars, meta = fetch(symbol, CRYPTO_CONTEXT_RANGE if tc.is_crypto_symbol(symbol) else "5d")
     now = tc.now_et()
     try:
         return market_context(bars, quote_from_meta(meta), now), now
@@ -693,14 +737,27 @@ def context_for(symbol: str) -> Tuple[Dict[str, Any], datetime]:
         raise ValueError(f"{symbol}: {e}") from None
 
 
+def check_market(alerts: Sequence[Dict[str, Any]]) -> tc.Market:
+    """The clock a check reports in: the alerts' market when they share one, else $DAYTRADER_MARKET/US."""
+    found = {alert_market(a) for a in alerts}
+    return found.pop() if len(found) == 1 else tc.market_for(None)
+
+
 def check(symbols: Optional[Sequence[str]] = None, ttl: Optional[float] = None) -> Dict[str, Any]:
-    """Fetch each symbol once, evaluate its active alerts, save state, return the report."""
+    """Fetch each symbol once, evaluate its active alerts, save state, return the report.
+
+    Each symbol is fetched and evaluated in its own market (stocks: ET sessions; crypto: 24/7, UTC
+    days); the report's own clock is check_market()'s, which this makes the active market."""
     alerts = load_alerts()
     want = {s.upper() for s in symbols} if symbols else None
     active = [a for a in alerts if a.get("status") == "active" and (want is None or a["symbol"] in want)]
+    ref = tc.set_market(check_market(active))   # before now_et: $DAYTRADER_NOW is read in its zone
     now = tc.now_et()
     now_ts = int(now.timestamp())
-    report: Dict[str, Any] = {"as_of": now.isoformat(timespec="seconds"), "market_open": tc.is_market_open(now),
+    markets = sorted({alert_market(a) for a in active} or {ref}, key=lambda m: m.key == "crypto")
+    opened = {m.key: open_at(m, now_ts) for m in markets}
+    report: Dict[str, Any] = {"as_of": now.isoformat(timespec="seconds"), "tz": ref.tz_label,
+                              "market_open": any(opened.values()), "markets": opened,
                               "checked": len(active), "fired": [], "symbols": {}, "errors": {},
                               "notes": [], "alerts": [], "disclaimer": tc.DISCLAIMER}
     by_sym: Dict[str, List[Dict[str, Any]]] = {}
@@ -708,41 +765,10 @@ def check(symbols: Optional[Sequence[str]] = None, ttl: Optional[float] = None) 
         by_sym.setdefault(a["symbol"], []).append(a)
     updated: Dict[str, Dict[str, Any]] = {}
     fetch_errors: List[str] = []
-    for sym, group in by_sym.items():
-        rng = range_for(min(int(a["cursor"]) for a in group), now_ts)
-        try:
-            bars, meta = fetch(sym, rng, ttl)
-        except (tc.FetchError, ValueError) as e:
-            report["errors"][sym] = str(e)
-            if isinstance(e, tc.FetchError):
-                fetch_errors.append(str(e))
-            continue
-        quote = quote_from_meta(meta)
-        prepared = prepare_bars(bars, quote, now_ts)
-        info: Dict[str, Any] = {"range": rng, "bars": len(prepared),
-                                "last": latest_price(prepared, quote, now_ts),
-                                "last_bar": prepared[-1].time if prepared else None}
-        minute = now.hour * 60 + now.minute
-        if (report["market_open"] and minute >= tc.MARKET_OPEN + STALE_MINUTES and prepared
-                and prepared[-1].ts + BAR_SECONDS < now_ts - STALE_MINUTES * 60):
-            report["notes"].append(f"{sym}: newest bar is {prepared[-1].date} {prepared[-1].time} ET - "
-                                   f"data delayed, trading halted, or a market holiday?")
-        report["symbols"][sym] = info
-        plan, plan_ok = None, any(a.get("source") == "plan" for a in group)
-        if plan_ok:
-            try:
-                plan = tc.load_plan(sym)
-            except tc.StateError as e:
-                plan_ok = False
-                report["notes"].append(f"{sym}: could not read the saved plan ({e})")
-        for a in group:
-            res = evaluate(a, prepared, quote, now)
-            updated[a["id"]] = res["alert"]
-            report["fired"].extend(res["events"])
-            report["notes"].extend(n for n in res["notes"] if n not in report["notes"])
-            drift = plan_drift(res["alert"], plan) if plan_ok else None
-            if drift:
-                report["notes"].append(drift)
+    with same_instant(now, pin=len(markets) > 1):
+        for sym, group in by_sym.items():
+            with tc.market_scope(sym):
+                _check_symbol(sym, group, tc.to_local(now_ts), ttl, report, updated, fetch_errors)
     if by_sym and not report["symbols"]:
         if fetch_errors:
             raise tc.FetchError(fetch_errors[0])
@@ -757,6 +783,51 @@ def check(symbols: Optional[Sequence[str]] = None, ttl: Optional[float] = None) 
     return report
 
 
+def _check_symbol(sym: str, group: List[Dict[str, Any]], now: datetime, ttl: Optional[float],
+                  report: Dict[str, Any], updated: Dict[str, Dict[str, Any]], fetch_errors: List[str]) -> None:
+    """One symbol of a check, in its own (active) market: fetch once, evaluate its alerts into
+    `updated` / `report`."""
+    now_ts = int(now.timestamp())
+    m = tc.market()
+    rng = range_for(min(int(a["cursor"]) for a in group), now_ts, m)
+    try:
+        bars, meta = fetch(sym, rng, ttl)
+    except (tc.FetchError, ValueError) as e:
+        report["errors"][sym] = str(e)
+        if isinstance(e, tc.FetchError):
+            fetch_errors.append(str(e))
+        return
+    quote = quote_from_meta(meta)
+    prepared = prepare_bars(bars, quote, now_ts)
+    info: Dict[str, Any] = {"range": rng, "bars": len(prepared),
+                            "last": latest_price(prepared, quote, now_ts),
+                            "last_bar": prepared[-1].time if prepared else None}
+    if m.every_day:
+        info["market"] = m.key
+    minute = now.hour * 60 + now.minute
+    if (tc.is_market_open(now) and minute >= tc.MARKET_OPEN + STALE_MINUTES and prepared
+            and prepared[-1].ts + BAR_SECONDS < now_ts - STALE_MINUTES * 60):
+        why = ("data delayed, no recent trades, or the pair is halted?" if m.every_day else
+               "data delayed, trading halted, or a market holiday?")
+        report["notes"].append(f"{sym}: newest bar is {prepared[-1].date} {prepared[-1].time} {m.tz_label} - {why}")
+    report["symbols"][sym] = info
+    plan, plan_ok = None, any(a.get("source") == "plan" for a in group)
+    if plan_ok:
+        try:
+            plan = tc.load_plan(sym)
+        except tc.StateError as e:
+            plan_ok = False
+            report["notes"].append(f"{sym}: could not read the saved plan ({e})")
+    for a in group:
+        res = evaluate(a, prepared, quote, now)
+        updated[a["id"]] = res["alert"]
+        report["fired"].extend(res["events"])
+        report["notes"].extend(n for n in res["notes"] if n not in report["notes"])
+        drift = plan_drift(res["alert"], plan) if plan_ok else None
+        if drift:
+            report["notes"].append(drift)
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -767,27 +838,35 @@ def _clock(ts: int, today: str) -> str:
 
 
 def _window(e: Dict[str, Any], now: Optional[datetime] = None) -> str:
-    """'10:05-10:10 ET' for the bar an event came from (cut at now for the bar still forming)."""
-    now = now or tc.now_et()
+    """'10:05-10:10 ET' for the bar an event came from (cut at now for the bar still forming).
+    Times are in the active market's clock (event_line activates the event's market)."""
+    now = tc.to_local((now or tc.now_et()).timestamp())
     today = now.strftime("%Y-%m-%d")
     end = e["bar_ts"] + BAR_SECONDS
     if not e.get("bar_complete"):
         end = min(end, int(now.timestamp()))
     a, b = _clock(e["bar_ts"], today), tc.to_et(end).strftime("%H:%M")
-    return f"{a}-{b} ET"
+    return f"{a}-{b} {tc.tz_label()}"
 
 
 def event_line(e: Dict[str, Any], now: Optional[datetime] = None) -> str:
+    """One FIRED line, with times in the event's own market clock (ET for stocks, UTC for crypto)."""
     now = now or tc.now_et()
-    today = now.strftime("%Y-%m-%d")
+    with tc.market_scope(tc.MARKETS.get(e.get("market") or "") or tc.market_for(e["symbol"])):
+        return _event_line(e, now)
+
+
+def _event_line(e: Dict[str, Any], now: datetime) -> str:
+    now = tc.to_local(now.timestamp())
+    today, tz = now.strftime("%Y-%m-%d"), tc.tz_label()
     if e["kind"] == "vwap_cross":
         what = (f"closed {e['leg']} VWAP {tc.fmt_price(e['vwap'])} at "
-                f"{_clock(e['bar_ts'] + BAR_SECONDS, today)} ET (5m close {tc.fmt_price(e['price'])})")
+                f"{_clock(e['bar_ts'] + BAR_SECONDS, today)} {tz} (5m close {tc.fmt_price(e['price'])})")
     else:
         word = "above" if e["leg"] == "up" else "below"
         if e["how"] == "gap":
             what = (f"gapped {word} {tc.fmt_price(e['level'])} - opened {tc.fmt_price(e['price'])} "
-                    f"at {_clock(e['bar_ts'], today)} ET")
+                    f"at {_clock(e['bar_ts'], today)} {tz}")
         else:
             ext = e["bar"]["high"] if e["leg"] == "up" else e["bar"]["low"]
             what = (f"traded {word} {tc.fmt_price(e['level'])} {_window(e, now)} "
@@ -828,13 +907,23 @@ def alerts_table(rows: Sequence[Dict[str, Any]], with_reason: bool = True) -> st
     return t
 
 
+def _as_of(rep: Dict[str, Any]) -> Tuple[datetime, str]:
+    """A report's time in its own clock, and that clock's label ('ET' / 'UTC')."""
+    tz = rep.get("tz") or tc.tz_label()
+    return tc.to_local(datetime.fromisoformat(rep["as_of"]).timestamp(), tc.CRYPTO if tz == "UTC" else tc.US), tz
+
+
 def render_check(rep: Dict[str, Any]) -> str:
-    when = tc.parse_et(rep["as_of"]).strftime("%H:%M")
+    now, tz = _as_of(rep)
+    when = now.strftime("%H:%M")
     syms = len(rep["symbols"]) + len(rep["errors"])
-    head = (f"ALERTS CHECK · {when} ET · {rep['checked']} active alert{'s' if rep['checked'] != 1 else ''} "
+    head = (f"ALERTS CHECK · {when} {tz} · {rep['checked']} active alert{'s' if rep['checked'] != 1 else ''} "
             f"on {syms} symbol{'s' if syms != 1 else ''}")
+    opened = rep.get("markets") or {}
     if not rep["market_open"]:
         head += " · market closed"
+    elif opened.get("us") is False and opened.get("crypto"):
+        head += " · US market closed (crypto trades 24/7)"
     lines = [head]
     if rep["checked"] == 0:
         lines.append("No active alerts. Add one: python3 scripts/alerts.py add TSLA --above 370.04")
@@ -861,10 +950,18 @@ def render_list(rows: Sequence[Dict[str, Any]]) -> str:
         return "No alerts set. Add one: python3 scripts/alerts.py add TSLA --above 370.04"
     active = sum(1 for r in rows if r["status"] != "fired")
     fired = len(rows) - active
-    checked = max((r.get("last_checked") or "" for r in rows), default="")
+    stamps = []
+    for r in rows:
+        try:
+            stamps.append((datetime.fromisoformat(r["last_checked"]).timestamp(),
+                           tc.MARKETS.get(r.get("market") or "") or tc.market_for(r["symbol"])))
+        except (KeyError, TypeError, ValueError):
+            continue
     head = f"ALERTS · {active} active" + (f", {fired} fired (one-shot)" if fired else "")
-    if checked:
-        head += f" · prices as of {tc.parse_et(checked).strftime('%m-%d %H:%M')} ET (run check to refresh)"
+    if stamps:
+        ts, m = max(stamps, key=lambda x: x[0])
+        head += (f" · prices as of {tc.to_local(ts, m).strftime('%m-%d %H:%M')} {m.tz_label} "
+                 "(run check to refresh)")
     return head + "\n" + alerts_table(rows)
 
 
@@ -896,6 +993,7 @@ def render_added(res: Dict[str, Any]) -> str:
 
 def cmd_add(args: argparse.Namespace) -> Dict[str, Any]:
     sym = parse_symbol(args.symbol)
+    mkt = tc.use_market_for(sym)   # before now_et: $DAYTRADER_NOW is read in the market's zone
     note = (args.note or "").strip()
     if len(note) > 200:
         raise ValueError("--note is limited to 200 characters")
@@ -929,7 +1027,8 @@ def cmd_add(args: argparse.Namespace) -> Dict[str, Any]:
     load_alerts()  # fail on a corrupt state file before downloading anything
     ctx, now = context_for(sym)
     if kind == "vwap_cross" and not ctx["has_volume"]:
-        raise ValueError(f"{sym}: Yahoo reports no volume for it (an index or FX pair?), so there is no "
+        src = "Coinbase" if mkt.every_day else "Yahoo"
+        raise ValueError(f"{sym}: {src} reports no volume for it (an index or FX pair?), so there is no "
                          f"VWAP to cross - use --above/--below or --pct-move instead")
     alerts = load_alerts()
     warnings: List[str] = []
@@ -954,10 +1053,11 @@ def cmd_add(args: argparse.Namespace) -> Dict[str, Any]:
         warnings.append(f"{sym} {tc.fmt_price(ctx['last'])} is already outside the band around "
                         f"{tc.fmt_price(new['ref_price'])}; that side waits for a move back inside")
     if kind == "vwap_cross" and not new.get("vwap_side"):
-        warnings.append("too early in the session to say which side of VWAP price is on; the next "
+        session = "UTC day" if mkt.every_day else "session"
+        warnings.append(f"too early in the {session} to say which side of VWAP price is on; the next "
                         "completed 5m bars set it" if ctx["market_open"] else
                         "market closed: the next session's first two 5m bars set the side of VWAP "
-                        "(earliest cross 09:45 ET)")
+                        f"(earliest cross {tc.hhmm(tc.MARKET_OPEN + 15)} {mkt.tz_label})")
     alerts.append(new)
     save_alerts(alerts)
     return {"added": [new], "duplicates": [], "warnings": warnings}
@@ -971,6 +1071,7 @@ def cmd_from_plan(args: argparse.Namespace) -> Dict[str, Any]:
     rearm = DEFAULT_REARM_PCT if args.rearm_pct is None else args.rearm_pct
     if not (math.isfinite(rearm) and 0 <= rearm <= 5):
         raise ValueError("--rearm-pct must be between 0 and 5 (percent)")
+    tc.use_market_for(sym)   # before now_et: $DAYTRADER_NOW is read in the market's zone
     plan = tc.load_plan(sym)
     if not plan:
         raise ValueError(f"no saved plan for {sym} - make one with the exit skill "
@@ -1034,12 +1135,13 @@ def render_removed(res: Dict[str, Any]) -> str:
 
 
 def _status_line(rep: Dict[str, Any]) -> str:
-    when = tc.parse_et(rep["as_of"]).strftime("%H:%M")
+    now, tz = _as_of(rep)
+    when = now.strftime("%H:%M")
     armed = [r for r in rep["alerts"] if r["status"] != "waiting"]
-    parts = [f"{when} ET", f"{rep['active']} active"]
-    now = tc.parse_et(rep["as_of"])
-    if now.weekday() < 5 and now.hour * 60 + now.minute < tc.MARKET_OPEN:
-        parts.append("pre-market (alerts use regular-session prices from 09:30 ET)")
+    parts = [f"{when} {tz}", f"{rep['active']} active"]
+    us_alerts = "us" in (rep.get("markets") or {"us": True})
+    if us_alerts and tz == "ET" and now.weekday() < 5 and now.hour * 60 + now.minute < tc.US.open_min:
+        parts.append(f"pre-market (alerts use regular-session prices from {tc.hhmm(tc.US.open_min)} ET)")
     parts.append(f"{len(rep['fired'])} fired" if rep["fired"] else "nothing new")
     near = [r for r in armed if r["distance_pct"] is not None and r["kind"] != "vwap_cross"]
     if near:
@@ -1050,8 +1152,18 @@ def _status_line(rep: Dict[str, Any]) -> str:
     return " · ".join(parts)
 
 
-def market_done_for_day(now: datetime) -> bool:
-    return now.weekday() >= 5 or now.hour * 60 + now.minute >= tc.MARKET_CLOSE
+def market_done_for_day(now: datetime, m: Optional[tc.Market] = None) -> bool:
+    """No more prices today: US after the close or on a weekend; crypto (24/7) never."""
+    m = m or tc.market()
+    if m.every_day:
+        return False
+    return now.weekday() >= 5 or now.hour * 60 + now.minute >= m.close_min
+
+
+def markets_done(markets: Sequence[tc.Market], now: datetime) -> bool:
+    """Every one of `markets` is done for the day at `now` (one instant, read in each market's clock)."""
+    ts = now.timestamp()
+    return all(market_done_for_day(tc.to_local(ts, m), m) for m in markets)
 
 
 def watch(symbols: Optional[Sequence[str]], interval: float, max_minutes: float, as_json: bool,
@@ -1060,10 +1172,13 @@ def watch(symbols: Optional[Sequence[str]], interval: float, max_minutes: float,
     """Re-run check every `interval` seconds; print fires as they happen."""
     alerts = load_alerts()
     want = {s.upper() for s in symbols} if symbols else None
-    if not any(a.get("status") == "active" and (want is None or a["symbol"] in want) for a in alerts):
+    watched = [a for a in alerts if a.get("status") == "active" and (want is None or a["symbol"] in want)]
+    if not watched:
         raise ValueError("no active alerts to watch - add one first (alerts.py add TSLA --above 370.04)")
     started = clock()
-    closed_at_start = market_done_for_day(tc.now_et())
+    markets = sorted({alert_market(a) for a in watched}, key=lambda m: m.key)
+    tc.set_market(check_market(watched))   # the clock check() reports in; $DAYTRADER_NOW is read in it
+    closed_at_start = markets_done(markets, tc.now_et())
     fired: List[Dict[str, Any]] = []
     polls = failures = 0
     stopped = "max-minutes"
@@ -1082,7 +1197,8 @@ def watch(symbols: Optional[Sequence[str]], interval: float, max_minutes: float,
                 if failures >= 3:     # down mid-run: still print the summary, then exit 2
                     stopped, data_error = "data error", e
                     break
-                print(f"{tc.now_et().strftime('%H:%M')} ET  data error (retrying): {e}", file=sys.stderr, flush=True)
+                print(f"{tc.now_et().strftime('%H:%M')} {tc.tz_label()}  data error (retrying): {e}",
+                      file=sys.stderr, flush=True)
             else:
                 failures = 0
                 last_rep = rep
@@ -1102,7 +1218,7 @@ def watch(symbols: Optional[Sequence[str]], interval: float, max_minutes: float,
                 if rep["active"] == 0:
                     stopped = "no active alerts left"
                     break
-            if closed_at_start or market_done_for_day(tc.now_et()):
+            if closed_at_start or markets_done(markets, tc.now_et()):
                 stopped = "market closed"
                 break
             if clock() - started + interval > max_minutes * 60 + 1:
@@ -1138,12 +1254,13 @@ def watch(symbols: Optional[Sequence[str]], interval: float, max_minutes: float,
 
 def build_parser() -> argparse.ArgumentParser:
     p = tc.make_parser("Price alerts for the day-trading desk: levels, % moves and VWAP crosses, "
-                       "checked against Yahoo 5-minute bars so touches between checks are not missed.")
+                       "checked against 5-minute bars (Yahoo for stocks, Coinbase for crypto pairs, 24/7) "
+                       "so touches between checks are not missed.")
     sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
     sub.required = True
 
     a = sub.add_parser("add", help="add an alert: --above X | --below X | --pct-move P | --vwap-cross")
-    a.add_argument("symbol", help="ticker, e.g. TSLA")
+    a.add_argument("symbol", help="ticker, e.g. TSLA, or a crypto pair, e.g. BTC-USD")
     g = a.add_mutually_exclusive_group(required=True)
     g.add_argument("--above", type=float, metavar="PRICE", help="fire when price trades at or above PRICE")
     g.add_argument("--below", type=float, metavar="PRICE", help="fire when price trades at or below PRICE")

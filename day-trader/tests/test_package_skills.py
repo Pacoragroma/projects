@@ -141,6 +141,22 @@ class BuildTests(unittest.TestCase):
         self.assertTrue(any("trader_common.py is missing" in p for p in problems), problems)
 
 
+class PluginManifestTests(unittest.TestCase):
+    """The plugin manifest and its marketplace entry describe the same release."""
+
+    def test_plugin_and_marketplace_entry_agree(self):
+        plugin = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        market = json.loads((ROOT.parent / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+        entry = next(p for p in market["plugins"] if p["name"] == plugin["name"])
+        self.assertEqual(entry["source"], "./" + ROOT.name)
+        for key in ("version", "description", "license", "keywords"):
+            self.assertEqual(entry[key], plugin[key], key)
+        self.assertRegex(plugin["version"], r"^\d+\.\d+\.\d+$")
+        self.assertEqual(plugin["version"], "1.1.0")
+        for words in ("11 Claude skills", "crypto", "Paper trading only."):
+            self.assertIn(words, plugin["description"])
+        self.assertIn("crypto", plugin["keywords"])
+
 class PackReadmeTests(unittest.TestCase):
     """Keep README.md honest as the skills change."""
 

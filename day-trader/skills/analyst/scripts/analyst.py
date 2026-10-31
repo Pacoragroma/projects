@@ -7,10 +7,14 @@ brief   Trend (price vs the 20/50-day SMAs, 20-day regression slope), key levels
         available, else vs the 20-day average), today's gap, and SEC context (company, shares
         outstanding, the last 30 days of filings: 8-K items, 10-Q/10-K, possible dilution,
         insider Form 4s). Daily bars are required; 5-minute bars and SEC data are optional.
+        Crypto pairs (BTC-USD): Coinbase candles, a "day" is a UTC day (levels = the prior UTC
+        day), no gap (24/7 trading) and SEC is not applicable (not asked).
 review  Analytics of the closed paper trades in ledger.json (written by the broker skill):
         win rate, average win/loss in $ and R, profit factor, expectancy, max drawdown,
         best/worst trade, breakdowns by setup, side, entry hour, time-of-day window, exit
-        reason and Time Machine verdict, and plain-language takeaways.
+        reason and Time Machine verdict, and plain-language takeaways. Each trade is read in its
+        own market's clock (ET for stocks, UTC for crypto); with trades of both, the review also
+        splits by market. Crypto P&L and R are net of the paper fees the broker charged.
 
 Usage:
   python3 scripts/analyst.py brief TSLA
@@ -18,6 +22,8 @@ Usage:
   python3 scripts/analyst.py brief NVDA --filing-days 90 --json
   python3 scripts/analyst.py review                            # closed trades, last 30 days
   python3 scripts/analyst.py review --days 90 --symbol TSLA --json
+  python3 scripts/analyst.py brief BTC-USD                     # crypto: Coinbase, UTC days, no SEC
+  python3 scripts/analyst.py review --market crypto            # only crypto trades
 
 Exit codes: 0 ok, 1 bad input or state, 2 data source unreachable.
 """
@@ -37,8 +43,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple  # noqa:
 
 DAILY_RANGE = "6mo"
 INTRADAY_RANGE = "1mo"           # ~21 sessions of 5m bars: a 20-session time-of-day baseline
+CRYPTO_INTRADAY_RANGE = "21d"    # 20 past UTC days + today (Coinbase: 300 candles per request)
 BAR_SECONDS = 300
-OPEN_MIN, CLOSE_MIN = tc.MARKET_OPEN, tc.MARKET_CLOSE
 RVOL_SESSIONS = 20
 MIN_RVOL_SESSIONS = 3
 SLOPE_FLAT_PCT = 0.05            # |20-day regression slope| under this (% per day) reads as flat
@@ -52,14 +58,19 @@ SHARES_STALE_DAYS = 400
 SYMBOL_RE = re.compile(r"^\^?[A-Z0-9][A-Z0-9.\-=]{0,14}$")
 MARKET_WORDS = {"open": "market open", "pre-market": "pre-market", "after-hours": "after the close",
                 "closed": "market closed"}
+CRYPTO_WORDS = "24/7 (UTC day)"
 
 # Review
 SCRATCH_EPS = 0.005              # |P&L| below half a cent is a scratch, not a win or a loss
 MIN_BUCKET = 3                   # a bucket needs this many trades before a takeaway mentions it
 EXIT_LABELS = {"target": "target", "stop": "stop", "eod": "time stop", "manual": "manual"}
 EXIT_ORDER = ["target", "stop", "time stop", "manual", "other"]
-PHASES = (("pre-market", 0, OPEN_MIN), ("09:30-10:30", OPEN_MIN, 630), ("10:30-14:00", 630, 840),
-          ("14:00-16:00", 840, CLOSE_MIN), ("after-hours", CLOSE_MIN, 24 * 60))
+PHASES = (("pre-market", 0, tc.US.open_min), ("09:30-10:30", tc.US.open_min, 630), ("10:30-14:00", 630, 840),
+          ("14:00-16:00", 840, tc.US.close_min), ("after-hours", tc.US.close_min, 24 * 60))
+# Crypto never closes: entry windows are quarters of the UTC day (keys carry "UTC").
+CRYPTO_PHASES = (("00:00-06:00 UTC", 0, 360), ("06:00-12:00 UTC", 360, 720), ("12:00-18:00 UTC", 720, 1080),
+                 ("18:00-24:00 UTC", 1080, 24 * 60))
+MARKET_ORDER = ["us", "crypto"]
 TM_ORDER = ["leaned your way", "coin flip", "leaned against you", "not checked"]
 
 
@@ -146,14 +157,23 @@ def parse_stamp(value: Any) -> Optional[datetime]:
 
 
 def market_phase(now: datetime) -> str:
+    """open / pre-market / after-hours / closed for the active market (crypto: always open)."""
     m = now.hour * 60 + now.minute
-    if now.weekday() >= 5:
+    if not tc.market().every_day and now.weekday() >= 5:
         return "closed"
-    if m < OPEN_MIN:
+    if m < tc.MARKET_OPEN:
         return "pre-market"
-    if m >= CLOSE_MIN:
+    if m >= tc.MARKET_CLOSE:
         return "after-hours"
     return "open"
+
+
+def trade_market(t: Dict[str, Any]) -> tc.Market:
+    """A ledger row's market: from its symbol (BTC-USD -> crypto), else its `market` field, else US."""
+    sym = str(t.get("symbol") or "").strip()
+    if sym:
+        return tc.market_for(sym)
+    return tc.MARKETS.get(str(t.get("market") or "").strip().lower(), tc.US)
 
 
 # ---------------------------------------------------------------------------
@@ -161,22 +181,23 @@ def market_phase(now: datetime) -> str:
 # ---------------------------------------------------------------------------
 
 def _session_ts(day: str) -> int:
-    return int(tc.parse_et(f"{day}T09:30").timestamp())
+    return int(tc.parse_et(f"{day}T{tc.hhmm(tc.MARKET_OPEN)}").timestamp())
 
 
 def clean_daily(bars: Sequence[tc.Bar], today: str, now_minute: int) -> List[tc.Bar]:
-    """One daily bar per trading date (the later copy wins), restamped 09:30 ET, none after today.
+    """One daily bar per trading date (the later copy wins), restamped at the open, none after today.
 
     Today's bar is dropped before 09:30 ET (it would be pre-market noise or, in a replay, the
     future). A bar stamped in the evening ET is a UTC-midnight stamp: it belongs to the next date.
+    Crypto: Coinbase stamps each daily candle at 00:00 UTC, the UTC day it covers.
     """
     by_date: Dict[str, tc.Bar] = {}
     for b in sorted(bars, key=lambda x: x.ts):
         dt = tc.to_et(b.ts)
-        if dt.hour >= 18:
+        if not tc.market().every_day and dt.hour >= 18:
             dt += timedelta(days=1)
         day = dt.strftime("%Y-%m-%d")
-        if day > today or (day == today and now_minute < OPEN_MIN):
+        if day > today or (day == today and now_minute < tc.MARKET_OPEN):
             continue
         by_date[day] = b
     return [tc.Bar(_session_ts(d), b.open, b.high, b.low, b.close, b.volume)
@@ -260,12 +281,14 @@ def trend_view(closes: Sequence[float], last: float) -> Dict[str, Any]:
 
 
 def key_levels(hist: Sequence[tc.Bar], last: float, atr: Optional[float], sma20: Optional[float],
-               sma50: Optional[float], vwap: Optional[float]) -> List[Dict[str, Any]]:
-    """Support/resistance ladder, highest first. Equal prices are merged into one row."""
+               sma50: Optional[float], vwap: Optional[float], prior: str = "prior day",
+               vwap_name: str = "today's VWAP") -> List[Dict[str, Any]]:
+    """Support/resistance ladder, highest first. Equal prices are merged into one row.
+    `prior` / `vwap_name` name the prior day's levels and VWAP (crypto: "prior UTC day")."""
     raw: List[Tuple[str, float]] = []
     if hist:
         p = hist[-1]
-        raw += [("prior day high", p.high), ("prior day low", p.low), ("prior day close", p.close)]
+        raw += [(f"{prior} high", p.high), (f"{prior} low", p.low), (f"{prior} close", p.close)]
         w = hist[-20:]
         if len(w) >= 2:
             raw += [(f"{len(w)}-day high", max(b.high for b in w)), (f"{len(w)}-day low", min(b.low for b in w))]
@@ -277,7 +300,7 @@ def key_levels(hist: Sequence[tc.Bar], last: float, atr: Optional[float], sma20:
     if sma50 is not None:
         raw.append(("50-day SMA", sma50))
     if vwap is not None:
-        raw.append(("today's VWAP", vwap))
+        raw.append((vwap_name, vwap))
     merged: Dict[float, List[str]] = {}
     for name, price in raw:
         key = _rpx(price)
@@ -295,19 +318,21 @@ def key_levels(hist: Sequence[tc.Bar], last: float, atr: Optional[float], sma20:
 def time_of_day_rvol(today_bars: Sequence[tc.Bar], past: Dict[str, List[tc.Bar]],
                      now_minute: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Today's volume through the last completed 5m slot vs the average of past sessions through
-    the same clock time. Returns (result, reason-if-none)."""
-    cutoff = min((now_minute // 5) * 5, CLOSE_MIN)
-    if today_bars:
+    the same clock time. Returns (result, reason-if-none). Crypto has no half days or early
+    closes; a quiet stretch there just means no trades (Coinbase sends no empty candles)."""
+    always_open = tc.market().every_day
+    cutoff = min((now_minute // 5) * 5, tc.MARKET_CLOSE)
+    if today_bars and not always_open:
         last_end = tc.minute_of_day(today_bars[-1].ts) + 5
         if cutoff - last_end >= QUIET_MINUTES:   # early close or halt: compare through the last bar
             cutoff = last_end
-    if cutoff <= OPEN_MIN:
+    if cutoff <= tc.MARKET_OPEN:
         return None, "no completed 5-minute bar yet today"
     today_vol = sum(b.volume for b in today_bars if tc.minute_of_day(b.ts) < cutoff)
     cums: List[float] = []
     for day in sorted(past, reverse=True):
         s = past[day]
-        if not s or tc.minute_of_day(s[-1].ts) + 5 < cutoff - QUIET_MINUTES:
+        if not s or (not always_open and tc.minute_of_day(s[-1].ts) + 5 < cutoff - QUIET_MINUTES):
             continue  # a half day (or a gap in the data) that ended before this clock time
         cums.append(sum(b.volume for b in s if tc.minute_of_day(b.ts) < cutoff))
         if len(cums) >= RVOL_SESSIONS:
@@ -509,6 +534,9 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
     """
     symbol = symbol.upper()
     meta = meta or {}
+    mkt = tc.market()
+    crypto, tz = mkt.every_day, mkt.tz_label
+    src = "Coinbase" if crypto else "Yahoo"
     today = now.strftime("%Y-%m-%d")
     now_ts = now.timestamp()
     now_minute = now.hour * 60 + now.minute
@@ -517,10 +545,10 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
     warnings: List[str] = []
 
     if not daily_raw:
-        raise tc.FetchError(f"{symbol}: Yahoo returned no daily bars")
+        raise tc.FetchError(f"{symbol}: {src} returned no daily bars")
     daily = clean_daily(daily_raw, today, now_minute)
     if not daily:
-        raise ValueError(f"no {symbol} daily bars on or before {today} (Yahoo's {DAILY_RANGE} window starts "
+        raise ValueError(f"no {symbol} daily bars on or before {today} ({src}'s {DAILY_RANGE} window starts "
                          f"{tc.et_date(min(b.ts for b in daily_raw))})")
     hist = [b for b in daily if b.date < today]
     today_daily = daily[-1] if daily[-1].date == today else None
@@ -541,7 +569,7 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
         notes.append(f"5-minute bars unavailable ({intraday_error}); relative volume uses daily volume")
 
     # The session the brief describes: today's if it has started, else the last completed one.
-    if today_daily is not None and now_minute >= CLOSE_MIN:
+    if today_daily is not None and now_minute >= tc.MARKET_CLOSE:
         session, source = today_daily, "daily"        # after the close the daily bar is official
     elif today_bars:
         session, source = aggregate(today_bars), "5m"
@@ -549,22 +577,23 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
         session, source = today_daily, "daily"
         if not intraday_error:
             notes.append("no 5-minute bars for today; today's numbers come from the daily bar")
-        if replay and now_minute < CLOSE_MIN:
+        if replay and now_minute < tc.MARKET_CLOSE:
             warnings.append(f"replay: without 5-minute bars, today's numbers come from the daily bar, which "
-                            f"includes trading after {now.strftime('%H:%M')} ET")
+                            f"includes trading after {now.strftime('%H:%M')} {tz}")
     else:
         session, source = None, "daily"
     is_today = session is not None
     if session is None:
         if not hist:
-            raise tc.FetchError(f"{symbol}: Yahoo returned no usable daily bars")
+            raise tc.FetchError(f"{symbol}: {src} returned no usable daily bars")
         session = hist[-1]
         base = hist[:-1]
         if opening_bar_pending:
-            notes.append(f"replay at {now.strftime('%H:%M')} ET: today's first 5-minute bar is not finished yet - "
+            notes.append(f"replay at {now.strftime('%H:%M')} {tz}: today's first 5-minute bar is not finished yet - "
                          "showing the last completed session")
         elif phase == "open":
-            warnings.append("market hours but no bars for today yet (holiday, halt or delayed data?)")
+            warnings.append("no bars for today's UTC day yet (delayed data or a halted product?)" if crypto else
+                            "market hours but no bars for today yet (holiday, halt or delayed data?)")
         if (now.date() - datetime.strptime(session.date, "%Y-%m-%d").date()).days > STALE_DAILY_DAYS:
             warnings.append(f"latest daily bar is from {session.date} - stale data (halted or delisted?)")
     else:
@@ -576,23 +605,28 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
     if is_today and phase == "open" and today_bars:
         quiet = now_minute - (tc.minute_of_day(today_bars[-1].ts) + 5)
         if quiet >= QUIET_MINUTES:
-            warnings.append(f"no 5-minute bars since {tc.hhmm(tc.minute_of_day(today_bars[-1].ts) + 5)} ET "
-                            "(halt, early close or delayed data?)")
+            why = "no trades, a halted product or delayed data?" if crypto else "halt, early close or delayed data?"
+            warnings.append(f"no 5-minute bars since {tc.hhmm(tc.minute_of_day(today_bars[-1].ts) + 5)} {tz} "
+                            f"({why})")
 
     atr_hist = tc.atr(hist, 14)
     trend = trend_view([b.close for b in hist], last)
     vwap = tc.vwap(today_bars)[-1] if is_today and today_bars else None
-    levels = key_levels(hist, _rpx(last), atr_hist, trend["sma20"], trend["sma50"], vwap)
+    if crypto:
+        levels = key_levels(hist, _rpx(last), atr_hist, trend["sma20"], trend["sma50"], vwap,
+                            prior="prior UTC day", vwap_name="VWAP (UTC day)")
+    else:
+        levels = key_levels(hist, _rpx(last), atr_hist, trend["sma20"], trend["sma50"], vwap)
 
     w20 = hist[-20:]
     liquidity = {"avg_dollar_volume_20d": round(sum(b.close * b.volume for b in w20) / len(w20)) if w20 else None,
                  "avg_volume_20d": round(sum(b.volume for b in w20) / len(w20)) if w20 else None,
-                 "sessions": len(w20)}
+                 "sessions": len(w20), "unit": (symbol.split("-")[0] if crypto else "shares")}
 
     rvol: Optional[Dict[str, Any]] = None
-    too_early = is_today and phase == "open" and now_minute < OPEN_MIN + 5
+    too_early = is_today and phase == "open" and now_minute < tc.MARKET_OPEN + 5
     if too_early:
-        notes.append("relative volume needs one completed 5-minute bar (after 09:35 ET)")
+        notes.append(f"relative volume needs one completed 5-minute bar (after {tc.hhmm(tc.MARKET_OPEN + 5)} {tz})")
     elif is_today and today_bars:
         rvol, why = time_of_day_rvol(today_bars, past5, now_minute)
         if rvol is None:
@@ -628,7 +662,10 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
         name = sec["name"]
     elif meta.get("longName") or meta.get("shortName"):
         name = meta.get("longName") or meta.get("shortName")
-    sec_view = sec if sec is not None else {"status": "skipped"}
+    if crypto:   # no SEC filer behind a crypto pair: not asked, not a failure
+        sec_view = {"status": "n/a", "notes": []}
+    else:
+        sec_view = sec if sec is not None else {"status": "skipped"}
     if sec_view.get("shares") and last:
         sh = sec_view["shares"]
         if str(sh.get("form") or "").upper().startswith("20-F"):
@@ -645,6 +682,7 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
 
     return {
         "symbol": symbol, "name": name, "as_of": now.isoformat(timespec="seconds"), "market": phase,
+        "market_type": mkt.key, "tz": tz,
         "price": _rpx(last),
         "session": session_view,
         "prior_day": ({"date": hist[-1].date, "high": _rpx(hist[-1].high), "low": _rpx(hist[-1].low),
@@ -655,7 +693,8 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
                        "basis": f"{len(hist)} completed daily bars before {today}"},
         "liquidity": liquidity,
         "relative_volume": rvol,
-        "gap": gap_view(session, prev.close if prev else None, atr_hist, session_5m) if prev else None,
+        # 24/7: a UTC day opens where the last one closed - there is no opening gap to measure.
+        "gap": gap_view(session, prev.close if prev else None, atr_hist, session_5m) if prev and not crypto else None,
         "sec": sec_view,
         "sources": {"daily": f"ok ({len(daily)} bars)",
                     "intraday": f"error: {intraday_error}" if intraday_error else f"ok ({len(intraday)} bars)",
@@ -668,15 +707,17 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
 
 def gather_brief(symbol: str, now: datetime, with_sec: bool = True,
                  filing_days: int = FILING_DAYS) -> Dict[str, Any]:
-    """Fetch (daily required; 5m and SEC optional) and build the brief."""
+    """Fetch (daily required; 5m and SEC optional) and build the brief. Crypto: Coinbase candles
+    and no SEC request (the active market must be the symbol's: tc.use_market_for)."""
+    crypto = tc.is_crypto_symbol(symbol)
     daily, meta = tc.fetch_bars(symbol, "1d", DAILY_RANGE)
     intraday: List[tc.Bar] = []
     intraday_error = None
     try:
-        intraday, _ = tc.fetch_bars(symbol, "5m", INTRADAY_RANGE)
+        intraday, _ = tc.fetch_bars(symbol, "5m", CRYPTO_INTRADAY_RANGE if crypto else INTRADAY_RANGE)
     except tc.FetchError as e:
         intraday_error = str(e)
-    sec = fetch_sec(symbol, now.strftime("%Y-%m-%d"), filing_days) if with_sec else None
+    sec = fetch_sec(symbol, now.strftime("%Y-%m-%d"), filing_days) if with_sec and not crypto else None
     return build_brief(symbol, daily, intraday, now, meta=meta, sec=sec, intraday_error=intraday_error,
                        replay=bool(os.environ.get("DAYTRADER_NOW")))
 
@@ -691,10 +732,16 @@ def _wrap(label: str, text: str, width: int = 100) -> str:
 
 def render_brief(b: Dict[str, Any]) -> str:
     s = b["session"]
-    now = parse_stamp(b["as_of"])
+    mkt = tc.MARKETS.get(b.get("market_type") or "", tc.US)
+    crypto = mkt.every_day
+    try:   # as written: ET for stocks, UTC for crypto
+        now: Optional[datetime] = datetime.fromisoformat(b["as_of"])
+    except (TypeError, ValueError):
+        now = parse_stamp(b["as_of"])
     stamp = now.strftime("%a %Y-%m-%d %H:%M") if now else b["as_of"]
     name = f" · {b['name']}" if b.get("name") else ""
-    lines = [f"BRIEF · {b['symbol']}{name} · {stamp} ET · {MARKET_WORDS.get(b['market'], b['market'])}"]
+    words = CRYPTO_WORDS if crypto else MARKET_WORDS.get(b["market"], b["market"])
+    lines = [f"BRIEF · {b['symbol']}{name} · {stamp} {mkt.tz_label} · {words}"]
     chg = ""
     if s["change"] is not None:
         chg = (f"  {fmt_diff(s['change'], s['last'])} ({s['change_pct']:+.2f}%) vs prior close "
@@ -721,15 +768,17 @@ def render_brief(b: Dict[str, Any]) -> str:
     liq = b["liquidity"]
     if liq["avg_dollar_volume_20d"] is not None:
         lines.append(_wrap("LIQUIDITY", f"avg ${tc.fmt_big(liq['avg_dollar_volume_20d'])}/day traded "
-                                        f"({tc.fmt_big(liq['avg_volume_20d'])} shares), "
-                                        f"last {liq['sessions']} sessions"))
+                                        f"({tc.fmt_big(liq['avg_volume_20d'])} {liq.get('unit') or 'shares'}), "
+                                        f"last {liq['sessions']} {'UTC days' if crypto else 'sessions'}"))
     rv = b["relative_volume"]
     if rv:
         who = "today" if s["is_today"] else f"{s['date']}"
         if rv["method"] == "time_of_day":
-            span = "full session" if rv["through"] == tc.hhmm(CLOSE_MIN) else f"through {rv['through']} ET"
+            span = ("full session" if rv["through"] == tc.hhmm(mkt.close_min)
+                    else f"through {rv['through']} {mkt.tz_label}")
             txt = (f"{rv['value']:.2f}x · {span} vs the same time on {rv['sessions']} prior "
-                   f"sessions ({tc.fmt_big(rv['volume'])} vs avg {tc.fmt_big(rv['baseline'])})")
+                   f"{'days' if crypto else 'sessions'} ({tc.fmt_big(rv['volume'])} vs avg "
+                   f"{tc.fmt_big(rv['baseline'])})")
         else:
             txt = (f"{rv['value']:.2f}x · {who}'s volume {tc.fmt_big(rv['volume'])} vs the "
                    f"{rv['sessions']}-day average {tc.fmt_big(rv['baseline'])}"
@@ -780,6 +829,8 @@ def render_sec(sec: Dict[str, Any], symbol: str) -> List[str]:
     st = sec.get("status")
     if st == "skipped":
         return ["SEC         skipped (--no-sec)"]
+    if st == "n/a":
+        return ["SEC         n/a (a crypto pair has no SEC filings)"]
     if st == "not_found":
         return ["SEC         " + ((sec.get("notes") or [f"{symbol} not found"])[0])]
     if st == "error":
@@ -843,22 +894,62 @@ def tm_lean(tm: Any) -> str:
     return "not checked"
 
 
-def phase_of(minute: Optional[int]) -> str:
+def phase_of(minute: Optional[int], phases: Sequence[Tuple[str, int, int]] = PHASES) -> str:
     if minute is None:
         return "unknown"
-    for name, lo, hi in PHASES:
+    for name, lo, hi in phases:
         if lo <= minute < hi:
             return name
     return "unknown"
 
 
+def _phases(market_key: str) -> Sequence[Tuple[str, int, int]]:
+    return CRYPTO_PHASES if market_key == "crypto" else PHASES
+
+
+def _hour_key(r: Dict[str, Any]) -> str:
+    """Entry hour bucket in the trade's own clock: '09:00' (ET) or '04:00 UTC' (crypto)."""
+    utc = " UTC" if r.get("market") == "crypto" else ""
+    if r["entry_minute"] is None:
+        return "unknown" + utc
+    return f"{r['entry_minute'] // 60:02d}:00" + utc
+
+
+def _window_key(r: Dict[str, Any]) -> str:
+    key = phase_of(r["entry_minute"], _phases(r.get("market", "us")))
+    return key + " UTC" if key == "unknown" and r.get("market") == "crypto" else key
+
+
+def window_label(key: str) -> str:
+    """'09:30-10:30' -> '09:30-10:30 ET'; crypto keys already say UTC."""
+    return key if key.endswith(" UTC") else f"{key} ET"
+
+
 def trade_row(t: Dict[str, Any], tickets: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Normalize one closed ledger trade; None if it lacks a P&L or any timestamp."""
+    """Normalize one closed ledger trade; None if it lacks a P&L or any timestamp.
+
+    Times are read in the trade's own market clock (ET for stocks, UTC for crypto). Crypto P&L is
+    net of paper fees: the broker's `pnl` already is; one rebuilt from prices subtracts `fees`
+    (or crypto_fee_pct on both fills when the row has none)."""
+    m = trade_market(t)
+    with tc.market_scope(m):
+        return _trade_row(t, tickets, m)
+
+
+def _trade_row(t: Dict[str, Any], tickets: Dict[str, Dict[str, Any]], m: tc.Market) -> Optional[Dict[str, Any]]:
     side = str(t.get("side") or "").strip().lower()
     entry, exit_, stop, qty = (_num(t.get(k)) for k in ("entry_price", "exit_price", "stop", "qty"))
+    crypto = m.key == "crypto"
+    fees = _num(t.get("fees")) if crypto else None
     pnl = _num(t.get("pnl"))
     if pnl is None and None not in (entry, exit_, qty) and side in ("long", "short"):
         pnl = (exit_ - entry) * qty if side == "long" else (entry - exit_) * qty  # type: ignore[operator]
+        if crypto:
+            if fees is None:
+                rate = _num(t.get("fee_pct"))
+                rate = tc.fee_pct(tc.CRYPTO) if rate is None or rate < 0 else rate
+                fees = rate / 100.0 * (entry + exit_) * abs(qty)  # type: ignore[operator]
+            pnl -= fees
     if pnl is None:
         return None
     r = _num(t.get("r_multiple"))
@@ -875,8 +966,8 @@ def trade_row(t: Dict[str, Any], tickets: Dict[str, Dict[str, Any]]) -> Optional
         tm = k.get("time_machine") if k and isinstance(k.get("time_machine"), dict) else tm
     hold = (closed - opened).total_seconds() / 60.0 if opened and closed and closed >= opened else None
     setup = "-".join(str(t.get("setup") or "").lower().split()) or "unlabeled"   # "Gap and go" -> "gap-and-go"
-    return {"id": str(t.get("id") or "?"), "symbol": str(t.get("symbol") or "?").upper(),
-            "side": side if side in ("long", "short") else "unknown", "setup": setup,
+    return {"id": str(t.get("id") or "?"), "symbol": str(t.get("symbol") or "?").upper(), "market": m.key,
+            "fees": fees, "side": side if side in ("long", "short") else "unknown", "setup": setup,
             "pnl": pnl, "r": r, "opened_at": t.get("opened_at"), "closed_at": t.get("closed_at"),
             "entry_minute": opened.hour * 60 + opened.minute if opened else None,
             "closed_date": when.strftime("%Y-%m-%d"), "closed_ts": when.timestamp(),
@@ -884,9 +975,13 @@ def trade_row(t: Dict[str, Any], tickets: Dict[str, Dict[str, Any]]) -> Optional
             "tm_lean": tm_lean(tm), "tm": tm if isinstance(tm, dict) else None}
 
 
-def journal_rows(ledger: Dict[str, Any], since: str, until: str, symbol: Optional[str] = None
+def journal_rows(ledger: Dict[str, Any], since: str, until: str, symbol: Optional[str] = None,
+                 market: Optional[str] = None, windows: Optional[Dict[str, Tuple[str, str]]] = None
                  ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Closed trades whose close date is in [since, until], oldest close first, plus counts."""
+    """Closed trades whose close date is in [since, until], oldest close first, plus counts.
+
+    `market` ('us' | 'crypto') keeps only that market's trades. `windows` gives a market its own
+    (since, until) - a crypto close date is a UTC date, which can already be "tomorrow" in ET."""
     trades = ledger.get("trades")
     tickets = ledger.get("tickets")
     if not isinstance(trades, list) or not isinstance(tickets, list):
@@ -900,15 +995,18 @@ def journal_rows(ledger: Dict[str, Any], since: str, until: str, symbol: Optiona
             continue
         if symbol and str(t.get("symbol") or "").upper() != symbol:
             continue
+        if market and trade_market(t).key != market:
+            continue
         if t.get("status") == "open":
             counts["open"] += 1
             continue
         if t.get("status") != "closed":
             continue
         row = trade_row(t, by_id)
+        lo, hi = (windows or {}).get(row["market"], (since, until)) if row else (since, until)
         if row is None:
             counts["skipped"] += 1
-        elif not since <= row["closed_date"] <= until:
+        elif not lo <= row["closed_date"] <= hi:
             counts["outside_window"] += 1
         else:
             rows.append(row)
@@ -974,7 +1072,10 @@ def streaks(rows: Sequence[Dict[str, Any]]) -> Tuple[int, int]:
 def _trade_brief(r: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if r is None:
         return None
-    return {k: r[k] for k in ("id", "symbol", "side", "setup", "pnl", "r", "closed_at", "exit")}
+    out = {k: r[k] for k in ("id", "symbol", "side", "setup", "pnl", "r", "closed_at", "exit")}
+    if r.get("market") == "crypto":
+        out.update(market="crypto", fees=r.get("fees"))
+    return out
 
 
 def review_stats(rows: Sequence[Dict[str, Any]], account: Optional[float] = None) -> Dict[str, Any]:
@@ -1025,16 +1126,21 @@ def review_stats(rows: Sequence[Dict[str, Any]], account: Optional[float] = None
         "avg_hold_minutes": {"all": hold(rows), "wins": hold(winners), "losses": hold(losers)},
         "by_setup": group_stats(rows, lambda r: r["setup"]),
         "by_side": group_stats(rows, lambda r: r["side"], ["long", "short"]),
-        "by_hour": group_stats(rows, lambda r: (f"{r['entry_minute'] // 60:02d}:00" if r["entry_minute"] is not None
-                                                else "unknown"), [f"{h:02d}:00" for h in range(24)]),
-        "by_window": group_stats(rows, lambda r: phase_of(r["entry_minute"]), [p[0] for p in PHASES]),
+        # Entry hour / window in each trade's own clock: stock keys as before ("09:00", ET),
+        # crypto keys carry "UTC" ("04:00 UTC", "00:00-06:00 UTC").
+        "by_hour": group_stats(rows, _hour_key, [f"{h:02d}:00" for h in range(24)]
+                               + [f"{h:02d}:00 UTC" for h in range(24)]),
+        "by_window": group_stats(rows, _window_key, [p[0] for p in PHASES + CRYPTO_PHASES]),
         "by_setup_side": group_stats(rows, lambda r: f"{r['setup']} {r['side']}"),
         "by_setup_side_window": group_stats(
-            rows, lambda r: f"{r['setup']} {r['side']} {phase_of(r['entry_minute'])}"),
+            rows, lambda r: f"{r['setup']} {r['side']} {_window_key(r)}"),
         "by_time_machine": group_stats(rows, lambda r: r["tm_lean"], TM_ORDER),
         "by_exit": group_stats(rows, lambda r: r["exit"], EXIT_ORDER),
         "by_symbol": group_stats(rows, lambda r: r["symbol"]),
+        "by_market": group_stats(rows, lambda r: r.get("market", "us"), MARKET_ORDER),
         "time_machine_check": tm_check,
+        "crypto_fees": (round(sum(r["fees"] or 0.0 for r in rows if r.get("market") == "crypto"), 2)
+                        if any(r.get("market") == "crypto" for r in rows) else None),
     }
 
 
@@ -1098,12 +1204,20 @@ def takeaways(st: Dict[str, Any]) -> List[str]:
                 out.append(f"Weakest bucket: {_bucket_name(worst['key'], dim)} ({fmt_r(worst['avg_r'])} per trade "
                            f"over {worst['n']}) - the first candidate to cut or rework.")
         break
-    win = [b for b in st["by_window"] if b["n"] >= MIN_BUCKET and b["avg_r"] is not None]
-    if len(win) >= 2:
-        best, worst = max(win, key=lambda b: b["avg_r"]), min(win, key=lambda b: b["avg_r"])
-        if best["avg_r"] > 0 > worst["avg_r"]:
-            out.append(f"Time of day matters here: entries {best['key']} ET average {fmt_r(best['avg_r'])} "
-                       f"({best['n']} trades) vs {fmt_r(worst['avg_r'])} for {worst['key']} ({worst['n']}).")
+    for utc in (False, True):   # stock (ET) and crypto (UTC) windows are compared within their market
+        win = [b for b in st["by_window"] if b["n"] >= MIN_BUCKET and b["avg_r"] is not None
+               and b["key"].endswith(" UTC") == utc]
+        if len(win) >= 2:
+            best, worst = max(win, key=lambda b: b["avg_r"]), min(win, key=lambda b: b["avg_r"])
+            if best["avg_r"] > 0 > worst["avg_r"]:
+                out.append(f"Time of day matters here: entries {window_label(best['key'])} average "
+                           f"{fmt_r(best['avg_r'])} ({best['n']} trades) vs {fmt_r(worst['avg_r'])} for "
+                           f"{worst['key']} ({worst['n']}).")
+    mk = {b["key"]: b for b in st.get("by_market") or []}
+    if len(mk) >= 2 and all(b["avg_r"] is not None for b in mk.values()):
+        us, cr = mk["us"], mk["crypto"]
+        out.append(f"By market: US stocks {fmt_r(us['avg_r'])} per trade over {us['n']}, crypto "
+                   f"{fmt_r(cr['avg_r'])} over {cr['n']}" + (" (after fees)." if st.get("crypto_fees") else "."))
     tm = {b["key"]: b for b in st["by_time_machine"]}
     checked = n - (tm["not checked"]["n"] if "not checked" in tm else 0)
     if checked == 0:
@@ -1142,12 +1256,33 @@ def takeaways(st: Dict[str, Any]) -> List[str]:
     return out
 
 
+def _since(today: str, days: int) -> str:
+    return (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+
+
 def build_review(ledger: Dict[str, Any], days: int, today: str, symbol: Optional[str] = None,
-                 account: Optional[float] = None) -> Dict[str, Any]:
-    since = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=days - 1)).strftime("%Y-%m-%d")
-    rows, counts = journal_rows(ledger, since, today, symbol)
+                 account: Optional[float] = None, market: Optional[str] = None,
+                 todays: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """The journal review. `today` is the review's own date; `todays` ({'us': ..., 'crypto': ...})
+    gives each market its own today (a crypto day is a UTC day), default `today` for all.
+    `market` keeps only that market's trades. With trades of both markets, `markets` holds
+    each market's own stats (the split)."""
+    since = _since(today, days)
+    todays = dict(todays or {})
+    windows = {k: (_since(todays.get(k, today), days), todays.get(k, today)) for k in tc.MARKETS}
+    rows, counts = journal_rows(ledger, since, today, symbol, market, windows)
     st = review_stats(rows, account)
-    st.update(days=days, since=since, until=today, symbol=symbol, open_trades=counts["open"],
+    present = [k for k in MARKET_ORDER if any(r["market"] == k for r in rows)]
+    split = None
+    if len(present) >= 2:
+        split = {}
+        for k in present:
+            sub = review_stats([r for r in rows if r["market"] == k], account)
+            split[k] = {f: sub[f] for f in ("count", "wins", "losses", "scratches", "win_rate_pct", "net_pnl",
+                                             "expectancy_r", "expectancy_usd", "total_r", "profit_factor",
+                                             "max_drawdown", "crypto_fees")}
+    st.update(days=days, since=since, until=today, symbol=symbol, market=market,
+              windows={k: list(windows[k]) for k in present}, markets=split, open_trades=counts["open"],
               skipped_rows=counts["skipped"], older_closed_trades=counts["outside_window"],
               takeaways=takeaways(st), trades=[_trade_brief(r) for r in rows], disclaimer=tc.DISCLAIMER)
     return st
@@ -1164,10 +1299,18 @@ def _bucket_table(title: str, buckets: Sequence[Dict[str, Any]]) -> str:
     return tc.table(rows, [title, "trades", "win%", "net P&L", "avg R", "PF"])
 
 
+_MARKET_NAMES = {"us": "US stocks", "crypto": "crypto"}
+
+
 def render_review(r: Dict[str, Any]) -> str:
     who = f" · {r['symbol']}" if r.get("symbol") else ""
+    if r.get("market") and not r.get("symbol"):
+        who = f" · {_MARKET_NAMES.get(r['market'], r['market'])} only"
     lines = [f"JOURNAL REVIEW{who} · last {_plural(r['days'], 'day')} ({r['since']} to {r['until']}) · "
              f"{_plural(r['count'], 'closed paper trade')}"]
+    cw = (r.get("windows") or {}).get("crypto")
+    if cw and r.get("markets") and list(cw) != [r["since"], r["until"]]:
+        lines[0] += f" · crypto by UTC day: {cw[0]} to {cw[1]}"
     if r["count"] == 0:
         lines.append("No closed paper trades in this window. Trades are recorded by the broker skill (paper only) "
                      "after you confirm a ticket; exits are applied by `broker.py sync`.")
@@ -1190,6 +1333,12 @@ def render_review(r: Dict[str, Any]) -> str:
     if r["losses"]:
         wl += f" · avg loss {tc.fmt_money(r['avg_loss'], signed=True)} ({fmt_r(r['avg_loss_r'])})"
     lines.append(f"{wl} · profit factor {pf}")
+    if r.get("crypto_fees") is not None:
+        lines.append(f"Crypto paper fees {tc.fmt_money(r['crypto_fees'])} - crypto P&L and R are net of them")
+    for k, m in (r.get("markets") or {}).items():
+        lines.append(f"  {_MARKET_NAMES.get(k, k)}: {_plural(m['count'], 'trade')} · net "
+                     f"{tc.fmt_money(m['net_pnl'], signed=True)} · win rate {tc.fmt_pct(m['win_rate_pct'])} · "
+                     f"expectancy {fmt_r(m['expectancy_r'])} · total {fmt_r(m['total_r'])}")
     dd = r["max_drawdown"]
     dd_txt = "none" if not dd["usd"] else (
         f"-{tc.fmt_money(dd['usd'])}" + (f" ({dd['pct_account']:.2f}% of account)" if dd.get("pct_account") else "")
@@ -1209,13 +1358,22 @@ def render_review(r: Dict[str, Any]) -> str:
         if h["losses"] is not None:
             hold += f" · losers {h['losses']:.0f} min"
         lines.append(hold)
-    for title, key in (("setup", "by_setup"), ("side", "by_side"), ("entry hour ET", "by_hour"),
-                       ("entry window ET", "by_window"), ("time machine", "by_time_machine"), ("exit", "by_exit"),
-                       ("symbol", "by_symbol")):
-        if key == "by_symbol" and len(r[key]) < 2:
+    def utc_only(buckets: Sequence[Dict[str, Any]], utc: bool) -> List[Dict[str, Any]]:
+        """One market's entry-time buckets (crypto keys end in ' UTC', dropped under a UTC title)."""
+        return [dict(b, key=b["key"][:-4]) if utc else b for b in buckets if b["key"].endswith(" UTC") == utc]
+
+    tables = [("market", r.get("by_market") or [])] if r.get("markets") else []
+    tables += [("setup", r["by_setup"]), ("side", r["by_side"])]
+    for utc, tz in ((False, "ET"), (True, "UTC")):
+        hours = utc_only(r["by_hour"], utc)
+        if hours:
+            tables += [(f"entry hour {tz}", hours), (f"entry window {tz}", utc_only(r["by_window"], utc))]
+    tables += [("time machine", r["by_time_machine"]), ("exit", r["by_exit"]), ("symbol", r["by_symbol"])]
+    for title, buckets in tables:
+        if title == "symbol" and len(buckets) < 2:
             continue
         lines.append("")
-        lines.append(_bucket_table(title, r[key]))
+        lines.append(_bucket_table(title, buckets))
     c = r["time_machine_check"]
     if c:
         lines.append("")
@@ -1266,7 +1424,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = tc.make_parser("Analyst: pre-trade ticker brief and post-trade review of the paper journal.")
     sub = p.add_subparsers(dest="command", metavar="{brief,review}")
     b = sub.add_parser("brief", help="trend, key levels, ATR, liquidity, relative volume, gap and SEC context")
-    b.add_argument("symbol", type=_symbol, help="ticker, e.g. TSLA")
+    b.add_argument("symbol", type=_symbol, help="ticker, e.g. TSLA, or a crypto pair, e.g. BTC-USD")
     b.add_argument("--no-sec", action="store_true", help="skip SEC EDGAR (Yahoo data only)")
     b.add_argument("--filing-days", type=_int_range(1, 365), default=FILING_DAYS,
                    help=f"SEC filings window in calendar days (default {FILING_DAYS})")
@@ -1274,12 +1432,15 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("review", help="analytics of closed paper trades from the broker's ledger")
     r.add_argument("--days", type=_int_range(1, 3650), default=30,
                    help="today and the previous N-1 calendar days, by close date (default 30)")
-    r.add_argument("--symbol", type=_symbol, help="only this ticker")
+    r.add_argument("--symbol", type=_symbol, help="only this ticker (or crypto pair)")
+    r.add_argument("--market", choices=tuple(tc.MARKETS),
+                   help="only US stock or only crypto trades (default: all, split by market when both exist)")
     tc.add_json_flag(r)
     return p
 
 
 def cmd_brief(args: argparse.Namespace, as_json: bool) -> int:
+    tc.use_market_for(args.symbol)   # before now_et: $DAYTRADER_NOW is read in the market's zone
     brief = gather_brief(args.symbol, tc.now_et(), with_sec=not args.no_sec, filing_days=args.filing_days)
     tc.emit(brief, as_json, render_brief)
     return 0
@@ -1292,8 +1453,13 @@ def cmd_review(args: argparse.Namespace, as_json: bool) -> int:
         ledger = tc.load_ledger()
     except AttributeError:  # valid JSON but not an object
         raise tc.StateError(f"{tc.state_path(tc.LEDGER_FILE)} is not a ledger object; fix or delete it") from None
-    review = build_review(ledger, args.days, tc.today_et(), args.symbol,
-                          account if account and account > 0 else None)
+    # "Today" is read once, in the review's market (--market, --symbol's, else $DAYTRADER_MARKET/US),
+    # then each market gets its own date for that instant (a crypto day is a UTC day).
+    ref = tc.set_market(args.market or tc.market_for(args.symbol))
+    now_ts = tc.now_et().timestamp()
+    todays = {k: tc.to_local(now_ts, m).strftime("%Y-%m-%d") for k, m in tc.MARKETS.items()}
+    review = build_review(ledger, args.days, todays[ref.key], args.symbol,
+                          account if account and account > 0 else None, market=args.market, todays=todays)
     tc.emit(review, as_json, render_review)
     return 0
 

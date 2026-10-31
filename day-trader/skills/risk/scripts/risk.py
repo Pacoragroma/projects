@@ -6,6 +6,11 @@ account), caps it by the max position size and buying power, and checks it befor
 broker for a ticket: reward:risk, a stop that is inside the noise, 0 shares, margin / buying
 power, today's loss budget (from the paper ledger), and a pattern-day-trader heads-up.
 
+Crypto (BTC-USD, ETH-USD, ... - Coinbase prices, 24/7, the UTC day) is sized in fractions, floored
+to the product's size step, and the paper fees of the entry and the stop exit (crypto_fee_pct)
+count toward the loss: "BUY 0.02946375 BTC-USD". The card says what the fees cost in R. Spot
+crypto has no margin and no PDT rule: leverage stays 1x unless you pass --leverage.
+
 Usage:
   python3 scripts/risk.py size --entry 364.18 --stop 358.32                  # BUY 8 shares
   python3 scripts/risk.py size --symbol TSLA                                 # levels from plans/TSLA.json
@@ -17,6 +22,8 @@ Usage:
   python3 scripts/risk.py config                                             # show settings
   python3 scripts/risk.py show                                               # settings + open risk today
   python3 scripts/risk.py --json size --symbol TSLA                          # --json works anywhere
+  python3 scripts/risk.py size --symbol BTC-USD --entry 100000 --stop 99500 --target 101000
+  python3 scripts/risk.py config --crypto-fee-pct 0.4                        # your Coinbase fee tier
 
 Exit codes: 0 ok, 1 bad input or state (including `size --save` that could not save),
 2 data source unreachable (only `size` without an entry anywhere fetches the current price).
@@ -47,7 +54,9 @@ EPS = 1e-9
 # Plan sections other skills computed for specific levels; stale once the levels change.
 DEPENDENT_SECTIONS = ("exit_plan", "time_machine")
 NUMERIC_SETTINGS = ("account_size", "risk_per_trade_pct", "max_position_pct", "min_reward_risk",
-                    "daily_max_loss", "max_open_risk")
+                    "daily_max_loss", "max_open_risk", "crypto_fee_pct")
+MAX_FEE_PCT = 5.0             # a paper fee per fill above this is a typo, not a fee tier
+BIG_FEE_R = 1.0               # round-trip fees at or above this many R -> warn
 INT_SETTINGS = ("max_trades_per_day", "max_consecutive_losses")
 CAP_LABELS = {"risk": "risk budget", "max_position_pct": "max position size",
               "buying_power": "buying power"}
@@ -60,6 +69,29 @@ CAP_LABELS = {"risk": "risk budget", "max_position_pct": "max position size",
 def _floor_shares(x: float) -> int:
     """Whole shares; the epsilon keeps float noise (9.99999999) from costing a share."""
     return max(0, int(math.floor(x + EPS)))
+
+
+def _decimals(step: float) -> int:
+    return max(0, -int(math.floor(math.log10(step) + 1e-9)))
+
+
+def _floor_step(x: float, step: float) -> float:
+    """Round down to a multiple of a crypto size step (e.g. 1e-8 BTC)."""
+    return max(0.0, round(math.floor(x / step + EPS) * step, _decimals(step)))
+
+
+def unit_word(symbol: Optional[str]) -> str:
+    """'shares' for stocks; the base currency for crypto ('BTC' for BTC-USD), 'units' without a symbol."""
+    if symbol and tc.is_crypto_symbol(symbol):
+        return symbol.upper().split("-")[0]
+    return "units" if tc.market().fractional and not symbol else "shares"
+
+
+def size_text(q: Any, fractional: bool) -> str:
+    """'8' / '1,200' for shares (as before); '0.02946375' for crypto."""
+    if fractional and isinstance(q, (int, float)):
+        return tc.fmt_qty(q)
+    return f"{q:,}" if isinstance(q, int) else str(q)
 
 
 def _same(a: Optional[float], b: Optional[float]) -> bool:
@@ -203,10 +235,20 @@ def size_position(side: str, entry: float, stop: float, target: Optional[float] 
                   settings: Optional[Dict[str, Any]] = None, account: Optional[float] = None,
                   risk_pct: Optional[float] = None, risk_dollars: Optional[float] = None,
                   max_position_pct: Optional[float] = None,
-                  leverage: Optional[int] = None) -> Dict[str, Any]:
+                  leverage: Optional[int] = None, market: Optional[tc.Market] = None,
+                  step: Optional[float] = None) -> Dict[str, Any]:
     """Whole shares so a stop-out loses at most the risk budget, capped by max position and
-    buying power (account x leverage). Uses tc.position_size for the first two caps."""
+    buying power (account x leverage). Uses tc.position_size for the first two caps.
+
+    Crypto (`market`, default the active one): a fractional size floored to `step` (the product's
+    size increment, default 1e-8), and the paper fees of the entry and the stop exit count toward
+    the loss, so `max_loss` = risk_used + fees_at_stop stays within the budget. R is still the stop
+    distance; `fees_r` says what the round trip costs in R."""
     s = dict(tc.DEFAULT_SETTINGS) if settings is None else settings
+    m = market or tc.market()
+    frac = m.fractional
+    step = float(step) if step else tc.qty_step(m)
+    fee = tc.fee_pct(m, s)
     errs = tc.validate_levels(side, entry, stop, target)
     if errs:
         raise ValueError("; ".join(errs))
@@ -229,20 +271,31 @@ def size_position(side: str, entry: float, stop: float, target: Optional[float] 
         raise ValueError(f"leverage must be one of {', '.join(map(str, LEVERAGES))}")
 
     base = tc.position_size(entry, stop, account=acct, risk_dollars=budget,
-                            max_position_pct=cap_pct, settings=s)
+                            max_position_pct=cap_pct, settings=s, step=step, fee=fee)
     per_share = abs(entry - stop)
+    rate = fee / 100.0
+    loss_per = per_share + rate * (entry + stop)      # = per_share for stocks (no fee)
     max_notional = acct * cap_pct / 100.0
     buying_power = acct * lev
-    limits = {"risk": _floor_shares(budget / per_share),
-              "max_position_pct": _floor_shares(max_notional / entry),
-              "buying_power": _floor_shares(buying_power / entry)}
-    shares, capped_by = int(base["shares"]), base["capped_by"]
+    if frac:
+        limits: Dict[str, Any] = {"risk": _floor_step(budget / loss_per, step),
+                                  "max_position_pct": _floor_step(max_notional / entry, step),
+                                  "buying_power": _floor_step(buying_power / entry, step)}
+        shares: Any = float(base["shares"])
+    else:
+        limits = {"risk": _floor_shares(budget / per_share),
+                  "max_position_pct": _floor_shares(max_notional / entry),
+                  "buying_power": _floor_shares(buying_power / entry)}
+        shares = int(base["shares"])
+    capped_by = base["capped_by"]
     if shares > limits["buying_power"]:
         shares, capped_by = limits["buying_power"], "buying_power"
 
     risk_used = shares * per_share
+    fees_at_stop = shares * rate * (entry + stop)
     notional = shares * entry
     out: Dict[str, Any] = {
+        "market": m.key,
         "side": side,
         "action": "BUY" if side == "long" else "SELL SHORT",
         "shares": shares,
@@ -264,42 +317,84 @@ def size_position(side: str, entry: float, stop: float, target: Optional[float] 
         "buying_power": round(buying_power, 2),
         "capped_by": capped_by,
         "limits": limits,
+        "max_loss": round(risk_used + fees_at_stop, 2),
         "rr": None, "reward_per_share": None, "reward_at_target": None, "breakeven_win_rate_pct": None,
     }
+    if frac:
+        out.update(step=step, fee_pct=round(fee, 6), fees_at_stop=round(fees_at_stop, 2),
+                   loss_per_unit=round(loss_per, 8), fees_r=round(rate * (entry + stop) / per_share, 4),
+                   fees_at_target=None, rr_after_fees=None)
     if target is not None:
         rr = tc.reward_risk(side, entry, stop, target)
         reward = abs(target - entry)
         out.update(rr=round(rr, 4), reward_per_share=round(reward, 4),
                    reward_at_target=round(shares * reward, 2),
                    breakeven_win_rate_pct=round(100.0 / (1.0 + rr), 2))
+        if frac:   # reward net of both fees / loss at the stop incl. both fees
+            out.update(fees_at_target=round(shares * rate * (entry + target), 2),
+                       rr_after_fees=round((reward - rate * (entry + target)) / loss_per, 4))
     return out
 
 
-def budget_ledger(ledger: Dict[str, Any], day: str) -> Dict[str, Any]:
+def _local_day(stamp: Any) -> str:
+    """Calendar date of an ISO stamp in the active market's zone (ET; UTC for crypto)."""
+    d = _parse_time(stamp)
+    return d.strftime("%Y-%m-%d") if d is not None else str(stamp or "")[:10]
+
+
+def row_fee_rate(row: Dict[str, Any], settings: Optional[Dict[str, Any]] = None) -> float:
+    """Paper fee per fill (a fraction) of a ledger row: 0 for stocks; crypto: its fee_pct, else the setting."""
+    if not tc.is_crypto_symbol(str(row.get("symbol") or "")):
+        return 0.0
+    v = _num(row.get("fee_pct"))
+    return (v if v is not None else tc.fee_pct(tc.CRYPTO, settings)) / 100.0
+
+
+def budget_row(t: Dict[str, Any], settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """A trade as the broker's budget check counts it (a copy): stamps in the active market's zone
+    (so tc.day_summary's day and loss-streak order hold with ET and UTC stamps in one ledger), and
+    for crypto the stop moved by both fills' fees, so tc.trade_initial_risk is the whole loss if the
+    stop fills. Stocks: same numbers as before."""
+    c = dict(t)
+    for field in ("opened_at", "closed_at"):
+        d = _parse_time(c.get(field))
+        if d is not None:
+            c[field] = d.isoformat(timespec="seconds")
+    rate = row_fee_rate(c, settings)
+    e, s = _num(c.get("entry_price")), _num(c.get("stop"))
+    if rate > 0 and e is not None and s is not None:
+        c["stop"] = s - rate * (e + s) if c.get("side") == "long" else s + rate * (e + s)
+    return c
+
+
+def budget_ledger(ledger: Dict[str, Any], day: str, settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The ledger as the broker's budget check sees it (pure).
 
     A working limit order confirmed on `day` can still fill without another check, so the broker
     counts it as an open trade opened today: its risk and its trade slot are already committed.
     tc.day_summary only looks at trades, so without this the risk skill would say OK to a trade
-    the broker then refuses. Rows added here carry `_working: True`.
+    the broker then refuses. Rows added here carry `_working: True`. Crypto rows count the fees
+    at the stop (see budget_row); `day` is a day of the active market.
     """
     trades = [t for t in ledger.get("trades") or [] if isinstance(t, dict)]
     linked = {t.get("ticket_id") for t in trades if t.get("ticket_id")}
     synth = []
     for k in ledger.get("tickets") or []:
         if (not isinstance(k, dict) or k.get("status") != "working" or k.get("id") in linked
-                or str(k.get("confirmed_at") or "")[:10] != day):
+                or _local_day(k.get("confirmed_at")) != day):
             continue
         synth.append({"id": k.get("id"), "symbol": k.get("symbol"), "side": k.get("side"),
                       "qty": k.get("qty"), "entry_price": k.get("entry"), "stop": k.get("stop"),
+                      "fee_pct": k.get("fee_pct"),
                       "status": "open", "opened_at": k.get("confirmed_at"), "_working": True})
-    return {"tickets": [], "trades": trades + synth}
+    return {"tickets": [], "trades": [budget_row(t, settings) for t in trades + synth]}
 
 
 def budget_view(bc: Dict[str, Any], risk_per_share: float, risk_used: float,
-                ledger: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                ledger: Optional[Dict[str, Any]] = None, step: float = 1.0) -> Dict[str, Any]:
     """tc.budget_check result + what is left after this trade and the most shares that fit now.
-    `ledger` is the budget_ledger() view the check ran on (for the working-order share of risk)."""
+    `ledger` is the budget_ledger() view the check ran on (for the working-order share of risk).
+    Crypto: `risk_per_share` is the loss per unit incl. fees, `step` the size increment."""
     lim, summ = bc["limits"], bc["summary"]
     used = float(bc["loss_budget_used"])
     count_blocked = (summ["trades_today"] >= lim["max_trades_per_day"]
@@ -307,7 +402,10 @@ def budget_view(bc: Dict[str, Any], risk_per_share: float, risk_used: float,
     # trade count / tilt guard block any new risk, whatever dollars are left
     room = 0.0 if count_blocked else max(0.0, min(float(lim["daily_max_loss"]) - used,
                                                   float(lim["max_open_risk"]) - float(summ["open_risk"])))
-    max_shares = 0 if count_blocked or risk_per_share <= 0 else _floor_shares(room / risk_per_share)
+    if count_blocked or risk_per_share <= 0:
+        max_shares: Any = 0
+    else:
+        max_shares = _floor_shares(room / risk_per_share) if step >= 1 else _floor_step(room / risk_per_share, step)
     working = [t for t in (ledger or {}).get("trades") or [] if t.get("_working")]
     return {
         "ok": bool(bc["ok"]),
@@ -333,6 +431,21 @@ def _ceil_to(x: float, places: int) -> float:
     """Round up (so a suggested setting is always enough), ignoring float noise."""
     f = 10 ** places
     return math.ceil(x * f - 1e-9) / f
+
+
+def zero_units_reason(sz: Dict[str, Any], unit: str) -> str:
+    """Crypto: why the size came out at 0 - every cap that allows less than one size step."""
+    lim, step = sz["limits"], sz["step"]
+    one = f"one {tc.fmt_qty(step)} {unit} step"
+    parts: List[str] = []
+    if lim["risk"] == 0:
+        parts.append(f"the risk budget {tc.fmt_money(sz['risk_budget'])} does not cover {one} at "
+                     f"{tc.fmt_money(sz['loss_per_unit'])}/{unit} (stop distance + fees)")
+    if lim["max_position_pct"] == 0:
+        parts.append(f"the max position {tc.fmt_money(sz['max_notional'])} is smaller than {one}")
+    if lim["buying_power"] == 0:
+        parts.append(f"the {tc.fmt_money(sz['buying_power'])} buying power is smaller than {one}")
+    return f"0 {unit}: " + "; and ".join(parts or ["no size fits"])
 
 
 def zero_shares_reason(sz: Dict[str, Any]) -> str:
@@ -367,11 +480,13 @@ def zero_shares_reason(sz: Dict[str, Any]) -> str:
 
 def risk_checks(sz: Dict[str, Any], settings: Dict[str, Any], budget: Optional[Dict[str, Any]] = None,
                 open_items: Iterable[str] = (), plan_date: Optional[str] = None,
-                today: Optional[str] = None) -> List[str]:
-    """Warnings for a sized trade (pure). Empty list = nothing to flag."""
+                today: Optional[str] = None, unit: str = "shares") -> List[str]:
+    """Warnings for a sized trade (pure). Empty list = nothing to flag. Crypto sizes (sz market
+    "crypto") also get the fee checks; the stock-only margin/PDT rules do not apply to them."""
     w: List[str] = []
+    crypto = sz.get("market") == "crypto"
     if sz["shares"] == 0:          # first: the text card points at the first warning
-        w.append(zero_shares_reason(sz))
+        w.append(zero_units_reason(sz, unit) if crypto else zero_shares_reason(sz))
     elif sz["capped_by"] == "buying_power":
         w.append(f"size capped by {sz['leverage']}x buying power ({tc.fmt_money(sz['buying_power'])}); pass "
                  "--leverage 2 or 4 only if your account really has that margin")
@@ -379,6 +494,12 @@ def risk_checks(sz: Dict[str, Any], settings: Dict[str, Any], budget: Optional[D
     if sz["rr"] is not None and sz["rr"] < min_rr - 1e-6:
         w.append(f"R:R {sz['rr']:.2f} is below your minimum of {min_rr:.2f} (min_reward_risk): the target "
                  "does not pay enough for the risk")
+    elif crypto and sz.get("rr_after_fees") is not None and sz["rr_after_fees"] < min_rr - 1e-6:
+        w.append(f"after fees the R:R is {sz['rr_after_fees']:.2f} (reward net of fees / loss at the stop incl. "
+                 f"fees), below your minimum of {min_rr:.2f}: the fees eat the edge")
+    if crypto and sz.get("fee_pct") and sz["fees_r"] >= BIG_FEE_R - 1e-9:
+        w.append(f"round-trip fees ≈ {sz['fees_r']:.2f}R at these levels - the paper fees alone cost more than "
+                 "the stop distance; a wider stop and target (fewer units) or a lower fee tier changes that")
     if sz["stop_pct"] < NOISE_STOP_PCT:
         w.append(f"the stop is only {tc.fmt_money(sz['risk_per_share'])} ({sz['stop_pct']:.3f}%) from the "
                  f"entry - under {NOISE_STOP_PCT:g}% of price is inside normal noise and the spread; "
@@ -386,7 +507,10 @@ def risk_checks(sz: Dict[str, Any], settings: Dict[str, Any], budget: Optional[D
     if sz["notional"] > sz["account"] + 0.005:
         w.append(f"the position ({tc.fmt_money(sz['notional'])}) is larger than the account "
                  f"({tc.fmt_money(sz['account'])}): it needs margin ({sz['leverage']}x buying power)")
-    if sz["leverage"] == 4 and sz["account"] < PDT_MIN_EQUITY:
+    if crypto and sz["leverage"] > 1:
+        w.append(f"spot crypto is paid in full - {sz['leverage']}x buying power assumes margin or derivatives "
+                 "that a spot account does not have")
+    elif sz["leverage"] == 4 and sz["account"] < PDT_MIN_EQUITY:
         w.append(f"4x intraday buying power normally needs a pattern-day-trader margin account with at "
                  f"least {tc.fmt_money(PDT_MIN_EQUITY)} equity")
     if sz["side"] == "short" and sz["leverage_given"] and sz["leverage"] == 1:
@@ -401,14 +525,17 @@ def risk_checks(sz: Dict[str, Any], settings: Dict[str, Any], budget: Optional[D
         for r in budget["reasons"]:
             w.append(f"daily budget: {r}")
         n = budget["max_shares_now"]
-        if 0 < n < sz["shares"]:
+        if 0 < n < sz["shares"] and crypto:
+            w.append(f"daily budget: at most {tc.fmt_qty(n)} {unit} ({tc.fmt_money(n * sz['loss_per_unit'])} risk "
+                     "incl. fees) fit what is left today")
+        elif 0 < n < sz["shares"]:
             w.append(f"daily budget: at most {n} shares ({tc.fmt_money(n * sz['risk_per_share'])} risk) "
                      "fit what is left today")
     for item in open_items:
         w.append(f"you already have {item}")
     if plan_date and today and plan_date != today:
         w.append(f"the saved plan is from {plan_date} - check its levels still make sense today")
-    if sz["account"] < PDT_MIN_EQUITY:
+    if sz["account"] < PDT_MIN_EQUITY and not crypto:      # FINRA's PDT rule is about stocks
         w.append(f"account under {tc.fmt_money(PDT_MIN_EQUITY)}: {PDT_NOTE} (a heads-up, not a block)")
     return w
 
@@ -478,13 +605,16 @@ def ledger_items(ledger: Dict[str, Any], now: datetime, symbol: Optional[str] = 
 
 def _qty(row: Dict[str, Any]) -> str:
     q = row.get("qty")
+    if isinstance(q, float) and not q.is_integer():
+        return tc.fmt_qty(q)          # a crypto size (":g" would cut 0.02946375 to 6 digits)
     return f"{q:g}" if isinstance(q, (int, float)) else str(q or "?")
 
 
 def describe_items(items: Dict[str, List[Dict[str, Any]]]) -> List[str]:
     out = []
     for t in items["open"]:
-        out.append(f"an open {t.get('side', '?')} paper position in {t.get('symbol')}: {_qty(t)} shares @ "
+        out.append(f"an open {t.get('side', '?')} paper position in {t.get('symbol')}: {_qty(t)} "
+                   f"{unit_word(str(t.get('symbol') or '') or None)} @ "
                    f"{tc.fmt_price(_num(t.get('entry_price')))} ({t.get('id', '?')})")
     for t in items["working"]:
         out.append(f"a working {t.get('side', '?')} order for {_qty(t)} {t.get('symbol')} ({t.get('id', '?')})")
@@ -494,11 +624,24 @@ def describe_items(items: Dict[str, List[Dict[str, Any]]]) -> List[str]:
     return out
 
 
+def fee_note(sz: Dict[str, Any]) -> str:
+    """Crypto: what the paper fees do to this trade, in dollars and in R - shown, not hidden."""
+    if not sz.get("fee_pct"):
+        return "paper fees are off (crypto_fee_pct is 0) - a real exchange charges a fee on every fill"
+    parts = [f"fees: {sz['fee_pct']:g}% per fill (paper, crypto_fee_pct) · round-trip fees ≈ {sz['fees_r']:.2f}R "
+             "at these levels", f"{tc.fmt_money(sz['fees_at_stop'])} if the stop fills"]
+    if sz.get("fees_at_target") is not None:
+        parts.append(f"{tc.fmt_money(sz['fees_at_target'])} at the target · R:R after fees {sz['rr_after_fees']:.2f}")
+    return " · ".join(parts) + " - the broker's P&L and R are net of fees"
+
+
 def sizing_section(sz: Dict[str, Any], budget: Dict[str, Any], warnings: List[str], as_of: str) -> Dict[str, Any]:
     """What `--save` merges into the plan as `sizing`."""
     keys = ("shares", "side", "entry", "stop", "target", "risk_per_share", "risk_budget", "risk_pct",
             "risk_used", "notional", "account", "max_position_pct", "leverage", "capped_by", "rr")
     sec = {k: sz[k] for k in keys}
+    if sz.get("market") == "crypto":     # what the broker and the budget need to count the fees
+        sec.update({k: sz[k] for k in ("market", "step", "fee_pct", "fees_at_stop", "max_loss", "fees_r")})
     sec.update(budget_ok=budget["ok"], warnings=list(warnings), as_of=as_of)
     return sec
 
@@ -544,6 +687,8 @@ def _leverage(value: str) -> int:
 
 def parse_symbol(raw: str) -> str:
     sym = (raw or "").strip().upper()
+    if tc.is_crypto_symbol(sym):
+        return sym
     if not re.fullmatch(r"[A-Z0-9^][A-Z0-9.\-=^]{0,14}", sym):
         raise ValueError(f"not a ticker symbol: {raw!r}")
     return sym
@@ -593,11 +738,16 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--risk-pct", type=_percent, help="risk per trade, %% of the account (e.g. 0.2)")
     c.add_argument("--max-position-pct", type=_percent, help="max position, %% of the account (e.g. 25)")
     c.add_argument("--min-rr", type=_nonneg, help="warn when reward:risk is below this (0 = off)")
+    c.add_argument("--crypto-fee-pct", type=_nonneg,
+                   help=f"paper fee per crypto fill, %% of notional (default {tc.DEFAULT_SETTINGS['crypto_fee_pct']:g}; "
+                        f"at most {MAX_FEE_PCT:g})")
     tc.add_json_flag(c)
 
     sh = _exit1_on_usage_error(sub.add_parser(
         "show", help="settings plus today's open risk and loss budget",
         description="Settings, today's paper P&L, open risk, positions, working orders and sized plans."))
+    sh.add_argument("--market", choices=("us", "crypto"),
+                    help="whose day is today: us (US/Eastern, default) or crypto (the UTC day)")
     tc.add_json_flag(sh)
     return p
 
@@ -617,6 +767,11 @@ def clean_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
     return s
 
 
+def safe_trade_risk(t: Dict[str, Any], settings: Optional[Dict[str, Any]] = None) -> float:
+    """tc.trade_initial_risk as the budget counts it (crypto: incl. the fees at the stop)."""
+    return tc.trade_initial_risk(budget_row(t, settings))
+
+
 def safe_budget_check(new_risk: float, settings: Dict[str, Any], ledger: Dict[str, Any]) -> Dict[str, Any]:
     try:
         return tc.budget_check(new_risk, settings=settings, ledger=ledger)
@@ -625,7 +780,12 @@ def safe_budget_check(new_risk: float, settings: Dict[str, Any], ledger: Dict[st
                             "remove it") from None
 
 
-def _price_note(price: float, name: str) -> Optional[str]:
+def _price_note(price: float, name: str, tick: Optional[float] = None, sym: Optional[str] = None) -> Optional[str]:
+    """Stocks: sub-penny digits. Crypto: off the product's price tick (`tick`; None = unknown, no note)."""
+    if tc.market().key == "crypto":
+        if tick and abs(round(price / tick) * tick - price) > tick * 1e-6:
+            return f"{name} {price} is not on {sym or 'the product'}'s price tick {tc.fmt_qty(tick)}"
+        return None
     if price >= 1 and abs(round(price, 2) - price) > 1e-9:
         return f"{name} {price:g} has sub-penny digits; stocks at $1+ are quoted in cents"
     return None
@@ -640,6 +800,9 @@ def cmd_size(args: argparse.Namespace) -> int:
         raise ValueError(f"two different symbols given: {args.symbol_pos} and --symbol {args.symbol}")
     raw_sym = args.symbol or args.symbol_pos
     sym = parse_symbol(raw_sym) if raw_sym else None
+    market = tc.use_market_for(sym)      # crypto: the UTC day, fractional sizes, paper fees
+    crypto = market.key == "crypto"
+    unit = unit_word(sym)
     if args.save and not sym:
         raise ValueError("--save needs --symbol (the sizing is stored in that ticker's plan)")
     if args.risk_pct is not None and args.risk_pct > MAX_RISK_PCT:
@@ -673,23 +836,35 @@ def cmd_size(args: argparse.Namespace) -> int:
         when = ""
         if isinstance(qt, (int, float)):
             qd = tc.to_et(qt)
-            when = f" at {qd.strftime('%H:%M' if qd.date() == now.date() else '%Y-%m-%d %H:%M')} ET"
-        notes.append(f"entry = last price {tc.fmt_price(last_price)}{when} (Yahoo); a market order "
-                     "fills wherever price is when it executes")
+            when = f" at {qd.strftime('%H:%M' if qd.date() == now.date() else '%Y-%m-%d %H:%M')} {tc.tz_label()}"
+        notes.append(f"entry = last price {tc.fmt_price(last_price)}{when} ({'Coinbase' if crypto else 'Yahoo'}); "
+                     "a market order fills wherever price is when it executes")
 
+    step = tick = None
+    if crypto and sym:          # Coinbase's size step and price tick (public, cached a day; best effort)
+        try:
+            info = tc.product_info(sym)
+            step, tick = info["base_increment"], info["quote_increment"]
+        except tc.FetchError as e:
+            notes.append(f"Coinbase product rules unavailable ({e}): size step {tc.fmt_qty(tc.qty_step())} "
+                         "assumed, prices not checked against the tick")
     lv = resolve_levels(plan, args.entry, args.stop, args.target, args.side, last_price)
     notes = lv["notes"] + notes
     sz = size_position(lv["side"], lv["entry"], lv["stop"], lv["target"], settings,
                        account=args.account, risk_pct=args.risk_pct, risk_dollars=args.risk_dollars,
-                       max_position_pct=args.max_position_pct, leverage=args.leverage)
+                       max_position_pct=args.max_position_pct, leverage=args.leverage, market=market, step=step)
     ledger = tc.load_ledger()
-    view = budget_ledger(ledger, now.strftime("%Y-%m-%d"))
-    budget = budget_view(safe_budget_check(sz["risk_used"], settings, view),
-                         sz["risk_per_share"], sz["risk_used"], view)
+    view = budget_ledger(ledger, now.strftime("%Y-%m-%d"), settings)
+    if crypto:     # the budget counts the whole loss at the stop: price risk + both fills' fees
+        budget = budget_view(safe_budget_check(sz["max_loss"], settings, view),
+                             sz["loss_per_unit"], sz["max_loss"], view, sz["step"])
+    else:
+        budget = budget_view(safe_budget_check(sz["risk_used"], settings, view),
+                             sz["risk_per_share"], sz["risk_used"], view)
     items = describe_items(ledger_items(ledger, now, sym)) if sym else []
     used_plan = "plan" in lv["sources"].values()
     plan_date = str(plan.get("updated_at") or plan.get("created_at") or "")[:10] if plan and used_plan else None
-    warnings = risk_checks(sz, settings, budget, items, plan_date or None, now.strftime("%Y-%m-%d"))
+    warnings = risk_checks(sz, settings, budget, items, plan_date or None, now.strftime("%Y-%m-%d"), unit)
 
     if used_plan:
         notes.insert(0, "levels from the saved plan: " + ", ".join(
@@ -699,13 +874,18 @@ def cmd_size(args: argparse.Namespace) -> int:
                      "the entry)")
     if sz["target"] is None and not any("saved target" in n for n in notes):
         notes.append("no target: add --target to check reward:risk")
-    if lv["side"] == "short":
+    if lv["side"] == "short" and crypto:
+        notes.append("spot crypto cannot be sold short on Coinbase (that needs margin or derivatives); the "
+                     "paper broker simulates the short like a stock short")
+    elif lv["side"] == "short":
         notes.append("short selling needs a margin account and shares available to borrow "
                      "(hard-to-borrow fees may apply)")
     for name in ("entry", "stop", "target"):
-        n = _price_note(sz[name], name) if sz[name] is not None else None
+        n = _price_note(sz[name], name, tick, sym) if sz[name] is not None else None
         if n:
             notes.append(n)
+    if crypto:
+        notes.append(fee_note(sz))
     tm = (plan or {}).get("time_machine")
     tm_ok = isinstance(tm, dict) and tm_levels_match(tm, lv)
     odds = tm_display(tm) if tm_ok else None  # type: ignore[arg-type]
@@ -721,8 +901,8 @@ def cmd_size(args: argparse.Namespace) -> int:
     res: Dict[str, Any] = {"symbol": sym}
     res.update(sz)
     res.update({
-        "order": f"{sz['action']} {sz['shares']:,} {sym or 'shares'}",
-        "sizing_note": size_explanation(sz),
+        "order": f"{sz['action']} {size_text(sz['shares'], crypto)} {sym or unit}",
+        "sizing_note": size_explanation(sz, unit),
         "budget": budget,
         "warnings": warnings,
         "notes": notes,
@@ -733,9 +913,11 @@ def cmd_size(args: argparse.Namespace) -> int:
         "disclaimer": tc.DISCLAIMER,
     })
     code = 0
+    if crypto:
+        res.update(unit=unit, tick=tick)
     if args.save:
         if sz["shares"] == 0:
-            res["save_error"] = "not saved: the size is 0 shares"
+            res["save_error"] = f"not saved: the size is 0 {unit}"
             code = 1
         else:
             dropped = save_sizing(sym, lv, sizing_section(sz, budget, warnings, res["as_of"]), plan)
@@ -786,6 +968,11 @@ def cmd_config(args: argparse.Namespace) -> int:
         updates["max_position_pct"] = args.max_position_pct
     if args.min_rr is not None:
         updates["min_reward_risk"] = args.min_rr
+    if args.crypto_fee_pct is not None:
+        if args.crypto_fee_pct > MAX_FEE_PCT:
+            raise ValueError(f"--crypto-fee-pct is the fee per fill in percent (0.6 = 0.6%); above "
+                             f"{MAX_FEE_PCT:g} is not a real fee tier")
+        updates["crypto_fee_pct"] = args.crypto_fee_pct
     s = clean_settings(tc.save_settings(updates) if updates else tc.load_settings())
     res = settings_view(s)
     res["changed"] = sorted(updates)
@@ -795,12 +982,13 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def cmd_show(args: argparse.Namespace) -> int:
+    tc.set_market(args.market or tc.market_for(None))     # whose day is "today" (UTC for crypto)
     s = clean_settings(tc.load_settings())
     ledger = tc.load_ledger()
     now = tc.now_et()
     view = settings_view(s)
     full_risk = view["risk_per_trade_dollars"]
-    budget_led = budget_ledger(ledger, now.strftime("%Y-%m-%d"))
+    budget_led = budget_ledger(ledger, now.strftime("%Y-%m-%d"), s)
     bc = safe_budget_check(0.0, s, budget_led)
     nxt = safe_budget_check(full_risk, s, budget_led) if full_risk > 0 else bc
     today = budget_view(bc, 0.0, 0.0, budget_led)
@@ -810,7 +998,7 @@ def cmd_show(args: argparse.Namespace) -> int:
     positions = []
     for t in items["open"]:
         try:
-            risk = round(tc.trade_initial_risk(t), 2)   # directional, as the budget counts it
+            risk = round(safe_trade_risk(t, s), 2)   # directional, as the budget counts it (crypto: + fees)
         except (KeyError, TypeError, ValueError, tc.StateError):
             risk = None
         positions.append({"id": t.get("id"), "symbol": t.get("symbol"), "side": t.get("side"),
@@ -829,7 +1017,8 @@ def cmd_show(args: argparse.Namespace) -> int:
                  and _same(_num(p.get("stop")), _num(sec.get("stop"))))
         sized.append({"symbol": p.get("symbol"), "side": sec.get("side"), "shares": sec.get("shares"),
                       "entry": _num(sec.get("entry")), "stop": _num(sec.get("stop")),
-                      "risk_used": sec.get("risk_used"), "as_of": sec.get("as_of"), "current": fresh})
+                      "risk_used": sec.get("max_loss", sec.get("risk_used")), "as_of": sec.get("as_of"),
+                      "current": fresh})
     res = dict(view)
     res.update({
         "today": today,
@@ -837,6 +1026,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         "open_positions": positions,
         "orders": orders,
         "sized_plans": sized,
+        "market": tc.market().key,
         "as_of": now.isoformat(timespec="seconds"),
         "disclaimer": tc.DISCLAIMER,
     })
@@ -862,11 +1052,21 @@ def _pct(x: float) -> str:
     return f"{x:.2f}%" if abs(x) < 10 else f"{x:.1f}%"
 
 
-def size_explanation(sz: Dict[str, Any]) -> str:
+def size_explanation(sz: Dict[str, Any], unit: str = "shares") -> str:
     lim = sz["limits"]
     budget = tc.fmt_money(sz["risk_budget"])
     if sz["risk_pct"] is not None:
         budget += f" ({sz['risk_pct']:g}% of the account)"
+    if sz.get("market") == "crypto":
+        q = tc.fmt_qty
+        if sz["capped_by"] == "risk":
+            return (f"risk budget {budget} / {tc.fmt_money(sz['loss_per_unit'])} per {unit} (stop distance + fees) = "
+                    f"{q(lim['risk'])} {unit} (max position allows {q(lim['max_position_pct'])})")
+        if sz["capped_by"] == "max_position_pct":
+            return (f"max position {sz['max_position_pct']:g}% of the account = {tc.fmt_money(sz['max_notional'])}"
+                    f" -> {q(lim['max_position_pct'])} {unit} (the risk budget alone allows {q(lim['risk'])})")
+        return (f"buying power {tc.fmt_money(sz['buying_power'])} at {sz['leverage']}x -> {q(lim['buying_power'])} "
+                f"{unit} (the risk budget alone allows {q(lim['risk'])})")
     if sz["capped_by"] == "risk":
         return (f"risk budget {budget} / {tc.fmt_money(sz['risk_per_share'])} per share = {lim['risk']:,} "
                 f"shares (max position allows {lim['max_position_pct']:,})")
@@ -895,22 +1095,34 @@ def _row(label: str, value: str) -> str:
 
 
 def render_size(r: Dict[str, Any]) -> str:
+    crypto = r.get("market") == "crypto"
+    unit = r.get("unit") or "shares"
     head = " · ".join(x for x in ("POSITION SIZE", r["symbol"], r["side"].upper()) if x)
     card = f"{r['order']} @ {tc.fmt_price(r['entry'])} · STOP {tc.fmt_price(r['stop'])}"
     if r["target"] is not None:
         card += f" · TARGET {tc.fmt_price(r['target'])}"
-    card += " · PAPER"
+    card += " · PAPER" + (" · Coinbase prices" if crypto else "")
     if not r["shares"]:
-        card = (f"0 SHARES - no trade at entry {tc.fmt_price(r['entry'])} / stop {tc.fmt_price(r['stop'])} "
-                "with this risk (see the first ! line)")
+        card = (f"0 {unit.upper() if crypto else 'SHARES'} - no trade at entry {tc.fmt_price(r['entry'])} / stop "
+                f"{tc.fmt_price(r['stop'])} with this risk (see the first ! line)")
     lines = [head, card]
-    lines.append(_row("risk/share", f"{tc.fmt_money(r['risk_per_share'])} ({_pct(r['stop_pct'])} of price)"))
-    lines.append(_row("$ at risk", f"{tc.fmt_money(r['risk_used'])} of a {tc.fmt_money(r['risk_budget'])} "
-                                   f"budget ({_pct(r['risk_used_pct'])} of the account)"))
+    if crypto:
+        fee_per = r["loss_per_unit"] - r["risk_per_share"]
+        lines.append(_row(f"risk/{unit}", f"{tc.fmt_money(r['risk_per_share'])} ({_pct(r['stop_pct'])} of price) + "
+                                          f"{tc.fmt_money(fee_per)} fees = {tc.fmt_money(r['loss_per_unit'])}"))
+        lines.append(_row("$ at risk", f"{tc.fmt_money(r['max_loss'])} ({tc.fmt_money(r['risk_used'])} + "
+                                       f"{tc.fmt_money(r['fees_at_stop'])} fees at the stop) of a "
+                                       f"{tc.fmt_money(r['risk_budget'])} budget "
+                                       f"({_pct(r['max_loss'] / r['account'] * 100.0)} of the account)"))
+    else:
+        lines.append(_row("risk/share", f"{tc.fmt_money(r['risk_per_share'])} ({_pct(r['stop_pct'])} of price)"))
+        lines.append(_row("$ at risk", f"{tc.fmt_money(r['risk_used'])} of a {tc.fmt_money(r['risk_budget'])} "
+                                       f"budget ({_pct(r['risk_used_pct'])} of the account)"))
     lines.append(_row("notional", f"{tc.fmt_money(r['notional'])} ({_pct(r['position_pct'])} of a "
                                   f"{tc.fmt_money(r['account'])} account)"))
     if r["rr"] is not None:
-        lines.append(_row("R:R", f"{r['rr']:.2f} · reward at target {tc.fmt_money(r['reward_at_target'])} · "
+        after = f" · after fees {r['rr_after_fees']:.2f}" if crypto and r.get("rr_after_fees") is not None else ""
+        lines.append(_row("R:R", f"{r['rr']:.2f}{after} · reward at target {tc.fmt_money(r['reward_at_target'])} · "
                                  f"break-even win rate {r['breakeven_win_rate_pct']:.1f}%"))
     lines.append(_row("size set by", r["sizing_note"]))
     b = r["budget"]
@@ -933,13 +1145,18 @@ def render_size(r: Dict[str, Any]) -> str:
         lines.append(f"Not saved: {r['save_error'].replace('not saved: ', '')}.")
     elif r["symbol"]:
         lines.append("Not saved - add --save to store this sizing in the trade plan.")
-    if r["shares"] and b["ok"]:
+    if r["shares"] and b["ok"] and crypto:
+        where = f"--symbol {r['symbol']}" if r["symbol"] else "--market crypto"
+        lines.append(f"Next: budget skill check ({where} --risk {r['max_loss']:.2f}), then a paper broker ticket for "
+                     f"{tc.fmt_qty(r['shares'])} {r['symbol'] or unit} - it waits for your yes.")
+    elif r["shares"] and b["ok"]:
         lines.append(f"Next: budget skill check (--risk {r['risk_used']:.2f}), then a paper broker ticket for "
                      f"{r['shares']:,} shares - it waits for your yes.")
     elif r["shares"]:
         fit = b["max_shares_now"]
+        fit_text = f"{tc.fmt_qty(fit)} {unit}" if crypto else f"{fit:,} shares"
         lines.append("Next: no ticket for this size while the daily budget blocks it"
-                     + (f" (at most {fit:,} shares fit what is left)" if 0 < fit < r["shares"] else "") + ".")
+                     + (f" (at most {fit_text} fit what is left)" if 0 < fit < r["shares"] else "") + ".")
     lines.append(r["disclaimer"])
     return "\n".join(lines)
 
@@ -955,7 +1172,9 @@ def _settings_lines(v: Dict[str, Any]) -> List[str]:
         _row("daily limits", f"max loss {tc.fmt_money(s['daily_max_loss'])} · max open risk "
                              f"{tc.fmt_money(s['max_open_risk'])} · {s['max_trades_per_day']} trades · "
                              f"stop after {s['max_consecutive_losses']} losses in a row"),
-    ]
+    ] + ([_row("crypto fees", f"{s['crypto_fee_pct']:g}% per fill (paper; Coinbase prices)")]
+         if "crypto_fee_pct" in (v.get("changed") or ()) or v.get("market") == "crypto"
+         or s.get("crypto_fee_pct") != tc.DEFAULT_SETTINGS["crypto_fee_pct"] else [])
 
 
 def render_config(r: Dict[str, Any]) -> str:
@@ -974,7 +1193,7 @@ def render_show(r: Dict[str, Any]) -> str:
     t = r["today"]
     lines = ["RISK SETTINGS"]
     lines += _settings_lines(r)
-    lines.append(f"TODAY {t['date']} (paper ledger)")
+    lines.append(f"TODAY {t['date']} (" + ("the UTC day, " if r.get("market") == "crypto" else "") + "paper ledger)")
     lines.append(_row("realized P&L", f"{tc.fmt_money(t['realized_pnl'], signed=True)} · "
                                       f"loss streak {t['loss_streak']}"))
     open_line = (f"{tc.fmt_money(t['open_risk'])} across {t['open_positions']} open "

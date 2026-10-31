@@ -15,6 +15,10 @@ Usage:
   python3 scripts/exit_plan.py TSLA --side short --entry 364.18 --save  # store in plans/TSLA.json
   python3 scripts/exit_plan.py TSLA --method manual --save              # reuse the saved plan's entry+stop
   python3 scripts/exit_plan.py TSLA --entry 364.18 --json
+  python3 scripts/exit_plan.py BTC-USD --save                           # crypto: UTC day, 23:55 time stop
+
+Crypto (a Coinbase product such as BTC-USD) trades 24/7: times are UTC, "today" is the UTC day,
+the default time stop is 23:55 UTC and prices round to the product's price increment.
 
 Exit codes: 0 ok, 1 bad input (or not enough bars for the method), 2 data source unreachable.
 """
@@ -34,7 +38,9 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal  # noqa: 
 from typing import Any, Dict, List, Optional, Sequence, Tuple  # noqa: E402
 
 METHODS = ("atr", "structure", "percent", "manual")
-DEFAULTS: Dict[str, Any] = {"rr": 2.0, "atr_mult": 1.5, "pct": 1.0, "lookback": 12, "time_stop": "15:55"}
+DEFAULTS: Dict[str, Any] = {"rr": 2.0, "atr_mult": 1.5, "pct": 1.0, "lookback": 12}
+# The default time stop is the active market's (tc.market().time_stop: 15:55 ET, 23:55 UTC for crypto).
+LAST_HHMM = 23 * 60 + 59     # latest time HH:MM can name (a 24/7 session closes at 24:00)
 BAR_SECONDS = 300
 ATR_N = 14
 STRUCTURE_BUFFER_ATR = 0.1   # structure stop sits this many ATRs beyond the swing low/high
@@ -43,6 +49,7 @@ WIDE_ATR = 4.0               # stop farther than this -> very wide for a day tra
 FAR_ENTRY_ATR = 2.0          # entry this far from the last price -> remind it assumes a fill
 FULL_SESSION_BARS = 36       # a past session counts for the average day range with >= 3 hours of bars
 STALE_DATA_SECONDS = 600     # market open but no bar finished in the last 10 minutes
+FEES_WARN_R = 0.25           # crypto: round-trip paper fees this big a share of R -> a warning, not a note
 # Which flags belong to which methods (a flag given with another method is an error, not ignored).
 FLAG_METHODS = {"stop": ("manual",), "pct": ("percent",), "lookback": ("structure",),
                 "atr_mult": ("atr", "structure")}
@@ -55,13 +62,28 @@ DEPENDENT_SECTIONS = {"time_machine": ("side", "entry", "stop", "target"),
 # Pure core
 # ---------------------------------------------------------------------------
 
-def tick(price: float, rounding: str = ROUND_HALF_UP) -> float:
+def _crypto() -> bool:
+    return tc.market().key == "crypto"
+
+
+def _tz() -> str:
+    return tc.tz_label()
+
+
+def tick(price: float, rounding: str = ROUND_HALF_UP, increment: Optional[float] = None) -> float:
     """Round to the quoting tick: cents at $1 and up, $0.0001 below $1 (half-up, as people round).
 
+    Crypto: the product's price increment (Coinbase quote_increment) when given; without it,
+    cents at $1 and up and 4 significant digits below (sub-cent coins quote far below $0.0001).
     The value is first cleaned to 8 decimals so float noise (98.49999999999999) cannot flip a
     floor/ceiling rounding by a whole tick.
     """
     clean = Decimal(repr(float(price))).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+    if increment is None and _crypto() and 0 < clean < 1:
+        increment = min(0.0001, 10.0 ** (int(math.floor(math.log10(float(clean)))) - 3))
+    if increment:
+        step = Decimal(repr(float(increment)))
+        return float((clean / step).quantize(Decimal(1), rounding=rounding) * step)
     places = Decimal("0.01") if clean >= 1 else Decimal("0.0001")
     return float(clean.quantize(places, rounding=rounding))
 
@@ -100,9 +122,10 @@ def session_true_ranges(bars: Sequence[tc.Bar]) -> List[float]:
     out: List[float] = []
     prev: Optional[tc.Bar] = None
     prev_day = None
+    every_day = tc.market().every_day   # 24/7 (crypto): midnight UTC is not a gap, the price runs on
     for b in bars:
         day = b.date
-        if prev is not None and day == prev_day:
+        if prev is not None and (day == prev_day or every_day):
             pc = prev.close
             out.append(max(b.high - b.low, abs(b.high - pc), abs(b.low - pc)))
         else:
@@ -151,19 +174,28 @@ def structure_level(bars: Sequence[tc.Bar], side: str, lookback: int) -> Dict[st
 
 
 def average_session_range(bars: Sequence[tc.Bar], today: Optional[str]) -> Tuple[Optional[float], int]:
-    """Mean high-low of the complete sessions before `today` (for a target-realism check)."""
+    """Mean high-low of the complete sessions before `today` (for a target-realism check).
+
+    Crypto: whole UTC days only (>= 90% of the 288 slots), since the first day of the 5-day
+    window starts at the current time of day and is partial."""
+    full = FULL_SESSION_BARS
+    if tc.market().every_day:
+        full = int(0.9 * (tc.MARKET_CLOSE - tc.MARKET_OPEN) // (BAR_SECONDS // 60))
     ranges = [max(b.high for b in s) - min(b.low for b in s)
               for d, s in tc.group_sessions(bars).items()
-              if (today is None or d < today) and len(s) >= FULL_SESSION_BARS]
+              if (today is None or d < today) and len(s) >= full]
     return (sum(ranges) / len(ranges), len(ranges)) if ranges else (None, 0)
 
 
 def parse_time_stop(value: Any) -> int:
-    """'15:55' -> minutes after midnight; must fall inside the regular session (09:35-16:00)."""
+    """'15:55' -> minutes after midnight; must fall inside the regular session (09:35-16:00 ET;
+    crypto: 00:05-23:59 UTC)."""
     m = value if isinstance(value, int) else tc.parse_hhmm(str(value))
-    if not tc.MARKET_OPEN + 5 <= m <= tc.MARKET_CLOSE:
-        raise ValueError(f"time stop must be between 09:35 and 16:00 ET (regular session), "
-                         f"got {tc.hhmm(m) if isinstance(m, int) else value}")
+    latest = min(tc.MARKET_CLOSE, LAST_HHMM)
+    if not tc.MARKET_OPEN + 5 <= m <= latest:
+        what = "the UTC day" if tc.market().every_day else "regular session"
+        raise ValueError(f"time stop must be between {tc.hhmm(tc.MARKET_OPEN + 5)} and {tc.hhmm(latest)} "
+                         f"{_tz()} ({what}), got {tc.hhmm(m) if isinstance(m, int) else value}")
     return m
 
 
@@ -177,6 +209,13 @@ def _finite_positive(value: Any, name: str, upper: Optional[float] = None) -> fl
     if upper is not None and v > upper:
         raise ValueError(f"{name} must be at most {upper:g}, got {v:g}")
     return v
+
+
+def _dist(x: float) -> float:
+    """A price distance (risk, ATR) for JSON: 4 decimals; sub-cent crypto keeps 4 significant digits."""
+    if _crypto() and 0 < abs(x) < 0.01:
+        return float(f"{x:.4g}")
+    return round(x, 4)
 
 
 def fmt_rr(rr: float) -> str:
@@ -193,24 +232,32 @@ def make_plan(side: str, entry: float, method: str, bars: Sequence[tc.Bar],
     params: stop (manual), target (instead of rr), rr, atr_mult, pct, lookback, time_stop
       'HH:MM', today 'YYYY-MM-DD', now_ts (bars ending after it are not complete),
       min_rr (warn below), last_price (stale-plan checks), market_open (False: last_price is the
-      previous close, so those checks are worded as conditional on the open).
+      previous close, so those checks are worded as conditional on the open), tick (crypto: the
+      product's price increment), fee_pct (crypto: paper fee per fill, % - adds `fees` in R).
+    Defaults follow the active market (time stop 15:55 ET; 23:55 UTC for crypto).
     """
-    p = dict(DEFAULTS)
+    p = dict(DEFAULTS, time_stop=tc.market().time_stop)
     p.update({k: v for k, v in (params or {}).items() if v is not None})
+    increment = p.get("tick")
+
+    def tk(price: float, rounding: str = ROUND_HALF_UP) -> float:
+        return tick(price, rounding, increment)
+
     side = str(side or "").lower()
     if side not in ("long", "short"):
         raise ValueError(f"side must be long or short, not {side!r}")
     if method not in METHODS:
         raise ValueError(f"unknown method {method!r}; choose from {', '.join(METHODS)}")
-    entry = tick(_finite_positive(entry, "entry"))
+    entry = tk(_finite_positive(entry, "entry"))
     rr_req = _finite_positive(p["rr"], "--rr", upper=50)
     atr_mult = _finite_positive(p["atr_mult"], "--atr-mult", upper=20)
     pct = _finite_positive(p["pct"], "--pct")
     if pct >= 100:
         raise ValueError(f"--pct must be below 100, got {pct:g}")
     lookback = int(p["lookback"])
-    if not 1 <= lookback <= 78:
-        raise ValueError(f"--lookback must be between 1 and 78 bars, got {lookback}")
+    max_lookback = (tc.MARKET_CLOSE - tc.MARKET_OPEN) // (BAR_SECONDS // 60)   # one session: 78 (288 for crypto)
+    if not 1 <= lookback <= max_lookback:
+        raise ValueError(f"--lookback must be between 1 and {max_lookback} bars, got {lookback}")
     time_stop = tc.hhmm(parse_time_stop(p["time_stop"]))
     bars = list(bars or [])
     today = p.get("today") or (bars[-1].date if bars else None)
@@ -222,12 +269,15 @@ def make_plan(side: str, entry: float, method: str, bars: Sequence[tc.Bar],
     atr_value, atr_info = intraday_atr(bars, today, now_ts=p.get("now_ts"))
     if atr_info["source"] == "recent":
         first, last = atr_info["first"], atr_info["last"]
-        span = f"{first} to {last[11:] if first[:10] == last[:10] else last} ET"
+        span = f"{first} to {last[11:] if first[:10] == last[:10] else last} {_tz()}"
         if atr_info["today_bars"]:
             ready = tc.hhmm(tc.MARKET_OPEN + ATR_N * BAR_SECONDS // 60)
             notes.append(f"today has only {atr_info['today_bars']} completed 5-minute bars, so ATR uses the "
-                         f"last {ATR_N} bars across sessions ({span}); re-run after about {ready} ET for "
+                         f"last {ATR_N} bars across sessions ({span}); re-run after about {ready} {_tz()} for "
                          "today's own ATR")
+        elif tc.market().every_day:   # 24/7: yesterday's last bars run straight into today's
+            notes.append(f"no completed 5-minute bars today (UTC) yet, so ATR uses the last {ATR_N} bars "
+                         f"({span})")
         else:
             notes.append(f"no 5-minute bars today yet, so ATR uses the last {ATR_N} bars of the previous "
                          f"session ({span}); the open usually swings more than the close")
@@ -254,13 +304,15 @@ def make_plan(side: str, entry: float, method: str, bars: Sequence[tc.Bar],
     elif method == "structure":
         a = need_atr("the structure stop's buffer")
         structure = structure_level(bars, side, lookback)
-        structure["buffer"] = round(STRUCTURE_BUFFER_ATR * a, 4)
+        structure["buffer"] = _dist(STRUCTURE_BUFFER_ATR * a)
         # round away from the entry so the stop stays beyond the swing level even with a tiny ATR
-        cand = tick(structure["level"] - sign * STRUCTURE_BUFFER_ATR * a,
+        cand = tk(structure["level"] - sign * STRUCTURE_BUFFER_ATR * a,
                     ROUND_FLOOR if side == "long" else ROUND_CEILING)
         structure["stop"] = cand
         extreme = "low" if side == "long" else "high"
-        if structure["sessions"] > 1:
+        if tc.market().every_day:
+            pass   # 24/7: a window across midnight UTC is one continuous chart, no overnight gap
+        elif structure["sessions"] > 1:
             notes.append(f"the {lookback}-bar window reaches back to {structure['window_first']} ET "
                          "(previous session)")
         elif today and structure["window_last"][:10] < today:
@@ -269,7 +321,7 @@ def make_plan(side: str, entry: float, method: str, bars: Sequence[tc.Bar],
                          "an overnight gap can leave that level far from today's price")
         if (cand >= entry) if side == "long" else (cand <= entry):
             notes.append(f"structure stop {tc.fmt_price(cand)} (the {lookback}-bar {extreme} "
-                         f"{tc.fmt_price(structure['level'])} at {structure['at']} ET, "
+                         f"{tc.fmt_price(structure['level'])} at {structure['at']} {_tz()}, "
                          f"{'minus' if side == 'long' else 'plus'} 0.1 ATR) is not {below} the entry "
                          f"{tc.fmt_price(entry)}, so the ATR stop is used instead")
             used = "atr"
@@ -282,7 +334,7 @@ def make_plan(side: str, entry: float, method: str, bars: Sequence[tc.Bar],
         raise ValueError(f"no stop could be computed for method {method}")
     if stop_raw <= 0:
         raise ValueError(f"the {used} stop would be at or below zero ({stop_raw:.4f}) - use a tighter stop")
-    stop = tick(stop_raw)
+    stop = tk(stop_raw)
     if stop == entry:
         raise ValueError(f"the stop rounds to the entry price {tc.fmt_price(entry)} - widen it")
     errs = tc.validate_levels(side, entry, stop, None)
@@ -293,14 +345,14 @@ def make_plan(side: str, entry: float, method: str, bars: Sequence[tc.Bar],
     risk = abs(entry - stop)
 
     if p.get("target") is not None:
-        target = tick(_finite_positive(p["target"], "target"))
+        target = tk(_finite_positive(p["target"], "target"))
         rr_requested: Optional[float] = None
     else:
         raw_target = entry + sign * rr_req * risk
         if raw_target <= 0:
             raise ValueError(f"a {rr_req:g}R target for this short would be at or below zero - lower --rr "
                              "or tighten the stop")
-        target = tick(raw_target)
+        target = tk(raw_target)
         rr_requested = rr_req
     errs = tc.validate_levels(side, entry, stop, target)
     if errs:
@@ -327,8 +379,10 @@ def make_plan(side: str, entry: float, method: str, bars: Sequence[tc.Bar],
                         "(setting min_reward_risk)")
     day_range, day_count = average_session_range(bars, today)
     if day_range and reward > day_range:
-        warnings.append(f"the target needs a {tc.fmt_price(reward)} move, more than the average full-session "
-                        f"range ({tc.fmt_price(day_range)} over the last {day_count} sessions): that would "
+        what, over = (("UTC-day", f"{day_count} days") if tc.market().every_day
+                      else ("full-session", f"{day_count} sessions"))
+        warnings.append(f"the target needs a {tc.fmt_price(reward)} move, more than the average {what} "
+                        f"range ({tc.fmt_price(day_range)} over the last {over}): that would "
                         "be an unusually big day")
     last = p.get("last_price")
     if last:
@@ -361,7 +415,25 @@ def make_plan(side: str, entry: float, method: str, bars: Sequence[tc.Bar],
                          f"{'above' if entry > last else 'below'} {last_txt} - "
                          f"these levels assume you get filled at {tc.fmt_price(entry)}")
 
-    be_at = tick(entry + sign * risk)
+    fees = None
+    fee = float(p.get("fee_pct") or 0.0)
+    if fee > 0:   # crypto: the paper broker charges fee% of notional on the entry and the exit fill
+        rate = fee / 100.0
+        at_stop, at_target = rate * (entry + stop) / risk, rate * (entry + target) / risk
+        win, loss = rr - at_target, 1.0 + at_stop
+        be_fees = 100.0 * loss / (win + loss) if win > 0 else None
+        fees = {"fee_pct": fee, "round_trip_r": round(2 * rate * entry / risk, 3),
+                "at_stop_r": round(at_stop, 3), "at_target_r": round(at_target, 3),
+                "breakeven_win_rate_after_fees_pct": None if be_fees is None else round(be_fees, 1)}
+        if fees["round_trip_r"] >= FEES_WARN_R or be_fees is None:   # the card's Fees row shows the rest
+            warnings.append(f"paper fees ({fee:g}% per fill) cost about {fees['round_trip_r']:.2f}R per round "
+                            f"trip at these levels: the stop loses about {loss:.2f}R and "
+                            + (f"the target nets only {win:.2f}R (break-even win rate after fees {be_fees:.1f}%)"
+                               if be_fees is not None else
+                               f"even the target {'loses' if win < 0 else 'makes'} {abs(win):.2f}R after fees - "
+                               f"this stop is too close to the entry to pay for {fee:g}% per fill"))
+
+    be_at = tk(entry + sign * risk)
     if (be_at < target) if side == "long" else (be_at > target):
         management = {"breakeven_at": be_at,
                       "rule": f"once {tc.fmt_price(be_at)} trades (+1R), move the stop to "
@@ -380,16 +452,16 @@ def make_plan(side: str, entry: float, method: str, bars: Sequence[tc.Bar],
         "method_requested": method,
         "rr": round(rr, 2),
         "rr_requested": rr_requested,
-        "risk_per_share": round(risk, 4),
-        "reward_per_share": round(reward, 4),
+        "risk_per_share": _dist(risk),
+        "reward_per_share": _dist(reward),
         "stop_pct": round(risk / entry * 100, 2),
         "target_pct": round(reward / entry * 100, 2),
         "breakeven_win_rate_pct": round(100.0 / (1.0 + rr), 1),
-        "atr": None if atr_value is None else round(atr_value, 4),
+        "atr": None if atr_value is None else _dist(atr_value),
         "atr_info": atr_info,
         "stop_atr": None if stop_atr is None else round(stop_atr, 2),
         "target_atr": None if target_atr is None else round(target_atr, 2),
-        "avg_session_range": None if day_range is None else round(day_range, 4),
+        "avg_session_range": None if day_range is None else _dist(day_range),
         "params": {"atr_mult": atr_mult if used == "atr" else None,
                    "pct": pct if method == "percent" else None,
                    "lookback": lookback if method == "structure" else None},
@@ -398,6 +470,7 @@ def make_plan(side: str, entry: float, method: str, bars: Sequence[tc.Bar],
         "management": management,
         "warnings": warnings,
         "notes": notes,
+        **({"fees": fees} if fees else {}),   # crypto only, so stock plans print exactly as before
     }
 
 
@@ -443,19 +516,23 @@ def time_context(now: datetime, time_stop_min: int, session_end: Optional[int] =
     minutes_left = None
     if market_open:
         minutes_left = ts_min - now_min
+        tz, every_day = _tz(), tc.market().every_day
         if minutes_left <= 0:
-            warnings.append(f"it is {tc.hhmm(now_min)} ET, past the {tc.hhmm(ts_min)} time stop - "
-                            "no new day trades today")
+            when = (f"until the next UTC day ({tc.hhmm(tc.MARKET_OPEN)} {tz})" if every_day else "today")
+            warnings.append(f"it is {tc.hhmm(now_min)} {tz}, past the {tc.hhmm(ts_min)} time stop - "
+                            f"no new day trades {when}")
         elif minutes_left < 30:
             warnings.append(f"only {minutes_left} minutes left before the {tc.hhmm(ts_min)} time stop")
         if last_bar is not None and now_min >= tc.MARKET_OPEN + 10:
             if last_bar.date != today:
-                warnings.append(f"no 5-minute bars from today yet (latest {_stamp(last_bar)} ET) - "
-                                "delayed data, a market holiday, or the stock is halted")
+                why = ("delayed data or no trades - is the product still trading?" if every_day
+                       else "delayed data, a market holiday, or the stock is halted")
+                warnings.append(f"no 5-minute bars from today yet (latest {_stamp(last_bar)} {tz}) - {why}")
             elif now.timestamp() - (last_bar.ts + BAR_SECONDS) > STALE_DATA_SECONDS:
                 age = int((now.timestamp() - last_bar.ts) // 60)
-                warnings.append(f"the latest 5-minute bar started at {last_bar.time} ET ({age} min ago) - "
-                                "halted or delayed data? Check before trading")
+                why = "no trades or delayed data?" if every_day else "halted or delayed data?"
+                warnings.append(f"the latest 5-minute bar started at {last_bar.time} {tz} ({age} min ago) - "
+                                f"{why} Check before trading")
     elif now.weekday() < 5 and now_min < tc.MARKET_OPEN:
         notes.append("pre-market: these levels are for today's session; re-run after the open for "
                      "today's own ATR")
@@ -526,8 +603,10 @@ def finished_trigger_warning(plan: Dict[str, Any], sym: str, entry: float, today
     day = str(sig.get("date") or "")
     if not (sig.get("session_over") or sig.get("replay") or (day and day < today)):
         return None
-    note = sig.get("note") or f"trigger is from the finished {day} session - re-plan from the next open"
-    when = f" at {sig['triggered_at']} ET" if sig.get("triggered_at") else ""
+    note = sig.get("note") or (
+        f"trigger is from the finished {day} {_tz()} session - re-plan from the current price"
+        if tc.market().every_day else f"trigger is from the finished {day} session - re-plan from the next open")
+    when = f" at {sig['triggered_at']} {_tz()}" if sig.get("triggered_at") else ""
     what = f"{sig.get('label') or sig.get('setup') or 'entry'}{when}"
     return f"the saved {sym} entry {tc.fmt_price(entry)} is an entry-skill trigger ({what}): {note}"
 
@@ -568,7 +647,7 @@ def _int(value: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = tc.make_parser("Set the stop, target and time stop before you enter a day trade (THE PLAN). "
                        "Paper planning only - not financial advice.")
-    p.add_argument("symbol", help="ticker, e.g. TSLA")
+    p.add_argument("symbol", help="ticker, e.g. TSLA, or a Coinbase product such as BTC-USD")
     p.add_argument("--entry", type=_number, help="planned entry price (default: the saved plan's "
                    "entry, else the current price)")
     p.add_argument("--side", type=str.lower, choices=("long", "short"),
@@ -584,7 +663,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pct", type=_number, help="percent stop distance (default 1.0)")
     p.add_argument("--lookback", type=_int, help="bars for the structure stop's swing low/high "
                    "(default 12 = one hour)")
-    p.add_argument("--time-stop", metavar="HH:MM", help="be flat by this time ET (default 15:55)")
+    p.add_argument("--time-stop", metavar="HH:MM", help="be flat by this time (default 15:55 ET; "
+                   "23:55 UTC for crypto)")
     p.add_argument("--save", action="store_true", help="merge the plan into plans/<SYMBOL>.json")
 
     def error(message: str) -> None:  # bad flags are bad input: exit 1, not 2 (= data error)
@@ -604,6 +684,18 @@ def parse_symbol(raw: str) -> str:
 def _not_found(err: Exception) -> bool:
     msg = str(err)
     return any(s in msg for s in ("HTTP 404", "Yahoo: Not Found", "No data found", "no chart data"))
+
+
+def price_increment(sym: str) -> Tuple[Optional[float], Optional[str]]:
+    """Crypto: (Coinbase quote_increment, None), or (None, note) when the product list is
+    unreachable - tick() then keeps cents (4 significant digits below $1). Stocks: (None, None)."""
+    if not _crypto():
+        return None, None
+    try:
+        return float(tc.product_info(sym)["quote_increment"]), None
+    except (tc.FetchError, KeyError, TypeError, ValueError) as e:
+        return None, (f"{sym} price increment unavailable ({e}); prices are rounded to cents "
+                      "(4 significant digits below $1)")
 
 
 def _plan_number(plan: Dict[str, Any], key: str) -> Optional[float]:
@@ -648,9 +740,10 @@ def save(res: Dict[str, Any], existing: Optional[Dict[str, Any]]) -> Tuple[Dict[
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     sym = parse_symbol(args.symbol)
+    tc.use_market_for(sym)               # crypto (BTC-USD): UTC days, 24/7, Coinbase prices
     given = [k for k in ("stop", "pct", "lookback", "atr_mult") if getattr(args, k) is not None]
     method = resolve_method(args.method, given)
-    time_stop_min = parse_time_stop(args.time_stop or DEFAULTS["time_stop"])
+    time_stop_min = parse_time_stop(args.time_stop or tc.market().time_stop)
     now = tc.now_et()
     now_ts = now.timestamp()
     today = now.strftime("%Y-%m-%d")
@@ -671,18 +764,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         stop, stop_source = plan_stop, "saved plan"
 
     # 5-minute bars: required for atr/structure, optional context for percent/manual.
+    source = "Coinbase" if _crypto() else "Yahoo"
+    increment: Optional[float] = None
     try:
         raw, meta = tc.fetch_bars(sym, "5m", "5d")
     except tc.FetchError as e:
         if _not_found(e):
+            if _crypto():
+                raise ValueError(f"Coinbase has no product {sym} - check the symbol (e.g. BTC-USD)") from e
             raise ValueError(f"Yahoo Finance has no data for {sym} - check the symbol") from e
         if method in ("atr", "structure") or (args.entry is None and plan_entry is None):
             raise
         raw, meta = [], {}
         warnings.append(f"5-minute data unavailable, so the ATR sanity checks were skipped ({e})")
+    else:
+        increment, inc_note = price_increment(sym)   # crypto only; the data host answered, so try it
+        if inc_note:
+            notes.append(inc_note)
     bars = usable_bars(raw, now_ts)
     if method in ("atr", "structure") and not bars:
-        raise ValueError(f"Yahoo returned no regular-session 5-minute bars for {sym} in the last 5 days "
+        raise ValueError(f"{source} returned no regular-session 5-minute bars for {sym} in the last 5 days "
                          "(halted or not trading?) - use --pct or --stop with --entry instead")
 
     last_price = bars[-1].close if bars else None
@@ -728,14 +829,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "stop": stop, "target": args.target, "rr": args.rr, "atr_mult": args.atr_mult,
         "pct": args.pct, "lookback": args.lookback, "time_stop": tc.hhmm(tctx["time_stop_min"]),
         "today": today, "now_ts": now_ts, "min_rr": settings.get("min_reward_risk"),
-        "last_price": last_price, "market_open": tctx["market_open"]})
+        "last_price": last_price, "market_open": tctx["market_open"], "tick": increment,
+        "fee_pct": tc.fee_pct(settings=settings)})
     res = dict({"symbol": sym}, **res)
     res["warnings"] = res["warnings"] + warnings + tctx["warnings"]
     res["notes"] = res["notes"] + notes + tctx["notes"]
     res.update({
         "as_of": now.isoformat(timespec="seconds"),
         "entry_source": entry_source, "stop_source": stop_source, "side_source": side_source,
-        "last_price": None if last_price is None else tick(last_price),
+        "last_price": None if last_price is None else tick(last_price, increment=increment),
         "market_open": tctx["market_open"], "minutes_to_time_stop": tctx["minutes_left"],
         "saved": False, "plan_file": None, "dropped_sections": [],
         "disclaimer": tc.DISCLAIMER,
@@ -771,7 +873,8 @@ def _delta(x: float, entry: float) -> str:
     d = x - entry
     sign = "+" if d > 0 else "-"
     places = 2 if entry >= 1 else 4
-    return f"{sign}{abs(d):,.{places}f} ({sign}{abs(d) / entry * 100:.2f}%)"
+    size = tc.fmt_price(abs(d)) if _crypto() and entry < 1 else f"{abs(d):,.{places}f}"   # sub-cent coins
+    return f"{sign}{size} ({sign}{abs(d) / entry * 100:.2f}%)"
 
 
 WIDTH = 100
@@ -803,8 +906,14 @@ def render(res: Dict[str, Any]) -> str:
         ("Target", fp(t), f"{_delta(t, e)}{atr_txt(res['target_atr'])}"),
         ("R:R", f"{res['rr']:.2f}", f"break-even win rate {res['breakeven_win_rate_pct']:.1f}% "
                                      "(before costs)"),
-        ("Time stop", res["time_stop"], f"ET - flat by then, win or lose{left_txt}"),
+        ("Time stop", res["time_stop"], f"{_tz()} - flat by then, win or lose{left_txt}"),
     ]
+    fees = res.get("fees")
+    if fees:   # crypto: what the paper broker's fees do to this plan, in R
+        rows.append(("Fees", f"{fees['round_trip_r']:.2f}R",
+                     f"round trip at {fees['fee_pct']:g}% per fill (paper broker)"
+                     + ("" if fees.get("breakeven_win_rate_after_fees_pct") is None else
+                        f" · break-even win rate after fees {fees['breakeven_win_rate_after_fees_pct']:.1f}%")))
     if res["atr"] is not None:
         info = res["atr_info"]
         where = (f"today's {info['bars']} bars" if info["source"] == "today"

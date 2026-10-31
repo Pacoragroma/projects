@@ -11,7 +11,8 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from helpers import (TempHomeTestCase, et_ts, fake_bars, load_skill_module, run_cli, skill_script,  # noqa: E402
-                     tc, write_fixture, yahoo_chart_url, yahoo_payload)
+                     tc, utc_ts, write_coinbase_fixtures, write_coinbase_products, write_fixture,
+                     yahoo_chart_url, yahoo_payload)
 
 E = load_skill_module("entry", "entry")
 SCRIPT = skill_script("entry", "entry.py")
@@ -633,6 +634,168 @@ class CliTests(TempHomeTestCase):
             p = run_cli(SCRIPT, "TSLA", *args, env=self.env)
             self.assertEqual(p.returncode, 1, (args, p.stderr))
             self.assertNotIn("Traceback", p.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Crypto: 24/7, UTC days, Coinbase candles
+# ---------------------------------------------------------------------------
+
+SAT, FRI = "2026-10-31", "2026-10-30"   # a Saturday: the weekend trades for crypto
+
+
+def mk_utc(day, rows, start="00:00", volume=12.5):
+    """Like mk(), on UTC time (crypto)."""
+    t0 = utc_ts(day, start)
+    return [tc.Bar(t0 + i * 300, *r[:4], r[4] if len(r) > 4 else volume) for i, r in enumerate(rows)]
+
+
+def utc_day(day, price=100.0):
+    return mk_utc(day, flat(price, 288, volume=12.5))
+
+
+class CryptoTests(TempHomeTestCase):
+    def setUp(self):
+        super().setUp()
+        tc.use_market_for("BTC-USD")          # temp_home switches back to US after each test
+
+    def test_orb_starts_at_midnight_utc_with_a_two_hour_default_cutoff(self):
+        r = E.find_trigger(mk_utc(SAT, ORB_ROWS), "orb", "both", {"now_ts": utc_ts(SAT, "00:35")})
+        self.assertEqual((r["status"], r["side"], r["triggered_at"]), ("TRIGGERED", "long", "00:25"))
+        self.assertEqual((r["entry"], r["suggested_stop"]), (101.9, 99.0))
+        self.assertEqual((r["reference"]["or_start"], r["reference"]["or_end"]), ("00:00", "00:15"))
+        self.assertEqual(r["cutoff"], "02:00")
+        self.assertNotIn("or_start", r)                                     # the default anchor
+        p = E.check_params("vwap", {})
+        self.assertEqual((p["or_start"], p["cutoff"], p["session_end"]), (0, 120, 1440))
+
+    def test_or_start_anchors_the_range_and_moves_the_default_cutoff(self):
+        bars = mk_utc(SAT, flat(100.0, 48)) + mk_utc(SAT, ORB_ROWS, start="04:00")
+        r = E.find_trigger(bars, "orb", "both", {"or_start": "04:00", "now_ts": utc_ts(SAT, "04:35")})
+        self.assertEqual((r["status"], r["triggered_at"], r["entry"]), ("TRIGGERED", "04:25", 101.9))
+        self.assertEqual((r["reference"]["or_start"], r["reference"]["or_high"], r["cutoff"]), ("04:00", 101.5, "06:00"))
+        self.assertEqual(r["or_start"], "04:00")
+        res = dict(r, symbol="BTC-USD", as_of="2026-10-31T04:35:00+00:00")
+        self.assertIn("BTC-USD 5m · ORB(15) · TRIGGERED 04:25 UTC · LONG @ 101.90 (OR 04:00-04:15 99.00–101.50)",
+                      E.render(res))
+        self.assertIn("risk 2.90/BTC", E.render(res))
+        # From 00:00 the same bars are a flat 100.00 range broken long by the 04:00 bar's 100.50 close.
+        r = E.find_trigger(bars, "orb", "both", {"cutoff": "23:55", "now_ts": utc_ts(SAT, "04:35")})
+        self.assertEqual((r["triggered_at"], r["entry"]), ("04:05", 100.5))
+        for bad in ({"or_start": "04:02"}, {"or_start": "23:50"}, {"cutoff": "24:00"}, {"cutoff": "00:00"},
+                    {"or_start": "04:00", "cutoff": "04:15"}):
+            with self.assertRaises(ValueError, msg=bad):
+                E.check_params("orb", bad)
+        self.assertEqual(E.check_params("level", {"level": 1.0, "cutoff": "23:59"})["cutoff"], 1439)
+
+    def test_us_defaults_are_unchanged(self):
+        tc.set_market(tc.US)
+        p = E.check_params("orb", {})
+        self.assertEqual((p["or_start"], p["cutoff"], p["session_end"]), (570, 690, 960))   # 09:30, 11:30, 16:00
+        self.assertEqual(E.check_params("orb", {"or_start": "10:00"})["cutoff"], 720)
+        with self.assertRaises(ValueError) as cm:
+            E.check_params("vwap", {"cutoff": "16:05"})
+        self.assertEqual(str(cm.exception), "--cutoff must be between 09:35 and 16:00 ET")
+
+    def test_the_weekend_is_a_session_and_pdh_is_the_previous_utc_day(self):
+        prev = mk_utc(FRI, [(100.0, 103.0, 99.0, 101.0)] + flat(101.0, 287))            # PDH 103, PDL 99
+        today = mk_utc(SAT, [(101.0, 102.0, 100.5, 101.5), (101.5, 103.5, 101.4, 103.2), (103.2, 103.4, 103.0, 103.1)])
+        r = E.evaluate("BTC-USD", prev + today, {}, tc.parse_et(f"{SAT}T00:16"), "pdh", None, {"cutoff": "23:55"})
+        self.assertEqual((r["date"], r["replay"], r["session_over"]), (SAT, False, False))
+        self.assertEqual((r["status"], r["triggered_at"], r["entry"]), ("TRIGGERED", "00:10", 103.2))
+        self.assertEqual((r["context"]["pdh"], r["context"]["pdl"], r["context"]["prev_date"]), (103.0, 99.0, FRI))
+        # VWAP is today's (UTC day) only: yesterday's volume never leaks in.
+        done = [b for b in today if b.ts + 300 <= utc_ts(SAT, "00:16")]
+        self.assertAlmostEqual(r["context"]["vwap"], round(tc.vwap(done)[-1], 2))
+
+    def test_default_cutoff_expiry_note_and_finished_day_note(self):
+        bars = utc_day(FRI) + mk_utc(SAT, flat(100.0, 60))
+        r = E.evaluate("BTC-USD", bars, {}, tc.parse_et(f"{SAT}T05:00"), "level", "long", {"level": 105.0})
+        self.assertEqual((r["status"], r["expired_reason"]), ("EXPIRED", "cutoff"))
+        self.assertIn("02:00 UTC is only the default cutoff; to look for a later trigger re-run with --cutoff "
+                      "HH:MM (up to 23:59)", r["notes"])
+        fri = utc_day("2026-10-29") + mk_utc(FRI, ORB_ROWS + flat(102.2, 282)) + mk_utc(SAT, flat(103.0, 60))
+        res = E.evaluate("BTC-USD", fri, {}, tc.parse_et(f"{SAT}T05:00"), "orb", None, {}, FRI)
+        self.assertEqual((res["status"], res["replay"]), ("TRIGGERED", True))
+        self.assertEqual(E.finished_session_note(res),
+                         f"trigger is from the finished {FRI} UTC session - re-plan from the current price")
+
+    def test_sub_cent_coins_keep_their_precision(self):
+        rows = [(0.00001200, 0.00001210, 0.00001195, 0.00001205), (0.00001205, 0.00001240, 0.00001204, 0.00001236)]
+        bars = E.normalize_bars(mk_utc(SAT, rows, volume=5e9))
+        self.assertEqual(bars[1].close, 0.00001236)                         # not rounded to 0.0000
+        r = E.find_trigger(bars, "level", "long", {"level": 0.0000121, "cutoff": "23:55", "tick": 1e-8})
+        self.assertEqual((r["status"], r["entry"], r["suggested_stop"]), ("TRIGGERED", 0.00001236, 0.00001204))
+        self.assertGreater(r["risk_per_share"], 0)
+        self.assertEqual(E.fallback_tick(0.00001236), 1e-8)
+        self.assertEqual(E.fallback_tick(94500.0), 0.01)
+        tc.set_market(tc.US)
+        self.assertEqual(E.fallback_tick(0.5), 0.0001)
+
+    def test_main_switches_to_the_symbols_market(self):
+        bars = utc_day(FRI) + mk_utc(SAT, ORB_ROWS + flat(102.2, 50))
+        out = io.StringIO()
+        info = {"symbol": "BTC-USD", "base_increment": 1e-8, "quote_increment": 0.01}
+        with fake_bars({"BTC-USD": bars}), mock.patch.dict(os.environ, {"DAYTRADER_NOW": f"{SAT}T04:40"}), \
+                mock.patch.object(tc, "product_info", return_value=info) as pi, redirect_stdout(out):
+            self.assertEqual(E.main(["BTC-USD", "--json"]), 0)
+        pi.assert_called_once_with("BTC-USD")                               # the tick: Coinbase quote_increment
+        r = json.loads(out.getvalue())
+        self.assertEqual((r["as_of"], r["date"], r["triggered_at"]), ("2026-10-31T04:40:00+00:00", SAT, "00:25"))
+        args = E.build_parser().parse_args(["BTC-USD", "--setup", "vwap", "--or-start", "04:00"])
+        with self.assertRaises(ValueError):
+            E.options_from_args(args, tc.parse_et(f"{SAT}T04:40"))           # --or-start is orb-only
+
+
+class CryptoCliTests(TempHomeTestCase):
+    """The real script against Coinbase fixtures, on a Saturday (crypto trades the weekend)."""
+    NOW = "2026-10-31T04:40"
+
+    def setUp(self):
+        super().setUp()
+        self.fx = self.home / "fixtures"
+        bars = []
+        for day in ("2026-10-26", "2026-10-27", "2026-10-28", "2026-10-29", FRI):
+            bars += utc_day(day, 100.0)
+        bars += mk_utc(SAT, ORB_ROWS + flat(102.2, 51))                     # 00:00 .. 04:40 (forming)
+        write_coinbase_fixtures(self.fx, "BTC-USD", bars, "5m", "5d", now_ts=utc_ts(SAT, "04:40"))
+        write_coinbase_products(self.fx)
+        self.env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(self.fx), "DAYTRADER_NOW": self.NOW}
+
+    def test_text_json_and_save(self):
+        p = run_cli(SCRIPT, "BTC-USD", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        lines = p.stdout.splitlines()
+        self.assertEqual(lines[0], "BTC-USD 5m · ORB(15) · TRIGGERED 00:25 UTC · LONG @ 101.90 (OR 99.00–101.50)")
+        self.assertIn("  trigger bar 00:20-00:25 UTC", p.stdout)
+        self.assertIn("suggested stop 99.00 (OR low) · risk 2.90/BTC (2.85%)", p.stdout)
+        self.assertNotIn(" ET", p.stdout)
+        p = run_cli(SCRIPT, "BTC-USD", "--json", "--save", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        r = json.loads(p.stdout)
+        self.assertEqual((r["date"], r["replay"], r["session_over"], r["cutoff"]), (SAT, False, False, "02:00"))
+        self.assertEqual(r["context"]["pdh"], 100.0)
+        plan = json.loads((self.home / "plans" / "BTC-USD.json").read_text())
+        self.assertEqual((plan["entry"], plan["stop"], plan["entry_signal"]["date"]), (101.9, 99.0, SAT))
+        self.assertFalse(plan["entry_signal"]["session_over"])
+
+    def test_or_start_waiting_and_bad_input(self):
+        p = run_cli(SCRIPT, "BTC-USD", "--or-start", "04:00", "--side", "long", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("BTC-USD 5m · ORB(15) · WAITING as of 04:40 UTC · OR 04:00-04:15 102.20–102.20", p.stdout)
+        self.assertIn("until 06:00 UTC", p.stdout)
+        for args in (["--or-start", "4:03"], ["--cutoff", "24:00"], ["--date", "2026-08-01"]):
+            p = run_cli(SCRIPT, "BTC-USD", *args, env=self.env)
+            self.assertEqual(p.returncode, 1, (args, p.stderr))
+            self.assertNotIn("Traceback", p.stderr)
+
+    def test_unreachable_coinbase_is_a_data_error_naming_the_host(self):
+        empty = self.home / "empty"
+        empty.mkdir()
+        p = run_cli(SCRIPT, "BTC-USD", env=dict(self.env, DAYTRADER_FIXTURES=str(empty)))
+        self.assertEqual(p.returncode, 2)
+        self.assertTrue(p.stderr.startswith("data error: "), p.stderr)
+        self.assertIn("api.exchange.coinbase.com", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
 
 
 if __name__ == "__main__":

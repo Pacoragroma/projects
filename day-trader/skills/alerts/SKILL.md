@@ -8,8 +8,9 @@ description: >-
   lows. Use when the user says "alert me if TSLA hits 370", "tell me when NVDA breaks 180", "ping me
   if it drops below my stop", "let me know if AMD moves 3%", "watch for a VWAP reclaim", "set alerts
   for my plan", "did any of my alerts go off?", "what alerts do I have?", "remove the TSLA alerts",
-  or "watch my levels while I'm away". Free Yahoo Finance data, no API key. Alerts only notify -
-  nothing here places an order; paper trading only.
+  or "watch my levels while I'm away". Crypto pairs (BTC-USD, ETH-USD) work 24/7 on Coinbase
+  prices. Free Yahoo Finance and Coinbase data, no API key. Alerts only notify - nothing here places
+  an order; paper trading only.
 ---
 # Alerts
 
@@ -41,9 +42,10 @@ python3 scripts/alerts.py remove ALR-20261030-001 ALR-20261030-002
 python3 scripts/alerts.py remove --symbol TSLA
 python3 scripts/alerts.py remove --fired
 python3 scripts/alerts.py remove --all
+python3 scripts/alerts.py add BTC-USD --below 98000 --once           # crypto pair: Coinbase, 24/7, UTC
 ```
 
-Symbols are Yahoo tickers (`BRK.B`, `^GSPC` for an index). `add` takes exactly one of `--above
+Symbols are Yahoo tickers (`BRK.B`, `^GSPC` for an index) or Coinbase crypto pairs (`BTC-USD`). `add` takes exactly one of `--above
 PRICE`, `--below PRICE`, `--pct-move PCT` or `--vwap-cross [any|above|below]` (put it after the
 symbol), plus `--note TEXT`, `--once`, `--rearm-pct PCT` (default 0.25), and for `--pct-move` only
 `--ref PRICE|prev-close`. `add` and `from-plan` download the current
@@ -53,7 +55,8 @@ alerts for the same levels. Every command takes `--json`.
 
 `watch` checks every `--interval` seconds (default 60, min 15) for up to `--max-minutes` (default
 390, max 600). It stops early when no active alerts are left or the market closes (16:00 ET); started
-while the market is closed (evening, weekend) it runs one check and stops. It runs in the foreground:
+while the market is closed (evening, weekend) it runs one check and stops. Crypto never closes: a
+watch with any crypto alert runs until `--max-minutes` or no active alerts. It runs in the foreground:
 in a chat keep `--max-minutes` inside your command timeout or run it in the background, and remember
 the user is only notified while something is reading its output. `--bell` rings the terminal bell on
 each fire; without `--quiet` it also prints a status line per check and each new warning once (stale
@@ -86,6 +89,10 @@ watch (final summary with `"stopped": "data error"`, then exit 2).
   `above`/`below` fire only on that direction (the other direction silently re-arms it). Needs
   volume: symbols Yahoo reports without volume (indexes like `^VIX`, FX) are refused - use levels.
 - `--once`: switches off after its first fire (status `fired`; clean up with `remove --fired`).
+- **Crypto** (`BTC-USD`, ...): Coinbase Exchange 5-minute candles (`api.exchange.coinbase.com`, no
+  key), around the clock, weekends included. Each alert runs in its own symbol's market, so one
+  `check` can mix stocks and crypto: for crypto the "session" (VWAP, `--ref prev-close`) is the UTC
+  day, and its fire times print in UTC. The header uses the alerts' shared clock (ET if mixed).
 - Plan alerts (from `plans/<SYM>.json`): long = stop *below*, target *above*; short = mirror; entry =
   whichever way price must travel to reach it (a long already above its entry gets a pullback alert,
   with a warning). `check` notes when the saved plan's levels changed since the alerts were set.
@@ -100,14 +107,14 @@ watch (final summary with `"stopped": "data error"`, then exit 2).
   348.91 · "note" · re-arms after a 5m close back across`, then a "Still watching" table (id, symbol,
   alert, status armed|waiting|armed up/down only, last, % away, times fired, note) and why any
   *waiting* alert is waiting.
-- Lead with what fired: symbol, level, **when** (the bar window), and where price is **now** - a level
+- Lead with what fired: symbol, level, **when** (the bar window; UTC for crypto), and where price is **now** - a level
   touched at 10:05 and given back by 10:12 is not the same as price sitting above it. Say "touched" or
   "traded at", never "broke out" or "confirmed".
 - A stop alert firing means price reached the stop level; for a paper position, the broker's `sync`
   records the exit. Say so instead of implying a fill happened here.
 - "Nothing fired" is an answer too: give the nearest armed alert and its distance.
 - Warnings on `add` (already past the level, % far away - typo?, stale plan) must be relayed.
-- JSON (`check`): `as_of, market_open, checked, active, fired [{id, symbol, kind, condition, leg,
+- JSON (`check`): `as_of, tz, market_open, markets {us|crypto: open?}, checked, active, fired [{id, symbol, market, kind, condition, leg,
   level, how (touch|gap|close), price, date, bar_time, bar_complete, bar {open, high, low, close}, vwap, last_price,
   note, once, deactivated, source, plan_role}], alerts [{id, symbol, condition, status, distance_pct,
   waiting_for, fire_count, last_fired, levels [{dir, level, armed}], ...}], symbols {SYM: {range,
@@ -131,5 +138,5 @@ watch (final summary with `"stopped": "data error"`, then exit 2).
   anything go off?".
 - Exit code 1 = bad input or state (the message says what to fix). If the script exits with code 2
   ("data error: ..."), tell the user which host failed (it is in the message, e.g.
-  `query1.finance.yahoo.com`) - in sandboxes the host may need to be allow-listed. Never invent
+  `query1.finance.yahoo.com` or `api.exchange.coinbase.com`) - in sandboxes the host may need to be allow-listed. Never invent
   prices, headlines, or odds to fill the gap; the alerts stay saved and unchanged.

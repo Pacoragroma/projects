@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from helpers import (ROOT, SKILLS, TempHomeTestCase, bars_from_closes, et_ts, fake_bars,  # noqa: E402
                      load_skill_module, random_walk_history, run_cli, skill_script, tc,
-                     trading_days, write_fixture, yahoo_chart_url, yahoo_payload)
+                     trading_days, utc_ts, write_coinbase_fixtures, write_coinbase_products,
+                     write_coinbase_quote, write_fixture, yahoo_chart_url, yahoo_payload)
 
 ep = load_skill_module("exit", "exit_plan")
 SCRIPT = skill_script("exit", "exit_plan.py")
@@ -627,6 +628,156 @@ class CliTests(TempHomeTestCase):
                 p = self.cli(*args)
                 self.assertEqual(p.returncode, 1, (args, p.stdout, p.stderr))
                 self.assertNotIn("Traceback", p.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Crypto: 24/7, UTC days, the market's time stop, fees in R
+# ---------------------------------------------------------------------------
+
+SAT, FRI = "2026-10-31", "2026-10-30"   # a Saturday: crypto trades the weekend
+
+
+def utc_flat(day, n, price=100.0, wick=0.5, start="00:00"):
+    t0 = utc_ts(day, start)
+    return [tc.Bar(t0 + i * 300, price, price + wick, price - wick, price, 12.5) for i in range(n)]
+
+
+class CryptoPlanTests(TempHomeTestCase):
+    def setUp(self):
+        super().setUp()
+        tc.use_market_for("BTC-USD")          # temp_home switches back to US after each test
+
+    def test_time_stop_is_the_markets(self):
+        r = plan("long", 100, "atr", utc_flat(SAT, 18), today=SAT)
+        self.assertEqual((r["time_stop"], r["stop"], r["target"]), ("23:55", 98.5, 103.0))
+        self.assertEqual(ep.parse_time_stop("23:59"), 1439)
+        with self.assertRaises(ValueError) as cm:
+            ep.parse_time_stop("00:00")
+        self.assertIn("between 00:05 and 23:59 UTC (the UTC day)", str(cm.exception))
+        self.assertEqual(plan("long", 100, "percent", [], pct=1, lookback=288, today=SAT)["time_stop"], "23:55")
+        tc.set_market(tc.US)
+        self.assertEqual(plan("long", 100, "percent", [], pct=1)["time_stop"], "15:55")
+
+    def test_ticks_follow_the_product(self):
+        self.assertEqual(ep.tick(94500.123, increment=0.01), 94500.12)
+        self.assertEqual(ep.tick(0.1234567, increment=0.00001), 0.12346)
+        self.assertEqual(ep.tick(0.000012345678), 0.00001235)               # 4 significant digits
+        r = plan("long", 0.00001236, "percent", [], pct=2, today=SAT)
+        self.assertEqual((r["stop"], r["target"]), (0.00001211, 0.00001286))
+        self.assertGreater(r["risk_per_share"], 0)
+        r = plan("long", 0.15234, "percent", [], pct=1, tick=0.00001, today=SAT)
+        self.assertEqual((r["entry"], r["stop"], r["target"]), (0.15234, 0.15082, 0.15538))   # 2R of 0.00152
+        tc.set_market(tc.US)
+        self.assertEqual(ep.tick(0.45125), 0.4513)                          # stocks unchanged
+
+    def test_atr_runs_straight_across_midnight_utc(self):
+        # 24/7: the 00:00 bar's true range includes the jump from yesterday's last close.
+        bars = utc_flat(FRI, 20, price=90.0, start="22:20") + utc_flat(SAT, 5, price=100.0, wick=1.0)
+        a, info = ep.intraday_atr(bars, SAT)
+        self.assertEqual((info["source"], info["today_bars"]), ("recent", 5))
+        self.assertAlmostEqual(a, (9 * 1.0 + (100 + 1 - 90) + 4 * 2.0) / 14)
+        r = plan("long", 100, "manual", bars, stop=98, today=SAT)
+        self.assertTrue(any("no completed" in n or "today has only 5" in n for n in r["notes"]), r["notes"])
+        self.assertTrue(any(f"({FRI} 23:15 to {SAT} 00:20 UTC)" in n for n in r["notes"]), r["notes"])
+
+    def test_fees_in_r(self):
+        tight = plan("long", 100000, "manual", [], stop=99000, rr=2, fee_pct=0.6, today=SAT)
+        f = tight["fees"]
+        self.assertEqual((f["fee_pct"], f["round_trip_r"]), (0.6, 1.2))     # 0.6% x 2 x 100k / 1000
+        self.assertEqual((f["at_stop_r"], f["at_target_r"]), (1.194, 1.212))
+        self.assertAlmostEqual(f["breakeven_win_rate_after_fees_pct"], 100 * 2.194 / (0.788 + 2.194), places=1)
+        self.assertTrue(any(w.startswith("paper fees (0.6% per fill) cost about 1.20R per round trip") for w in
+                            tight["warnings"]), tight["warnings"])
+        wide = plan("long", 100000, "manual", [], stop=90000, rr=2, fee_pct=0.6, today=SAT)
+        self.assertEqual(wide["fees"]["round_trip_r"], 0.12)
+        self.assertFalse(any("paper fees" in w for w in wide["warnings"]))  # the card's Fees row is enough
+        losing = plan("long", 100000, "manual", [], stop=99500, rr=1, fee_pct=0.6, today=SAT)
+        self.assertIsNone(losing["fees"]["breakeven_win_rate_after_fees_pct"])
+        self.assertTrue(any("even the target loses" in w for w in losing["warnings"]), losing["warnings"])
+        tc.set_market(tc.US)
+        self.assertNotIn("fees", plan("long", 100, "manual", [], stop=98))   # stock plans: no fee section
+
+    def test_time_context_is_24_7(self):
+        c = ep.time_context(tc.parse_et(f"{SAT}T04:40"), tc.parse_hhmm("23:55"))
+        self.assertEqual((c["market_open"], c["minutes_left"], c["notes"]), (True, 1155, []))
+        late = ep.time_context(tc.parse_et(f"{SAT}T23:57"), tc.parse_hhmm("23:55"))
+        self.assertIn("it is 23:57 UTC, past the 23:55 time stop - no new day trades until the next UTC day "
+                      "(00:00 UTC)", late["warnings"])
+        stale = ep.time_context(tc.parse_et(f"{SAT}T04:40"), 1435, None, tc.Bar(utc_ts(SAT, "04:00"), 1, 1, 1, 1, 1))
+        self.assertTrue(any("no trades or delayed data?" in w for w in stale["warnings"]), stale["warnings"])
+
+    def test_finished_trigger_fallback_note(self):
+        sig = {"setup": "orb", "label": "ORB(15)", "date": FRI, "triggered_at": "00:25", "entry": 101.9}
+        self.assertEqual(ep.finished_trigger_warning({"entry_signal": sig}, "BTC-USD", 101.9, SAT),
+                         "the saved BTC-USD entry 101.90 is an entry-skill trigger (ORB(15) at 00:25 UTC): trigger is "
+                         f"from the finished {FRI} UTC session - re-plan from the current price")
+
+
+class CryptoCliTests(TempHomeTestCase):
+    """The real script against Coinbase fixtures on a Saturday, 04:40 UTC."""
+    NOW = f"{SAT}T04:40"
+
+    def setUp(self):
+        super().setUp()
+        self.fx = self.home / "fixtures"
+        bars = []
+        for day in ("2026-10-26", "2026-10-27", "2026-10-28", "2026-10-29", FRI):
+            bars += utc_flat(day, 288, price=100.0, wick=0.5)
+        bars += utc_flat(SAT, 57, price=100.0, wick=0.5)                    # 00:00 .. 04:40 (forming)
+        write_coinbase_fixtures(self.fx, "BTC-USD", bars, "5m", "5d", now_ts=utc_ts(SAT, "04:40"))
+        write_coinbase_quote(self.fx, "BTC-USD", 100.0, when=f"{SAT}T04:40:00Z")
+        write_coinbase_products(self.fx)
+        self.env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(self.fx), "DAYTRADER_NOW": self.NOW}
+
+    def cli(self, *args):
+        return run_cli(SCRIPT, *args, env=self.env)
+
+    def test_json_text_and_save(self):
+        p = self.cli("BTC-USD", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        r = json.loads(p.stdout)
+        self.assertEqual((r["entry"], r["entry_source"], r["stop"], r["target"]), (100.0, "current price", 98.5, 103.0))
+        self.assertEqual((r["time_stop"], r["minutes_to_time_stop"], r["market_open"]), ("23:55", 1155, True))
+        self.assertEqual((r["atr"], r["atr_info"]["source"], r["atr_info"]["today_bars"]), (1.0, "today", 56))
+        self.assertEqual(r["avg_session_range"], 1.0)                       # whole UTC days only
+        self.assertEqual(r["fees"]["round_trip_r"], 0.8)                    # 0.6% x 2 x 100 / 1.50
+        self.assertTrue(any("paper fees" in w for w in r["warnings"]), r["warnings"])
+        p = self.cli("BTC-USD", "--entry", "100", "--pct", "10", "--rr", "1.5", "--save")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("THE PLAN — BTC-USD LONG · percent stop (10%)", p.stdout)
+        self.assertIn("ENTRY 100.00 / STOP 90.00 / TARGET 115.00 / R:R 1.5", p.stdout)
+        self.assertIn("23:55  UTC - flat by then, win or lose (19h 15m left)", p.stdout)
+        self.assertIn("Fees 0.12R round trip at 0.6% per fill (paper broker) · break-even win rate after fees "
+                      "44.8%", " ".join(p.stdout.split()))                  # (1 + 0.114) / (1.5 - 0.129 + 1.114)
+        saved = json.loads((self.home / "plans" / "BTC-USD.json").read_text())
+        self.assertEqual((saved["stop"], saved["target"], saved["exit_plan"]["time_stop"]), (90.0, 115.0, "23:55"))
+
+    def test_bad_time_stop_and_unknown_product(self):
+        p = self.cli("BTC-USD", "--time-stop", "00:00")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("between 00:05 and 23:59 UTC", p.stderr)
+        empty = self.home / "empty"
+        empty.mkdir()
+        p = run_cli(SCRIPT, "BTC-USD", env=dict(self.env, DAYTRADER_FIXTURES=str(empty)))
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("api.exchange.coinbase.com", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+
+class CryptoDeskRunDocTests(unittest.TestCase):
+    def test_desk_run_says_crypto_works_the_same(self):
+        sec = desk_run_section("exit")
+        line = [ln for ln in sec.splitlines() if ln.startswith("Crypto works the same way")]
+        self.assertEqual(len(line), 1, sec)
+        for word in ("Coinbase", "`BTC-USD`", "UTC", "UTC day", "fractional", "fees"):
+            self.assertIn(word, line[0])
+        self.assertEqual(sec, desk_run_section("time-machine"))
+        for skill in ("entry", "exit", "time-machine"):
+            text = (SKILLS / skill / "SKILL.md").read_text(encoding="utf-8")
+            desc = " ".join(re.search(r"^description: >-\n(.*?)^---", text, re.M | re.S).group(1).split())
+            self.assertIn('"paper trade BTC"', desc, skill)
+            self.assertIn('"plan a trade on BTC-USD"', desc, skill)
+            self.assertLessEqual(len(desc), 1024, skill)
 
 
 if __name__ == "__main__":

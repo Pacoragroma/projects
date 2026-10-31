@@ -7,8 +7,10 @@ description: >-
   done since. Use when the user asks "did TSLA break its opening range", "is the ORB long on yet",
   "tell me when NVDA reclaims VWAP", "watch AMD for a break of 165", "let me know when it takes out
   yesterday's high", "wait for the entry", "what would the 15-minute ORB have done on Tuesday", or
-  wants a trigger before setting a stop and target. Free Yahoo Finance 5-minute data, no API key.
-  Reports mechanical triggers, not advice; paper trading only.
+  wants a trigger before setting a stop and target. Crypto too (24/7, UTC days): "paper trade BTC",
+  "plan a trade on BTC-USD", "did ETH-USD break its range since 04:00". Free Yahoo Finance (stocks)
+  or Coinbase (crypto) 5-minute data, no API key. Reports mechanical triggers, not advice; paper
+  trading only.
 ---
 # Entry
 
@@ -29,18 +31,30 @@ python3 scripts/entry.py AMD --level 165 --side long --cutoff 15:55 # --level im
 python3 scripts/entry.py AAPL --setup pdh --cutoff 15:55            # long only (pdl = short only)
 python3 scripts/entry.py TSLA --watch --interval 60 --max-minutes 30 --save
 python3 scripts/entry.py TSLA --date 2026-10-29 --json              # replay a past session
+python3 scripts/entry.py BTC-USD --or-start 04:00 --save            # crypto: range from 04:00 UTC
+python3 scripts/entry.py BTC-USD --level 100000 --side long --cutoff 23:55
 ```
 
 Flags: `--setup orb|vwap|level|pdh|pdl` (default `orb`), `--side long|short|both` (default `both`
 for orb/vwap/level = whichever triggers first; pdh is long-only, pdl short-only), `--or-minutes N`
-(orb only, multiple of 5, default 15), `--level PRICE`, `--cutoff HH:MM` (ET, default 11:30: no
-trigger by then = EXPIRED), `--min-rvol X` (volume filter, off by default), `--date YYYY-MM-DD`
+(orb only, multiple of 5, default 15), `--or-start HH:MM` (orb only: start the range here instead of
+the session open; on the 5-minute grid), `--level PRICE`, `--cutoff HH:MM` (ET; UTC for crypto;
+default 2 hours after the range start = 11:30 ET: no trigger by then = EXPIRED), `--min-rvol X`
+(volume filter, off by default), `--date YYYY-MM-DD`
 (replay, last ~60 days), `--watch` with `--interval SECONDS` (default 60, min 15) and
 `--max-minutes M` (default 120), `--save` (write a trigger into the saved plan), `--json`.
 
 The 11:30 default cutoff suits the morning ORB. For a VWAP, level or PDH/PDL watch, or any request
 made after 11:30, pass a later cutoff (e.g. `--cutoff 15:55`); otherwise the result is EXPIRED at
 once (the output adds a note when the default cutoff caused the expiry).
+
+**Crypto** (a Coinbase product such as `BTC-USD`, `ETH-USD`, `SOL-USD`) works the same way with
+these differences: it trades 24/7, so times are **UTC** and a session is a **UTC day** (VWAP, the
+day range and PDH/PDL all use UTC days; weekends trade). There is no opening bell: the ORB starts at
+00:00 UTC unless you anchor it with `--or-start HH:MM` (e.g. where the user starts watching), and
+the default cutoff is 2 hours after that start (02:00 UTC by default), so a later request needs
+`--or-start` or `--cutoff 23:55`. Prices come from Coinbase's public candles (no account, no key);
+the one-tick stop rule uses the product's price increment.
 
 `--watch` prints one status line per check and the full card at the end; it stops on TRIGGERED,
 EXPIRED, `--max-minutes`, or Ctrl-C (exit 130). If the first check cannot reach Yahoo it exits 2 at
@@ -51,11 +65,13 @@ per check, then a last one with `"final": true`.
 
 ## How it works
 - Data: Yahoo 5-minute bars (`5d`; `60d` for a past `--date`), regular session 09:30-16:00 ET,
-  plus the previous session for PDH/PDL. Bars are snapped to the 5-minute grid.
+  plus the previous session for PDH/PDL. Bars are snapped to the 5-minute grid. Crypto: Coinbase
+  5-minute candles over the same ranges, whole UTC days.
 - **Completed bars only.** A bar counts once its 5 minutes are over (start + 5 min <= now); the bar
   still forming never triggers. `triggered_at` is the trigger bar's *close* time (10:10 bar ->
   10:15). Entry = that bar's close. Only bars closing by `--cutoff` can trigger.
-- `orb`: opening range = high/low of the first `--or-minutes` (09:30-09:45 by default). Long = first
+- `orb`: opening range = high/low of the first `--or-minutes` from `--or-start` (09:30-09:45 by
+  default; 00:00-00:15 UTC for crypto). Long = first
   later bar that closes above the OR high, short = closes below the OR low. Stop = the other side
   of the range (OR mid also reported). If the stock printed nothing in the window (late open/halt),
   the range is taken from its first N minutes of trading, with a note.
@@ -79,7 +95,8 @@ per check, then a last one with `"final": true`.
 
 ## Reading the output / how to present it to the user
 Example: `TSLA 5m · ORB(15) · TRIGGERED 10:15 ET · LONG @ 364.18 (OR 358.32–363.10)`, then the
-trigger bar (OHLC, volume, rvol), `suggested stop 358.32 (OR low) · risk 5.86/share (1.61%)`, a
+trigger bar (OHLC, volume, rvol), `suggested stop 358.32 (OR low) · risk 5.86/share (1.61%)` (crypto:
+`risk 871.77/BTC`, times in UTC), a
 "since trigger" line (last price, move in $ and R, high/low, whether the stop was hit - the bar still
 forming counts here, since its prices already traded; it never counts for the trigger), a context line
 (VWAP, day range, PDH/PDL, previous close), and notes.
@@ -97,8 +114,8 @@ forming counts here, since its prices already traded; it never counts for the tr
   last, move, move_r, high, low, max_favorable_r, max_adverse_r, stop_hit, stop_hit_at,
   stop_hit_in_forming_bar},
   watching [{side, level, armed, distance, distance_pct}], rejected [], context {vwap, high, low,
-  pdh, pdl, prev_close}, cutoff, session_over, expired_reason, notes [], saved {path, cleared,
-  note}`.
+  pdh, pdl, prev_close}, cutoff, or_minutes, or_start (only when `--or-start` moved it),
+  session_over, expired_reason, notes [], saved {path, cleared, note}`.
 
 ## Next step on the desk
 - `--save` writes `symbol, side, entry, stop (= suggested stop), setup, entry_signal {...}` into
@@ -107,7 +124,8 @@ forming counts here, since its prices already traded; it never counts for the tr
 - A trigger from a session that is already over (`--save` after the close, or with a past `--date`)
   is still saved - useful for replays - but never silently: the output adds a note and the plan's
   `entry_signal` gets `session_over: true` and `note: "trigger is from the finished <date> session -
-  re-plan from the next open"`. Exit and time-machine repeat that note whenever they plan or test
+  re-plan from the next open"` (crypto, which never closes: `"... the finished <date> UTC session -
+  re-plan from the current price"`). Exit and time-machine repeat that note whenever they plan or test
   from this entry. Tell the user the move has already played out; for a live trade, re-run entry
   after the next open.
 - Then the **exit** skill sets stop and target before entering (`exit_plan.py TSLA` reads the saved
@@ -125,5 +143,6 @@ forming counts here, since its prices already traded; it never counts for the tr
   through the broker skill and only after the user's explicit yes.
 - Exit code 1 = bad input (the message says what to fix, e.g. `--setup level needs --level PRICE`).
 - If the script exits with code 2 ("data error: ..."), tell the user which host failed (it is in
-  the message, e.g. `query1.finance.yahoo.com`) - in sandboxes the host may need to be
-  allow-listed. Never invent prices, headlines, or odds to fill the gap.
+  the message, e.g. `query1.finance.yahoo.com`, or `api.exchange.coinbase.com` for crypto) - in
+  sandboxes the host may need to be allow-listed. Never invent prices, headlines, or odds to fill
+  the gap.

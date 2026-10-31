@@ -31,6 +31,27 @@ ticket ──► pending ──confirm --yes──► confirmed (filled now → 
   blocks. The banner is `MARKET CLOSED — preview only. Re-run ticket after 09:30 ET [on the next
   trading day] to get a ticket you can confirm.`, or `PAST THE HH:MM ET TIME STOP — ...` between
   the time stop and the close.
+* **Crypto** never closes: weekends included, a ticket is confirmable from 00:00 UTC up to its time
+  stop (default 23:55 UTC). After it the ticket is a preview: `PAST THE 23:55 UTC TIME STOP —
+  preview only. Re-run ticket after 00:00 UTC to get a ticket you can confirm.` The yes rule, the
+  10-second rule, the expiry and the budget re-check at confirm are the same as for stocks.
+
+## Markets
+
+| | US stocks | Crypto (`BTC-USD`, `ETH-USD`, ... any `BASE-QUOTE` Coinbase product) |
+|---|---|---|
+| prices | Yahoo Finance | Coinbase Exchange public market data (`api.exchange.coinbase.com`), no key |
+| clock / day | US/Eastern, weekdays 09:30-16:00 | UTC, every day 00:00-24:00 (a session = a UTC day) |
+| default time stop | 15:55 ET | 23:55 UTC |
+| size (`--qty`) | whole shares | fractional, a multiple of the product's `base_increment` (else 1e-8) |
+| price tick | cents at $1+ (`sub-penny` refused) | the product's `quote_increment` (off-tick refused) |
+| paper fees | none | `crypto_fee_pct` (default 0.6) % of notional on every fill |
+
+* `--market us|crypto` on `sync`, `positions`, `tickets`, `history` picks whose clock and "today" are
+  shown (default `$DAYTRADER_MARKET`, else US). Each ticket and trade is always replayed, dated and
+  expired in its own market; times of the other market carry their label (`05:15 UTC`).
+* `ticket` reads the product rules (`/products`, cached a day). Offline it assumes the 1e-8 size
+  step, does not check the tick, and says so in a note.
 
 ## Fill rules
 
@@ -42,6 +63,7 @@ ticket ──► pending ──confirm --yes──► confirmed (filled now → 
 | sell-short limit, quote ≥ limit | filled at the quote |
 | sell-short limit, quote < limit | `working` |
 | fill price already through the stop or past the target | refused (exit 1), ticket stays pending |
+| crypto, any fill | the price rounded to the product's tick; pays `fee_pct` % of its notional |
 | working buy limit, later bar with `low < limit` | filled at `min(limit, bar open)` |
 | working buy limit, confirmation bar closes `< limit` | filled at the limit |
 | working short limit, later bar with `high > limit` | filled at `max(limit, bar open)` |
@@ -96,6 +118,12 @@ starting with the bar that contains the fill:
 decimals; `null` when that risk is 0 (a fill already at or through the stop). Open risk in
 `positions`, `sync` and the budget check uses the same directional risk (`tc.trade_initial_risk`).
 
+Crypto fees: `entry_fee = fee_pct% x entry_price x qty` at the fill, `exit_fee = fee_pct% x
+exit_price x qty` at the exit (both to the cent), `fees = entry_fee + exit_fee`, `gross_pnl` as
+above, and **`pnl = gross_pnl - fees`**; `r_multiple` is that net `pnl` over the price risk, so a
+stop-out is worse than -1R by the fees. `positions` shows crypto P&L net of both fees (as if closed
+at the last price), plus `unrealized_gross` and `fees_if_closed`.
+
 ## Budget check
 
 `tc.budget_check(risk)` runs on the ledger plus today's working orders, each treated as an open
@@ -108,6 +136,12 @@ trade at its limit. It blocks (exit 3) when one of these is true:
 
 `ticket` uses the planned risk. `confirm` uses the risk at the actual fill price, which can be
 higher for a market order. Both sync open trades first, so stops already hit count.
+
+For crypto every risk the budget counts - the new ticket's, open trades', working orders' - is the
+loss if the stop fills **including the fees of both fills**: `|entry - stop| x qty + fee_pct% x
+(entry + stop) x qty` (the ticket's `max_loss`; `risk` stays the price risk). The day is the
+calendar day of the ticket's market (the UTC day for crypto); every trade in the ledger is placed
+on that day by its own time.
 
 Settings come from the risk and budget skills (`settings.json`). `ticket` also warns when:
 
@@ -144,6 +178,17 @@ Other fields that can appear:
 
 * tickets: `cancelled_at`, `cancel_reason`, `expired_at`, `synced_at`;
 * trades: `ambiguous_exit`, `synced_at`.
+* every ticket and trade carries `market` (`us` | `crypto`). Crypto tickets add `tick`, `qty_step`,
+  `fee_pct`, `fees_at_stop`, `max_loss`; crypto trades add `tick`, `fee_pct`, `entry_fee`,
+  `exit_fee`, `fees`, `gross_pnl` (ids, stamps and days in UTC):
+
+```json
+{"id": "TRADE-20261031-001", "symbol": "BTC-USD", "market": "crypto", "side": "long", "qty": 0.01,
+ "entry_price": 101234.56, "stop": 99000.0, "target": 104000.0, "time_stop": "23:55",
+ "opened_at": "2026-10-31T04:41:00+00:00", "status": "closed", "exit_price": 104000.0,
+ "closed_at": "2026-10-31T05:10:00+00:00", "exit_reason": "target", "tick": 0.01, "fee_pct": 0.6,
+ "entry_fee": 6.07, "exit_fee": 6.24, "fees": 12.31, "gross_pnl": 27.65, "pnl": 15.34, "r_multiple": 0.69}
+```
 
 Writes are atomic, behind a lock file (`ledger.lock`). Only this skill writes the ledger.
 
@@ -182,11 +227,20 @@ Writes are atomic, behind a lock file (`ledger.lock`). Only this skill writes th
   `summary`, `warnings[]`, `errors[]`.
 * `tickets`: `tickets[]` (status shown as `expired` once past `expires_at`).
 * `history`: `days, since, trades[]`, and `totals {trades, wins, losses, flat, win_rate_pct,
-  net_pnl, avg_r, best, worst}`.
+  net_pnl, avg_r, best, worst}` (plus `fees, gross_pnl` when crypto trades are in the window).
+* `sync` events of crypto trades add `market`, `fees`, `gross_pnl`.
 
 ## Data
 
-* Fills use `tc.quote` (Yahoo 1-minute chart, `regularMarketPrice`).
+* Fills use `tc.quote` (Yahoo 1-minute chart, `regularMarketPrice`; crypto: the Coinbase ticker).
 * Exits use `tc.fetch_bars(symbol, "5m", "5d")`, or `"60d"` for items more than 4 days old.
-  Yahoo keeps 60 days of 5-minute bars.
-* Offline tests and demos: set `$DAYTRADER_FIXTURES`. Replays: set `$DAYTRADER_NOW` (ET).
+  Yahoo keeps 60 days of 5-minute bars. Crypto: Coinbase 5-minute candles for the UTC days since
+  the oldest open item (`"2d"` for today's), 300 candles a page.
+* Offline tests and demos: set `$DAYTRADER_FIXTURES`. Replays: set `$DAYTRADER_NOW` (naive = the
+  command's market clock: ET, or UTC for a crypto ticket/trade or `--market crypto`; `Z` works).
+
+```bash
+python3 scripts/broker.py ticket --symbol ETH-USD --qty 0.25 --type market --stop 3450 --target 3650
+python3 scripts/broker.py positions --market crypto
+python3 scripts/broker.py history --days 7 --market crypto --json
+```

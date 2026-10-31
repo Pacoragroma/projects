@@ -13,7 +13,8 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from helpers import (TempHomeTestCase, bars_from_closes, et_ts, fake_bars, load_skill_module, run_cli,
-                     skill_script, tc, write_fixture, yahoo_chart_url, yahoo_payload)  # noqa: E402
+                     skill_script, tc, utc_ts, write_coinbase_fixtures, write_coinbase_products,  # noqa: E402
+                     write_coinbase_quote, write_fixture, yahoo_chart_url, yahoo_payload)
 
 broker = load_skill_module("broker", "broker")
 SCRIPT = skill_script("broker", "broker.py")
@@ -1016,6 +1017,345 @@ class CloseCancelPositionsHistoryTests(BrokerCase):
             self.run_main("tickets")
 
 
+# ---------------------------------------------------------------------------
+# Crypto: 24/7 on UTC days, Coinbase prices, fractional sizes, fees on every fill
+# ---------------------------------------------------------------------------
+
+CDAY = "2026-10-31"          # a Saturday: the stock market is closed, crypto is not
+
+
+def cbar(hhmm, o, h, l, c, day=CDAY):
+    return tc.Bar(utc_ts(day, hhmm), o, h, l, c, 5.0)
+
+
+def crypto_flat(start, end, price=101200.0, day=CDAY, start_day=None, wick=100.0):
+    """Flat 5-minute UTC bars from `start` (on start_day) up to `end` (on day), exclusive."""
+    t, stop = utc_ts(start_day or day, start), utc_ts(day, end)
+    out = []
+    while t < stop:
+        out.append(tc.Bar(t, price, price + wick, price - wick, price, 5.0))
+        t += 300
+    return out
+
+
+def btc_trade(**kw):
+    t = {"id": "TRADE-20261031-001", "ticket_id": "TKT-20261031-001", "symbol": "BTC-USD", "market": "crypto",
+         "side": "long", "qty": 0.01, "entry_price": 101234.56, "stop": 99000.0, "target": 104000.0,
+         "time_stop": "23:55", "opened_at": f"{CDAY}T04:41:00+00:00", "status": "open", "tick": 0.01,
+         "fee_pct": 0.6, "entry_fee": 6.07, "fees": 6.07}
+    t.update(kw)
+    return t
+
+
+class CryptoPureTests(unittest.TestCase):
+    def test_tick_rounding_and_rules(self):
+        self.assertEqual(broker.px(101234.567, 0.01), 101234.57)
+        self.assertEqual(broker.px(0.000012345, 1e-8), 0.00001235)
+        self.assertEqual(broker.px(364.175), 364.18)                    # stocks unchanged
+        self.assertTrue(broker.off_tick(101234.567, 0.01))
+        self.assertFalse(broker.off_tick(101234.57, 0.01))
+        self.assertTrue(broker.off_step(0.0123456789, 1e-8))
+        self.assertFalse(broker.off_step(0.02946375, 1e-8))
+        self.assertEqual(broker.floor_step(0.0123456789, 1e-8), 0.01234567)
+        self.assertEqual((broker.price_arg(101250, 0.01), broker.price_arg(364.18)), ("101250.00", "364.18"))
+
+    def test_markets_and_symbols(self):
+        self.assertIs(broker.row_market({"symbol": "BTC-USD"}), tc.CRYPTO)
+        self.assertIs(broker.row_market({"symbol": "BRK-B", "market": "crypto"}), tc.US)    # the symbol decides
+        self.assertEqual(broker.parse_symbol("1inch-usd"), "1INCH-USD")
+        self.assertEqual(broker.qty_text({"symbol": "BTC-USD", "qty": 0.02946375}), "0.02946375")
+        self.assertEqual(broker.qty_text({"symbol": "TSLA", "qty": 1000}), "1000")
+        self.assertEqual(broker.unit_word("ETH-USD"), "ETH")
+
+    def test_fees_on_both_fills_net_pnl_and_r(self):
+        t = btc_trade()
+        broker.close_trade(t, 104000.0, f"{CDAY}T05:10:00+00:00", "target")
+        # gross (104000 - 101234.56) x 0.01 = 27.65; fees 6.07 + 6.24; R = net / 22.3456 price risk
+        self.assertEqual((t["gross_pnl"], t["exit_fee"], t["fees"], t["pnl"], t["r_multiple"]),
+                         (27.65, 6.24, 12.31, 15.34, 0.69))
+        t = btc_trade()
+        broker.close_trade(t, 99000.0, f"{CDAY}T05:05:00+00:00", "stop")
+        self.assertEqual((t["gross_pnl"], t["fees"], t["pnl"], t["r_multiple"]), (-22.35, 12.01, -34.36, -1.54))
+        us = {"id": "T", "symbol": "TSLA", "side": "long", "qty": 8, "entry_price": 364.10, "stop": 358.32}
+        broker.close_trade(us, 370.04, f"{DAY}T10:35:00-04:00", "target")
+        self.assertEqual(us["pnl"], 47.52)
+        self.assertNotIn("fees", us)                                       # stocks: no fee fields
+
+    def test_budget_counts_crypto_fees_at_the_stop(self):
+        rows = broker.budget_rows([btc_trade(), {"id": "U", "symbol": "TSLA", "side": "long", "qty": 8,
+                                                 "entry_price": 364.18, "stop": 358.32, "status": "open"}])
+        # 22.3456 price risk + 0.6% x (101234.56 + 99000) x 0.01 = 12.0141 of fees
+        self.assertAlmostEqual(tc.trade_initial_risk(rows[0]), 34.3597, places=3)
+        self.assertAlmostEqual(tc.trade_initial_risk(rows[1]), 46.88, places=6)
+        self.assertEqual(rows[1]["stop"], 358.32)
+
+    def test_session_rules_follow_the_utc_clock(self):
+        with tc.market_scope("BTC-USD"):
+            sat = tc.parse_et(f"{CDAY}T04:40")
+            self.assertIsNone(broker.order_window_problem(sat, 1435, 15))             # the weekend is open
+            late = tc.parse_et(f"{CDAY}T23:57")
+            self.assertIn("23:55 UTC time stop", broker.order_window_problem(late, 1435, 15))
+            self.assertEqual(broker.preview_banner(late, 1435),
+                             "PAST THE 23:55 UTC TIME STOP — preview only. Re-run ticket after 00:00 UTC to get a "
+                             "ticket you can confirm.")
+            self.assertEqual((broker.parse_time_stop("23:55"), broker.default_time_stop()), (1435, "23:55"))
+            with self.assertRaises(ValueError) as cm:
+                broker.parse_time_stop("00:00")
+            self.assertIn("between 00:05 and 23:59 UTC", str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            broker.parse_time_stop("17:00")
+        self.assertIn("between 09:35 and 16:00 ET", str(cm.exception))            # stocks unchanged
+        self.assertEqual(broker.default_time_stop(), "15:55")
+
+    def test_walk_runs_on_the_utc_day_through_the_night(self):
+        bars = crypto_flat("22:00", "23:59") + crypto_flat("00:00", "01:00", day="2026-11-01")
+        with tc.market_scope("BTC-USD"):
+            bars = broker.normalize_bars(bars)
+            self.assertEqual(len(bars), 36)                   # no session filter: every 5-minute slot counts
+            r = broker.walk_position("long", 101200, 99000, 104000, utc_ts(CDAY, "22:01"), bars,
+                                     utc_ts("2026-11-01", "00:30"), 1435, tick=0.01)
+            self.assertEqual((r["reason"], r["price"], tc.et_hhmm(r["ts"])), ("eod", 101200.0, "23:55"))
+            r = broker.walk_working("long", 101000, utc_ts(CDAY, "22:01"), bars, utc_ts("2026-11-01", "00:01"),
+                                    1435, tick=0.01)
+            self.assertEqual(r["status"], "expired")
+
+
+class CryptoBrokerCase(BrokerCase):
+    NOW = f"{CDAY}T04:40"
+
+    def setUp(self):
+        super().setUp()
+        self.fx = self.home / "fx"
+        write_coinbase_products(self.fx)
+        self.quote(101234.56)
+
+    def quote(self, price, when=f"{CDAY}T04:40:30Z"):
+        write_coinbase_quote(self.fx, "BTC-USD", price, when=when)
+
+    def run_main(self, *argv, now=None):
+        with mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(self.fx)}):
+            return super().run_main(*argv, now=now)
+
+    def cticket(self, *extra, qty="0.01", entry="101250", stop="99000", target="104000", now=None):
+        args = ["ticket", "--symbol", "BTC-USD", "--qty", qty, "--entry", entry, "--stop", stop]
+        if target is not None:
+            args += ["--target", target]
+        return self.run_json(*args, *extra, now=now)
+
+    def cconfirm(self, tid="TKT-20261031-001", now=f"{CDAY}T04:41", yes=True):
+        return self.run_json("confirm", tid, *(["--yes"] if yes else []), now=now)
+
+    def open_btc(self):
+        code, res = self.cticket()
+        self.assertEqual(code, 0, res)
+        code, res = self.cconfirm()
+        self.assertEqual((code, res["status"]), (0, "filled"), res)
+        return res["trade"]
+
+
+class CryptoTicketTests(CryptoBrokerCase):
+    def test_saturday_ticket_is_a_real_ticket_with_fees_and_coinbase_label(self):
+        code, res = self.cticket()
+        self.assertEqual((code, res["status"], res["preview"]), (0, "pending", False))
+        k = res["ticket"]
+        self.assertEqual((k["id"], k["market"], k["qty"], k["tick"], k["qty_step"], k["fee_pct"]),
+                         ("TKT-20261031-001", "crypto", 0.01, 0.01, 1e-8, 0.6))
+        self.assertEqual((k["risk"], k["fees_at_stop"], k["max_loss"]), (22.5, 12.02, 34.52))
+        self.assertEqual((k["created_at"], k["expires_at"]), (f"{CDAY}T04:40:00+00:00", f"{CDAY}T04:55:00+00:00"))
+        self.assertEqual(res["card"], "BUY 0.01 BTC-USD · LIMIT 101,250.00 · TARGET 104,000.00 · STOP 99,000.00 · "
+                                      "PAPER · REAL MONEY: OFF · Coinbase prices · WAITING FOR YOUR YES — reply yes "
+                                      "to confirm ticket TKT-20261031-001")
+        self.assertTrue(any("round-trip fees ≈ 0.53R at these levels" in n for n in res["notes"]), res["notes"])
+        self.assertTrue(any("after fees the R:R is 0.44" in w for w in res["warnings"]), res["warnings"])
+        code, text = self.run_main("ticket", "--symbol", "BTC-USD", "--qty", "0.01", "--entry", "101250",
+                                   "--stop", "99000", "--target", "104000")
+        self.assertIn("  Fees      0.6% per fill (paper) · $12.02 if the stop fills -> loss at the stop $34.52", text)
+        self.assertIn("  Expires   04:55 UTC (15 min) · day order · flat by 23:55 UTC", text)
+        self.assertIn("replaced the earlier pending BTC-USD ticket(s) TKT-20261031-001", text)
+
+    def test_stock_tickets_carry_their_market_and_stay_unchanged(self):
+        code, res = self.ticket(now=f"{DAY}T10:15")
+        self.assertEqual((code, res["ticket"]["market"]), (0, "us"))
+        self.assertNotIn("fee_pct", res["ticket"])
+        self.assertTrue(res["card"].endswith("· PAPER · REAL MONEY: OFF · WAITING FOR YOUR YES — reply yes to "
+                                             "confirm ticket TKT-20261030-001"))
+
+    def test_fractional_sizes_ticks_and_whole_shares(self):
+        for extra, msg in ((["--qty", "0.0123456789"], "size step 0.00000001 (e.g. 0.01234567)"),
+                           (["--qty", "0.000000001"], "size step 0.00000001 (the smallest size is 0.00000001)"),
+                           (["--qty", "0"], "--qty must be a positive amount of BTC"),
+                           (["--entry", "101250.555"], "not on BTC-USD's price tick 0.01 (e.g. 101250.56)")):
+            with self.subTest(extra=extra), self.assertRaises(ValueError) as cm:
+                self.cticket(*extra)
+            self.assertIn(msg, str(cm.exception))
+        with fake_bars({("TSLA", "1m"): quote_bars(100)}), self.assertRaises(ValueError) as cm:
+            self.run_main("ticket", "--symbol", "TSLA", "--qty", "8.5", "--entry", "100", "--stop", "99",
+                          now=f"{DAY}T10:15")
+        self.assertIn("whole number of shares", str(cm.exception))
+        self.assertEqual(self.ledger()["tickets"], [])
+
+    def test_past_the_utc_time_stop_is_a_preview_until_midnight(self):
+        code, res = self.cticket(now=f"{CDAY}T23:57")
+        self.assertEqual((code, res["status"], res["preview"]), (0, "preview", True))
+        self.assertEqual(res["banner"], "PAST THE 23:55 UTC TIME STOP — preview only. Re-run ticket after 00:00 UTC "
+                                        "to get a ticket you can confirm.")
+        self.assertIn("· Coinbase prices · PAST THE 23:55 UTC TIME STOP", res["card"])
+        self.assertEqual(self.ledger()["tickets"], [])
+        code, res = self.cticket(now="2026-11-01T00:01")                     # Sunday, a new UTC day
+        self.assertEqual((code, res["status"], res["ticket"]["id"]), (0, "pending", "TKT-20261101-001"))
+
+    def test_budget_counts_fees_and_blocks_on_the_loss_at_the_stop(self):
+        # price risk 0.06 x 2,250 = $135 fits the $150 daily max loss; with $72.09 of fees at the stop it does not
+        code, res = self.cticket(qty="0.06")
+        self.assertEqual((code, res["blocked"]), (broker.EXIT_BLOCKED, True))
+        self.assertTrue(any("$207.09" in r for r in res["reasons"]), res["reasons"])
+        code, text = self.run_main("ticket", "--symbol", "BTC-USD", "--qty", "0.06", "--entry", "101250",
+                                   "--stop", "99000", "--target", "104000")
+        self.assertIn("Risk $207.09 (incl. $72.09 of fees at the stop) - BLOCKED by today's budget:", text)
+        self.assertEqual(self.ledger()["tickets"], [])
+
+
+class CryptoConfirmTests(CryptoBrokerCase):
+    def test_the_yes_rule_holds_on_a_saturday(self):
+        code, res = self.cticket()
+        tid = res["ticket"]["id"]
+        code, res = self.cconfirm(tid, yes=False)
+        self.assertEqual((code, res["confirmed"]), (1, False))
+        self.assertIn("in a later message", res["reason"])
+        with self.assertRaises(ValueError) as cm:                       # same breath: refused
+            self.cconfirm(tid, now=f"{CDAY}T04:40:05")
+        self.assertIn("s ago", str(cm.exception))
+        code, res = self.cconfirm(tid)
+        self.assertEqual((code, res["status"], res["fill_price"]), (0, "filled", 101234.56))
+        tr = res["trade"]
+        self.assertEqual((tr["id"], tr["market"], tr["qty"], tr["entry_fee"], tr["fees"], tr["opened_at"]),
+                         ("TRADE-20261031-001", "crypto", 0.01, 6.07, 6.07, f"{CDAY}T04:41:00+00:00"))
+        with self.assertRaises(ValueError) as cm:
+            self.cconfirm(tid, now=f"{CDAY}T04:42")
+        self.assertIn("already confirmed", str(cm.exception))
+        code, text = self.run_main("tickets", "--market", "crypto", now=f"{CDAY}T04:42")
+        self.assertIn("TKT-20261031-001  confirmed  BUY 0.01 BTC-USD · LIMIT 101,250.00", text)
+
+    def test_expiry_and_the_time_stop_still_apply(self):
+        self.cticket()
+        with self.assertRaises(ValueError) as cm:
+            self.cconfirm(now=f"{CDAY}T04:56")
+        self.assertIn("expired at 04:55 UTC without a yes", str(cm.exception))
+        code, res = self.cticket(now=f"{CDAY}T23:50")
+        self.assertEqual(res["ticket"]["expires_at"], f"{CDAY}T23:55:00+00:00")     # clipped to the time stop
+        with self.assertRaises(ValueError) as cm:
+            self.cconfirm(res["ticket"]["id"], now=f"{CDAY}T23:56")
+        self.assertIn("expired", str(cm.exception))
+        self.assertEqual(self.ledger()["trades"], [])
+
+    def test_budget_is_rechecked_at_confirm_with_fees(self):
+        code, res = self.cticket(qty="0.03")                       # $67.50 + $36.05 fees = $103.55 now: OK
+        self.assertEqual(code, 0, res)
+        led = self.ledger()
+        led["trades"].append(btc_trade(id="TRADE-20261031-000", status="closed", pnl=-60.0, r_multiple=-1.0,
+                                       exit_price=98000.0, closed_at=f"{CDAY}T03:00:00+00:00",
+                                       opened_at=f"{CDAY}T02:00:00+00:00"))
+        tc.save_ledger(led)
+        # $60 lost today + $67.04 price risk fits $150; + $36.04 of fees does not -> blocked, still pending
+        code, res = self.cconfirm()
+        self.assertEqual((code, res["blocked"]), (broker.EXIT_BLOCKED, True))
+        self.assertEqual([k["status"] for k in self.ledger()["tickets"]], ["pending"])
+
+    def test_working_order_fills_later_and_pays_its_fee(self):
+        code, res = self.cticket(entry="101000")
+        code, res = self.cconfirm()
+        self.assertEqual((code, res["status"]), (0, "working"))
+        self.assertIn("before 23:55 UTC; otherwise it expires (day order)", broker.render_confirm(res))
+        code, text = self.run_main("tickets", now=f"{CDAY}T04:42")        # the US view labels the UTC row
+        self.assertIn("04:40 UTC  until 23:55", text)
+        five = crypto_flat("04:40", "05:00") + [cbar("05:00", 101100, 101150, 100900, 101050)]
+        with fake_bars({("BTC-USD", "5m"): five}):
+            code, res = self.run_json("sync", "--market", "crypto", now=f"{CDAY}T05:06")
+        ev = res["events"][0]
+        self.assertEqual((ev["kind"], ev["price"], ev["market"]), ("filled", 101000.0, "crypto"))
+        tr = self.ledger()["trades"][0]
+        self.assertEqual((tr["entry_price"], tr["entry_fee"], tr["fee_pct"]), (101000.0, 6.06, 0.6))
+
+
+class CryptoSyncTests(CryptoBrokerCase):
+    def test_stop_hit_is_net_of_fees_in_dollars_and_r(self):
+        self.open_btc()
+        five = crypto_flat("04:40", "05:00") + [cbar("05:00", 101200, 101300, 98900, 99100)]
+        with fake_bars({("BTC-USD", "5m"): five}):
+            code, text = self.run_main("sync", "--market", "crypto", now=f"{CDAY}T05:10")
+        self.assertIn("SYNC · 05:10 UTC · paper ledger", text)
+        self.assertIn("TRADE-20261031-001 BTC-USD LONG 0.01: STOP @ 99,000.00 in the 05:00 UTC bar · -$34.36 -1.54R "
+                      "(net of $12.01 fees)", text)
+        self.assertIn("Today: realized -$34.36", text)
+        t = self.ledger()["trades"][0]
+        self.assertEqual((t["exit_reason"], t["closed_at"], t["gross_pnl"], t["fees"], t["pnl"], t["r_multiple"]),
+                         ("stop", f"{CDAY}T05:05:00+00:00", -22.35, 12.01, -34.36, -1.54))
+
+    def test_us_view_sync_fetches_crypto_bars_at_the_same_instant(self):
+        # A naive $DAYTRADER_NOW is read in the active market's zone. A symbol-less sync (US view: ET)
+        # that replays a crypto trade must not let Coinbase re-read it as UTC - 4 h earlier here.
+        self.open_btc()
+        five = crypto_flat("04:40", "05:00") + [cbar("05:00", 101200, 101300, 98900, 99100)]
+        seen = []
+
+        def fake(symbol, interval="5m", range_="60d", prepost=False, ttl=None):
+            seen.append((tc.market().key, tc.now_et().timestamp()))
+            return list(five), {"symbol": symbol}
+        with mock.patch.object(tc, "fetch_bars", side_effect=fake):
+            code, res = self.run_json("sync", now=f"{CDAY}T01:10")       # 01:10 ET = 05:10 UTC
+        self.assertEqual(seen, [("crypto", utc_ts(CDAY, "05:10"))])
+        self.assertEqual([(e["reason"], e["price"]) for e in res["events"]], [("stop", 99000.0)])
+        self.assertEqual(os.environ.get("DAYTRADER_NOW"), self.NOW)          # restored afterwards
+
+    def test_time_stop_at_2355_utc(self):
+        self.open_btc()
+        five = crypto_flat("04:40", "23:59")
+        with fake_bars({("BTC-USD", "5m"): five}):
+            code, res = self.run_json("sync", "--market", "crypto", now="2026-11-01T00:10")
+        ev = res["events"][0]
+        self.assertEqual((ev["reason"], ev["price"], ev["at"]), ("eod", 101200.0, f"{CDAY}T23:55:00+00:00"))
+        self.assertEqual((ev["gross_pnl"], ev["fees"], ev["pnl"]), (-0.35, 12.14, -12.49))
+
+    def test_positions_history_and_close_are_net_of_fees(self):
+        tr = self.open_btc()
+        self.quote(102000.0, when=f"{CDAY}T04:45:00Z")
+        code, res = self.run_json("positions", "--market", "crypto", now=f"{CDAY}T04:45")
+        p = res["positions"][0]
+        # gross (102000 - 101234.56) x 0.01 = 7.65; fees if closed now 6.07 + 6.12
+        self.assertEqual((p["unrealized_gross"], p["fees_if_closed"], p["unrealized"]), (7.65, 12.19, -4.54))
+        code, text = self.run_main("positions", "--market", "crypto", now=f"{CDAY}T04:45")
+        self.assertIn("PAPER POSITIONS · 04:45 UTC · REAL MONEY: OFF", text)
+        self.assertIn("Crypto P&L is net of the paper fees of both fills", text)
+        five = crypto_flat("04:40", "04:45")
+        with fake_bars({("BTC-USD", "5m"): five}):
+            code, res = self.run_json("close", tr["id"], "--price", "101250", now=f"{CDAY}T04:46")
+        t = res["trade"]
+        self.assertEqual((t["exit_reason"], t["exit_price"], t["fees"], t["pnl"]), ("manual", 101250.0, 12.15, -12.0))
+        with fake_bars({("BTC-USD", "5m"): five}), self.assertRaises(ValueError) as cm:
+            self.run_main("close", tr["id"], "--price", "105000", now=f"{CDAY}T04:47")
+        self.assertIn("already closed", str(cm.exception))
+        code, res = self.run_json("history", "--market", "crypto", now=f"{CDAY}T05:00")
+        self.assertEqual((res["totals"]["net_pnl"], res["totals"]["fees"], res["totals"]["gross_pnl"]),
+                         (-12.0, 12.15, 0.15))
+        code, text = self.run_main("history", "--market", "crypto", now=f"{CDAY}T05:00")
+        self.assertIn("· crypto fees $12.15 (P&L and R are net of them)", text)
+
+    def test_a_mixed_ledger_replays_every_trade_in_its_own_market(self):
+        us = {"id": "TRADE-20261030-001", "ticket_id": "TKT-20261030-001", "symbol": "TSLA", "market": "us",
+              "side": "long", "qty": 40, "entry_price": 100.0, "stop": 99.0, "target": 102.0, "time_stop": "15:55",
+              "opened_at": f"{DAY}T10:16:00-04:00", "status": "open"}
+        tc.save_ledger({"tickets": [], "trades": [us, btc_trade()]})
+        five = {("TSLA", "5m"): flat_session(), ("BTC-USD", "5m"): crypto_flat("04:40", "05:00")}
+        with fake_bars(five):
+            code, text = self.run_main("sync", "--market", "crypto", now=f"{CDAY}T05:00")
+        self.assertIn("TRADE-20261030-001 TSLA LONG 40: TIME STOP @ 100.00 in the 15:50 ET bar", text)
+        self.assertIn("open: TRADE-20261031-001 BTC-USD LONG 0.01 @ 101,234.56", text)
+        self.assertIn("(checked through 05:00 UTC)", text)
+        led = self.ledger()
+        self.assertEqual(led["trades"][0]["closed_at"], f"{DAY}T15:55:00-04:00")     # dated in its own zone
+        self.assertEqual(led["trades"][1]["status"], "open")
+
+
 class PaperOnlyTests(unittest.TestCase):
     def test_no_live_flag_or_mode(self):
         p = broker.build_parser()
@@ -1128,6 +1468,51 @@ class CliTests(TempHomeTestCase):
         self.assertNotIn("WAITING FOR YOUR YES", r.stdout)
         r = run_cli(SCRIPT, "tickets", "--all", "--json", env=env)
         self.assertEqual(json.loads(r.stdout)["tickets"], [])
+
+    def test_crypto_saturday_ticket_confirm_sync_budget_cli(self):
+        """BTC-USD on Saturday 2026-10-31 (UTC): ticket -> yes in a later step -> the target fills on a later
+        bar -> P&L net of fees -> the budget's UTC day shows it. Coinbase fixtures only, no network."""
+        fx = self.home / "fx"
+        write_coinbase_products(fx)
+        write_coinbase_quote(fx, "BTC-USD", 101234.56, when=f"{CDAY}T04:40:30Z")
+        five = crypto_flat("00:00", "05:30", start_day="2026-10-30")
+        i = next(n for n, b in enumerate(five) if b.ts == utc_ts(CDAY, "05:05"))
+        five[i] = cbar("05:05", 101200, 104100, 101100, 103900)               # the target trades at 05:05
+        write_coinbase_fixtures(fx, "BTC-USD", five, "5m", "2d", now_ts=utc_ts(CDAY, "05:30"))
+        env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(fx)}
+        budget_script = skill_script("budget", "budget.py")
+
+        def cli(now, *args, script=SCRIPT):
+            return run_cli(script, *args, env=dict(env, DAYTRADER_NOW=now))
+
+        r = cli(f"{CDAY}T04:40", "ticket", "--symbol", "BTC-USD", "--qty", "0.01", "--entry", "101250",
+                "--stop", "99000", "--target", "104000")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("BUY 0.01 BTC-USD · LIMIT 101,250.00 · TARGET 104,000.00 · STOP 99,000.00 · PAPER · "
+                      "REAL MONEY: OFF · Coinbase prices", r.stdout)
+        self.assertIn("WAITING FOR YOUR YES — reply yes to confirm ticket TKT-20261031-001", r.stdout)
+        self.assertNotIn("PREVIEW", r.stdout)                                   # the weekend is open for crypto
+        r = cli(f"{CDAY}T04:41", "confirm", "TKT-20261031-001")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("NOT CONFIRMED", r.stdout)
+        r = cli(f"{CDAY}T04:41", "confirm", "TKT-20261031-001", "--yes", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        res = json.loads(r.stdout)
+        self.assertEqual((res["status"], res["fill_price"], res["trade"]["market"], res["trade"]["entry_fee"]),
+                         ("filled", 101234.56, "crypto", 6.07))
+        r = cli(f"{CDAY}T05:30", "sync", "--market", "crypto")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("TARGET @ 104,000.00 in the 05:05 UTC bar · +$15.34 +0.69R (net of $12.31 fees)", r.stdout)
+        r = cli(f"{CDAY}T05:30", "history", "--market", "crypto", "--json")
+        tot = json.loads(r.stdout)["totals"]
+        self.assertEqual((tot["net_pnl"], tot["fees"], tot["gross_pnl"], tot["avg_r"]), (15.34, 12.31, 27.65, 0.69))
+        r = cli(f"{CDAY}T05:31", "status", "--market", "crypto", script=budget_script)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("RISKED SO FAR · Sat 2026-10-31 · 05:31 UTC (market open)", r.stdout)
+        self.assertIn("realized P&L  +$15.34  (1 closed: 1 W / 0 L)", r.stdout)
+        st = json.loads(cli(f"{CDAY}T05:31", "status", "--market", "crypto", "--json", script=budget_script).stdout)
+        self.assertEqual((st["date"], st["realized_pnl"], st["trades_today"], st["status"]),
+                         (CDAY, 15.34, 1, "OPEN FOR TRADING"))
 
     def test_data_error_is_one_line_exit_2(self):
         env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_NOW": f"{DAY}T10:15"}

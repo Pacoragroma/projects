@@ -820,5 +820,217 @@ class SkillDocTests(unittest.TestCase):
             self.assertEqual(cm.exception.code, 1, argv)
 
 
+
+# ---------------------------------------------------------------------------
+# Crypto: Coinbase candles, UTC days, no SEC; review split by market
+# ---------------------------------------------------------------------------
+
+CDAY = "2026-10-31"            # a Saturday (crypto trades, stocks do not)
+CNOW = f"{CDAY}T04:40"          # UTC
+
+
+def crypto_fixture_bars():
+    """(daily, 5m) Coinbase-like history ending at 04:40 UTC on CDAY: 21 days of 5m candles and
+    ~5 months of daily candles whose last 21 match the 5m data."""
+    intra = helpers.crypto_history(CDAY, 21, start_price=100_000.0, seed=4, until="04:40")
+    with tc.market_scope(tc.CRYPTO):
+        days = tc.group_sessions(intra)
+    early = helpers.crypto_history("2026-10-10", 140, start_price=80_000.0, seed=5, minutes=1440)
+    agg = [tc.Bar(helpers.utc_ts(d, "00:00"), s[0].open, max(b.high for b in s), min(b.low for b in s),
+                  s[-1].close, sum(b.volume for b in s)) for d, s in days.items()]
+    return early + agg, intra
+
+
+class CryptoBriefTests(TempHomeTestCase):
+    NOW = CNOW
+
+    def setUp(self):
+        super().setUp()
+        tc.set_market(tc.CRYPTO)            # as cmd_brief does for BTC-USD
+        self.now = tc.now_et()
+
+    def test_market_phase_and_daily_cleaning(self):
+        self.assertEqual(an.market_phase(self.now), "open")                       # Saturday, 24/7
+        self.assertEqual(an.market_phase(tc.parse_et("2026-11-01T23:59")), "open")
+        midnight = helpers.utc_ts(CDAY, "00:00")
+        out = an.clean_daily([tc.Bar(midnight - 86400, 1, 2, 0.5, 1.5, 10), tc.Bar(midnight, 1, 2, 0.5, 1.5, 10)],
+                             CDAY, 0)
+        self.assertEqual([b.date for b in out], ["2026-10-30", CDAY])   # no evening-ET shift, kept at 00:00
+        self.assertEqual(out[-1].ts, midnight)
+
+    def test_brief_uses_utc_days_no_gap_no_sec(self):
+        daily, intra = crypto_fixture_bars()
+        b = an.build_brief("btc-usd", daily, intra, self.now, meta={"shortName": "BTC"}, replay=True)
+        self.assertEqual((b["market"], b["market_type"], b["tz"]), ("open", "crypto", "UTC"))
+        self.assertEqual((b["session"]["date"], b["session"]["is_today"], b["session"]["source"]), (CDAY, True, "5m"))
+        self.assertEqual(b["session"]["first_bar"], "00:00")
+        self.assertEqual(b["prior_day"]["date"], "2026-10-30")
+        self.assertIsNone(b["gap"])
+        self.assertEqual(b["sec"]["status"], "n/a")
+        self.assertEqual(b["sources"]["sec"], "n/a")
+        names = " | ".join(lv["name"] for lv in b["levels"])
+        self.assertIn("prior UTC day high", names)
+        self.assertIn("VWAP (UTC day)", names)
+        self.assertNotIn("today's VWAP", names)
+        rv = b["relative_volume"]
+        self.assertEqual((rv["method"], rv["through"], rv["sessions"]), ("time_of_day", "04:40", 20))
+        self.assertEqual(b["liquidity"]["unit"], "BTC")
+        self.assertEqual(b["prior_day"]["high"], round(max(x.high for x in intra if x.date == "2026-10-30"), 2))
+        text = an.render_brief(b)
+        self.assertTrue(text.startswith("BRIEF · BTC-USD · BTC · Sat 2026-10-31 04:40 UTC · 24/7 (UTC day)"), text)
+        self.assertIn("through 04:40 UTC vs the same time on 20 prior days", text)
+        self.assertIn("BTC), last 20 UTC days", text)
+        self.assertIn("SEC         n/a (a crypto pair has no SEC filings)", text)
+        self.assertNotIn("GAP", text)
+        self.assertNotRegex(text, r"\bET\b")
+
+    def test_quiet_stretch_is_not_an_early_close_for_crypto(self):
+        # Coinbase sends no candle for a 5 minutes without trades: that must not cut the comparison.
+        day = helpers.crypto_history(CDAY, 1, seed=1, until="04:40")
+        thin = [x for x in day if not ("02:00" <= x.time < "03:00")]
+        past = {"2026-10-%02d" % d: helpers.crypto_history("2026-10-%02d" % d, 1, seed=d) for d in range(25, 31)}
+        rv, why = an.time_of_day_rvol(thin, past, 4 * 60 + 40)
+        self.assertIsNone(why)
+        self.assertEqual((rv["through"], rv["sessions"]), ("04:40", 6))
+
+    def test_gather_never_asks_sec_and_reads_21_days_of_5m(self):
+        daily, intra = crypto_fixture_bars()
+        with fake_bars({("BTC-USD", "1d"): daily, ("BTC-USD", "5m"): intra}) as fb, fake_http({}) as fh:
+            b = an.gather_brief("BTC-USD", self.now)
+        self.assertEqual([c.args[1:3] for c in fb.call_args_list], [("1d", "6mo"), ("5m", "21d")])
+        self.assertEqual(fh.call_count, 0)                  # nothing went to sec.gov
+        self.assertEqual(b["sec"]["status"], "n/a")
+
+
+def ctrade(tid, pnl, opened, closed, fees=0.6, **kw):
+    """A closed broker-shaped crypto trade: 0.01 BTC, risk |100,000 - 99,000| x 0.01 = $10."""
+    t = trade(tid, pnl, opened, closed, symbol="BTC-USD", entry=100_000.0, stop=99_000.0, qty=0.01, **kw)
+    t.update(market="crypto", fees=fees, gross_pnl=None if pnl is None else pnl + fees, fee_pct=0.6)
+    return t
+
+
+def utc(day, hhmm):
+    return f"{day}T{hhmm}:00+00:00"
+
+
+class CryptoReviewTests(TempHomeTestCase):
+    NOW = f"{DAY}T21:00"     # ET: already 01:00 UTC on Oct 31
+
+    def ledger(self):
+        led = ReviewTests.four(None)
+        led["trades"] += [
+            ctrade("x", 15, utc("2026-10-29", "23:50"), utc("2026-10-30", "00:20")),
+            ctrade("y", -10.6, utc("2026-10-31", "00:05"), utc("2026-10-31", "00:40"), exit_reason="stop"),
+            ctrade("z", 8, utc("2026-10-30", "13:05"), utc("2026-10-30", "14:00"), exit_reason="eod")]
+        return led
+
+    def test_rows_use_the_trades_own_clock(self):
+        rows, _ = an.journal_rows(self.ledger(), "2026-10-01", "2026-10-31")
+        by = {r["id"]: r for r in rows}
+        self.assertEqual((by["x"]["market"], by["x"]["entry_minute"], by["x"]["closed_date"]),
+                         ("crypto", 23 * 60 + 50, "2026-10-30"))
+        self.assertEqual(by["a"]["market"], "us")
+        self.assertEqual(by["a"]["entry_minute"], 9 * 60 + 45)            # still ET
+        self.assertEqual(by["x"]["fees"], 0.6)
+        self.assertEqual(by["x"]["r"], 1.5)                                 # net P&L / $10 price risk
+
+    def test_crypto_close_date_is_a_utc_date(self):
+        led = self.ledger()
+        # The review's "today" is Oct 30 (ET); the crypto trade closed 00:40 UTC Oct 31 is crypto's today.
+        r = an.build_review(led, 1, DAY, todays={"us": DAY, "crypto": CDAY})
+        self.assertEqual(sorted(t["id"] for t in r["trades"]), ["y"])
+        self.assertEqual(r["windows"], {"crypto": [CDAY, CDAY]})
+        r = an.build_review(led, 1, DAY)                                    # one date for all markets
+        self.assertEqual(sorted(t["id"] for t in r["trades"]), ["x", "z"])   # both closed on Oct 30 UTC
+
+    def test_split_by_market(self):
+        r = an.build_review(self.ledger(), 30, DAY, account=25_000, todays={"us": DAY, "crypto": CDAY})
+        self.assertEqual(r["count"], 7)
+        self.assertEqual({b["key"]: b["n"] for b in r["by_market"]}, {"us": 4, "crypto": 3})
+        self.assertEqual(set(r["markets"]), {"us", "crypto"})
+        self.assertEqual((r["markets"]["us"]["net_pnl"], r["markets"]["crypto"]["net_pnl"]), (25.0, 12.4))
+        self.assertEqual((r["markets"]["us"]["crypto_fees"], r["markets"]["crypto"]["crypto_fees"]), (None, 1.8))
+        self.assertEqual(r["crypto_fees"], 1.8)
+        hours = [b["key"] for b in r["by_hour"]]
+        self.assertEqual(hours, ["09:00", "10:00", "14:00", "00:00 UTC", "13:00 UTC", "23:00 UTC"])
+        self.assertEqual({b["key"] for b in r["by_window"]} - {"09:30-10:30", "10:30-14:00", "14:00-16:00"},
+                         {"00:00-06:00 UTC", "12:00-18:00 UTC", "18:00-24:00 UTC"})
+        self.assertTrue(any(t.startswith("By market: US stocks +0.12R per trade over 4, crypto") for t in r["takeaways"]),
+                        r["takeaways"])
+        text = an.render_review(r)
+        for piece in ("Crypto paper fees $1.80 - crypto P&L and R are net of them",
+                      "  US stocks: 4 trades · net +$25.00", "  crypto: 3 trades · net +$12.40",
+                      "entry hour ET", "entry window ET", "entry hour UTC", "entry window UTC",
+                      "crypto by UTC day: 2026-10-02 to 2026-10-31"):
+            self.assertIn(piece, text)
+        self.assertRegex(text, r"\nmarket +trades")
+        self.assertRegex(text, r"\n00:00-06:00 +1 ")                       # UTC suffix dropped under its title
+
+    def test_market_filter_and_us_only_output_unchanged(self):
+        led = self.ledger()
+        r = an.build_review(led, 30, CDAY, market="crypto")
+        self.assertEqual((r["count"], r["markets"], r["market"]), (3, None, "crypto"))
+        text = an.render_review(r)
+        self.assertIn("JOURNAL REVIEW · crypto only · last 30 days", text)
+        self.assertNotIn("entry hour ET", text)
+        us = an.build_review(led, 30, DAY, market="us")
+        self.assertEqual(us["count"], 4)
+        plain = an.build_review(ReviewTests.four(None), 30, DAY)
+        self.assertIsNone(plain["markets"])
+        self.assertIsNone(plain["crypto_fees"])
+        self.assertNotIn("market  trades", an.render_review(plain))
+        self.assertNotIn("UTC", an.render_review(plain))
+
+    def test_missing_crypto_pnl_is_rebuilt_net_of_fees(self):
+        t = ctrade("q", 0, utc(CDAY, "01:00"), utc(CDAY, "02:00"))
+        t.update(pnl=None, r_multiple=None, exit_price=101_000.0, gross_pnl=None)
+        t.pop("fees")
+        rows, _ = an.journal_rows({"tickets": [], "trades": [t]}, "2026-10-01", CDAY)
+        fees = 0.006 * (100_000 + 101_000) * 0.01                           # 0.6% on both fills
+        self.assertAlmostEqual(rows[0]["pnl"], 10.0 - fees)
+        self.assertAlmostEqual(rows[0]["fees"], fees)
+
+
+class CryptoCliTests(TempHomeTestCase):
+    def env(self, fixtures, now=CNOW):
+        return {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(fixtures), "DAYTRADER_NOW": now}
+
+    def test_brief_btc_on_a_saturday_with_coinbase_fixtures(self):
+        fx = self.home / "fx"
+        daily, intra = crypto_fixture_bars()
+        now_ts = helpers.utc_ts(CDAY, "04:40")
+        helpers.write_coinbase_fixtures(fx, "BTC-USD", daily, "1d", "6mo", now_ts)
+        helpers.write_coinbase_fixtures(fx, "BTC-USD", intra, "5m", "21d", now_ts)
+        p = helpers.run_cli(SCRIPT, "brief", "BTC-USD", env=self.env(fx))      # no SEC fixtures: never asked
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for piece in ("BRIEF · BTC-USD · BTC · Sat 2026-10-31 04:40 UTC · 24/7 (UTC day)", "LAST ", "TREND",
+                      "REL VOLUME", "through 04:40 UTC", "prior UTC day high", "VWAP (UTC day)",
+                      "SEC         n/a"):
+            self.assertIn(piece, p.stdout)
+        self.assertNotIn("unavailable", p.stdout)
+        j = helpers.run_cli(SCRIPT, "brief", "btc-usd", "--json", env=self.env(fx))
+        self.assertEqual(j.returncode, 0, j.stderr)
+        d = json.loads(j.stdout)
+        self.assertEqual((d["symbol"], d["market_type"], d["sec"]["status"], d["gap"]), ("BTC-USD", "crypto", "n/a", None))
+        self.assertTrue(d["as_of"].endswith("+00:00"))
+        self.assertEqual(d["session"]["date"], CDAY)
+
+    def test_review_cli_market_split_and_filter(self):
+        (self.home / "ledger.json").write_text(json.dumps(CryptoReviewTests.ledger(None)))
+        p = helpers.run_cli(SCRIPT, "review", env=self.env(self.home, f"{DAY}T21:00"))     # ET
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("7 closed paper trades · crypto by UTC day: 2026-10-02 to 2026-10-31", p.stdout)
+        self.assertIn("entry hour UTC", p.stdout)
+        j = helpers.run_cli(SCRIPT, "review", "--market", "crypto", "--days", "1", "--json",
+                            env=self.env(self.home, CNOW))                                   # UTC: crypto's clock
+        self.assertEqual(j.returncode, 0, j.stderr)
+        d = json.loads(j.stdout)
+        self.assertEqual((d["count"], d["until"], d["market"]), (1, CDAY, "crypto"))
+        s = helpers.run_cli(SCRIPT, "review", "--symbol", "BTC-USD", "--days", "1", "--json", env=self.env(self.home, CNOW))
+        self.assertEqual(json.loads(s.stdout)["count"], 1)            # a crypto --symbol reads "today" in UTC
+        bad = helpers.run_cli(SCRIPT, "review", "--market", "moon", env=self.env(self.home))
+        self.assertEqual(bad.returncode, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

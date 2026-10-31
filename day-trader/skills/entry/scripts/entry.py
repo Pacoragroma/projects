@@ -17,6 +17,11 @@ Usage:
   python3 scripts/entry.py TSLA --level 365 --side long            # --level implies --setup level
   python3 scripts/entry.py NVDA --setup pdh --watch --interval 60 --max-minutes 90 --save
   python3 scripts/entry.py AMD --date 2026-10-29 --json           # replay a past session
+  python3 scripts/entry.py BTC-USD --or-start 04:00 --save        # crypto: UTC day, no opening bell
+
+Crypto (a Coinbase product such as BTC-USD) trades 24/7: times are UTC, a session is a UTC day
+(VWAP and PDH/PDL use UTC days), the ORB starts at 00:00 UTC unless --or-start moves it, and the
+default cutoff is 2 hours after the opening-range start.
 
 Exit codes: 0 ok (WAITING, TRIGGERED or EXPIRED), 1 bad input, 2 data source unreachable,
 130 watch stopped with Ctrl-C.
@@ -41,7 +46,8 @@ SETUP_SIDES = {"orb": ("long", "short"), "vwap": ("long", "short"), "level": ("l
                "pdh": ("long",), "pdl": ("short",)}
 BAR_SECONDS = 300            # 5-minute bars
 DEFAULT_OR_MINUTES = 15
-DEFAULT_CUTOFF = "11:30"
+CUTOFF_AFTER_OR_START = 120  # default cutoff: 2 h after the opening-range start (11:30 ET for 09:30)
+LAST_HHMM = 23 * 60 + 59     # latest time HH:MM can name (a 24/7 session closes at 24:00)
 VWAP_MIN_BARS = 3            # a VWAP reclaim can trigger on the 3rd bar of the session at the earliest
 RVOL_LOOKBACK = 12           # --min-rvol compares with up to this many prior bars of the session (1 h)
 RVOL_MIN_PRIOR = 3           # ...and needs at least this many, else the bar cannot qualify
@@ -55,27 +61,64 @@ EPS = 1e-9
 # Pure core
 # ---------------------------------------------------------------------------
 
+def _crypto() -> bool:
+    return tc.market().key == "crypto"
+
+
 def _px(x: Optional[float]) -> Optional[float]:
     if x is None:
         return None
-    return round(x, 2) if abs(x) >= 1 else round(x, 4)
+    if abs(x) >= 1:
+        return round(x, 2)
+    if _crypto() and x != 0:   # sub-cent coins: keep 4 significant digits, as tc.fmt_price shows them
+        return round(x, max(4, 3 - int(math.floor(math.log10(abs(x))))))
+    return round(x, 4)
+
+
+def fallback_tick(price: float) -> float:
+    """Price tick when the exchange's own is unknown: a cent at $1 and up; below $1, $0.0001 for
+    stocks and 4 significant digits for crypto (sub-cent coins quote far below $0.0001)."""
+    if price >= 1:
+        return 0.01
+    if _crypto() and price > 0:
+        return min(0.0001, 10.0 ** (int(math.floor(math.log10(price))) - 3))
+    return 0.0001
 
 
 def _et_ts(day: str, minute: int) -> float:
-    """Unix seconds of `minute` (after midnight ET) on ET date `day`."""
-    return tc.parse_et(f"{day}T{tc.hhmm(minute)}").timestamp()
+    """Unix seconds of `minute` (after local midnight; 1440 = the next midnight) on local date `day`."""
+    local = datetime.strptime(day, "%Y-%m-%d") + timedelta(minutes=minute)
+    return tc.parse_et(local.strftime("%Y-%m-%dT%H:%M")).timestamp()
+
+
+def _tz() -> str:
+    return tc.tz_label()
+
+
+def _latest_hhmm() -> int:
+    """The latest cutoff a user can type: the close (16:00 ET), or 23:59 for a 24/7 market."""
+    return min(tc.MARKET_CLOSE, LAST_HHMM)
+
+
+def default_cutoff(or_start: Optional[int] = None) -> int:
+    """2 hours after the opening-range start: 11:30 ET for stocks, 02:00 UTC for crypto."""
+    start = tc.MARKET_OPEN if or_start is None else or_start
+    return min(start + CUTOFF_AFTER_OR_START, _latest_hhmm())
 
 
 def normalize_bars(bars: Sequence[tc.Bar]) -> List[tc.Bar]:
     """Snap bars to the 5-minute grid, merge duplicates, round prices to 4 decimals, oldest first.
 
     Yahoo can stamp the bar still forming with the last trade time (e.g. 10:22:37) instead of
-    its start (10:20); snapping keeps "is this bar complete?" honest.
+    its start (10:20); snapping keeps "is this bar complete?" honest. Coinbase prices are exact
+    decimals (and sub-cent coins need more than 4), so crypto prices are not rounded.
     """
     out: Dict[int, tc.Bar] = {}
+    digits = None if _crypto() else 4
     for b in sorted(bars, key=lambda x: x.ts):
         start = int(b.ts) - int(b.ts) % BAR_SECONDS
-        o, h, l, c = (round(float(x), 4) for x in (b.open, b.high, b.low, b.close))
+        o, h, l, c = (float(x) if digits is None else round(float(x), digits)
+                      for x in (b.open, b.high, b.low, b.close))
         v = float(b.volume or 0)
         cur = out.get(start)
         if cur is None:
@@ -101,7 +144,8 @@ def resolve_side(setup: str, side: Optional[str]) -> str:
 
 
 def check_params(setup: str, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Validate and normalize parameters (cutoff/session_end become minutes after midnight ET)."""
+    """Validate and normalize parameters (or_start/cutoff/session_end become minutes after local
+    midnight: ET for stocks, UTC for crypto)."""
     setup = (setup or "orb").strip().lower()
     if setup not in SETUPS:
         raise ValueError(f"unknown setup {setup!r}; choose from {', '.join(SETUPS)}")
@@ -110,17 +154,27 @@ def check_params(setup: str, params: Optional[Dict[str, Any]]) -> Dict[str, Any]
     orm = DEFAULT_OR_MINUTES if orm is None else orm
     if setup == "orb" and (int(orm) != orm or orm < 5 or orm > 180 or int(orm) % 5):
         raise ValueError("--or-minutes must be a multiple of 5 between 5 and 180 (5-minute bars)")
-    cutoff = p.get("cutoff")
-    cutoff = DEFAULT_CUTOFF if cutoff in (None, "") else cutoff
+    tz, latest = _tz(), _latest_hhmm()
+    start = p.get("or_start")
     try:
-        cut = tc.parse_hhmm(cutoff) if isinstance(cutoff, str) else int(cutoff)
+        or_start = tc.MARKET_OPEN if start in (None, "") else (
+            tc.parse_hhmm(start) if isinstance(start, str) else int(start))
+    except ValueError as e:
+        raise ValueError(f"--or-start: {e}") from None
+    if or_start % 5 or not tc.MARKET_OPEN <= or_start <= tc.MARKET_CLOSE - int(orm) - 5:
+        raise ValueError(f"--or-start must be on the 5-minute grid, from {tc.hhmm(tc.MARKET_OPEN)} to "
+                         f"{tc.hhmm(tc.MARKET_CLOSE - int(orm) - 5)} {tz} (for {int(orm)}-minute range)")
+    cutoff = p.get("cutoff")
+    try:
+        cut = default_cutoff(or_start) if cutoff in (None, "") else (
+            tc.parse_hhmm(cutoff) if isinstance(cutoff, str) else int(cutoff))
     except ValueError as e:
         raise ValueError(f"--cutoff: {e}") from None
     if not tc.MARKET_OPEN + 5 <= cut <= tc.MARKET_CLOSE:
-        raise ValueError("--cutoff must be between 09:35 and 16:00 ET")
-    if setup == "orb" and cut < tc.MARKET_OPEN + int(orm) + 5:
+        raise ValueError(f"--cutoff must be between {tc.hhmm(tc.MARKET_OPEN + 5)} and {tc.hhmm(latest)} {tz}")
+    if setup == "orb" and cut < or_start + int(orm) + 5:
         raise ValueError(f"--cutoff {tc.hhmm(cut)} leaves no bar after the opening range "
-                         f"(it ends {tc.hhmm(tc.MARKET_OPEN + int(orm))} ET)")
+                         f"(it ends {tc.hhmm(or_start + int(orm))} {tz})")
     level = p.get("level")
     if setup == "level":
         if level is None:
@@ -131,8 +185,8 @@ def check_params(setup: str, params: Optional[Dict[str, Any]]) -> Dict[str, Any]
     if not math.isfinite(min_rvol) or min_rvol < 0:
         raise ValueError("--min-rvol must be >= 0")
     end = int(p.get("session_end") or tc.MARKET_CLOSE)
-    p.update(setup=setup, or_minutes=int(orm), cutoff=cut, min_rvol=min_rvol, session_end=end,
-             level=None if level is None else float(level))
+    p.update(setup=setup, or_minutes=int(orm), or_start=or_start, cutoff=cut, min_rvol=min_rvol,
+             session_end=end, level=None if level is None else float(level))
     return p
 
 
@@ -212,9 +266,12 @@ def find_trigger(session_bars: Sequence[tc.Bar], setup: str = "orb", side: Optio
                  prev_session: Optional[Sequence[tc.Bar]] = None) -> Dict[str, Any]:
     """Walk one session's 5-minute bars in order and report the first trigger.
 
-    params: or_minutes (15), level, cutoff ('11:30' or minutes), min_rvol (0 = off),
-            now_ts (unix seconds; None = replay, every bar complete), date ('YYYY-MM-DD', else
-            taken from the bars), session_end (minutes ET, 960; 780 on half days).
+    params: or_minutes (15), or_start ('HH:MM' or minutes; default the session open: 09:30 ET,
+            00:00 UTC for crypto), level, cutoff ('11:30' or minutes; default 2 h after or_start),
+            min_rvol (0 = off), now_ts (unix seconds; None = replay, every bar complete), date
+            ('YYYY-MM-DD', else taken from the bars), session_end (minutes, 960; 780 on half
+            days; 1440 for crypto), tick (price increment for the one-tick stop rule; default:
+            fallback_tick). Times are in the active market's zone (tc.use_market_for).
     A bar is complete when its start + 5 min <= now. Only bars that close by the cutoff can
     trigger. Status: TRIGGERED, EXPIRED (cutoff reached or session over) or WAITING.
     """
@@ -265,15 +322,18 @@ def find_trigger(session_bars: Sequence[tc.Bar], setup: str = "orb", side: Optio
 
     if setup == "orb":
         orm = p["or_minutes"]
-        or_start, or_end = open_ts, open_ts + orm * 60
+        anchor = _et_ts(day, p["or_start"])          # the session open unless --or-start moved it
+        or_start, or_end = anchor, anchor + orm * 60
         or_bars = [b for b in completed if or_start <= b.ts < or_end]
-        if horizon >= or_end and not or_bars and completed:
+        first = next((b for b in completed if b.ts >= anchor), None)
+        if horizon >= or_end and not or_bars and first is not None:
             # No prints in the normal window (late open / halt): use the first N minutes of trading.
-            or_start = completed[0].ts
+            or_start = first.ts
             or_end = or_start + orm * 60
             or_bars = [b for b in completed if or_start <= b.ts < or_end]
-            notes.append(f"no bars {tc.et_hhmm(open_ts)}-{tc.et_hhmm(open_ts + orm * 60)} (late open or "
-                         f"halt): opening range taken from {tc.et_hhmm(or_start)}-{tc.et_hhmm(or_end)}")
+            why = "no trades or a data gap" if tc.market().every_day else "late open or halt"
+            notes.append(f"no bars {tc.et_hhmm(anchor)}-{tc.et_hhmm(anchor + orm * 60)} ({why}): "
+                         f"opening range taken from {tc.et_hhmm(or_start)}-{tc.et_hhmm(or_end)}")
         or_complete = horizon >= or_end and bool(or_bars)
         reference = {"or_start": tc.et_hhmm(or_start), "or_end": tc.et_hhmm(or_end),
                      "or_bars": len(or_bars), "or_complete": or_complete}
@@ -297,10 +357,10 @@ def find_trigger(session_bars: Sequence[tc.Bar], setup: str = "orb", side: Optio
                 watching = [_watch_item(s, hi if s == "long" else lo, True, last) for s in want]
         elif not cutoff_reached:
             if or_bars:
-                notes.append(f"opening range {reference['or_start']}-{reference['or_end']} ET is still "
+                notes.append(f"opening range {reference['or_start']}-{reference['or_end']} {_tz()} is still "
                              f"forming (high {tc.fmt_price(hi)}, low {tc.fmt_price(lo)} so far)")
             elif horizon < or_end:
-                notes.append(f"opening range forms {reference['or_start']}-{reference['or_end']} ET")
+                notes.append(f"opening range forms {reference['or_start']}-{reference['or_end']} {_tz()}")
         else:
             notes.append("no opening range: no bars in the opening window")
 
@@ -321,12 +381,12 @@ def find_trigger(session_bars: Sequence[tc.Bar], setup: str = "orb", side: Optio
             lc = completed[-1].close
             if len(completed) < VWAP_MIN_BARS:
                 notes.append(f"VWAP reclaim needs {VWAP_MIN_BARS} completed bars "
-                             f"(first check at {tc.et_hhmm(open_ts + VWAP_MIN_BARS * BAR_SECONDS)} ET)")
+                             f"(first check at {tc.et_hhmm(open_ts + VWAP_MIN_BARS * BAR_SECONDS)} {_tz()})")
             watching = [_watch_item(s, vw[-1], lc <= vw[-1] if s == "long" else lc >= vw[-1], last)
                         for s in want]
         elif not cutoff_reached:
             notes.append(f"VWAP reclaim needs {VWAP_MIN_BARS} completed bars "
-                         f"(first check at {tc.et_hhmm(open_ts + VWAP_MIN_BARS * BAR_SECONDS)} ET)")
+                         f"(first check at {tc.et_hhmm(open_ts + VWAP_MIN_BARS * BAR_SECONDS)} {_tz()})")
 
     else:  # level, pdh, pdl
         if setup == "level":
@@ -404,6 +464,8 @@ def find_trigger(session_bars: Sequence[tc.Bar], setup: str = "orb", side: Optio
         res["level"] = _px(p["level"])
     if setup == "orb":
         res["or_minutes"] = p["or_minutes"]
+        if p["or_start"] != tc.MARKET_OPEN:
+            res["or_start"] = tc.hhmm(p["or_start"])
 
     if trig is not None:
         i, s, rv = trig
@@ -423,8 +485,9 @@ def find_trigger(session_bars: Sequence[tc.Bar], setup: str = "orb", side: Optio
                 basis = "trigger-bar high" if tb.high > lvl else f"back above {name}"
         stop = float(_px(stop))
         entry_px = float(_px(entry))
-        # Sub-penny prints can round entry and stop to the same price: keep the stop one tick away.
-        tick = 0.01 if entry_px >= 1 else 0.0001
+        # Sub-penny prints can round entry and stop to the same price: keep the stop one tick away
+        # (crypto: the product's quote_increment when the caller knows it).
+        tick = float(p.get("tick") or fallback_tick(entry_px))
         if s == "long" and stop >= entry_px:
             stop = float(_px(entry_px - tick))
         elif s == "short" and stop <= entry_px:
@@ -438,8 +501,8 @@ def find_trigger(session_bars: Sequence[tc.Bar], setup: str = "orb", side: Optio
                             None if over else horizon, None if over else forming)
         res["since_trigger"] = st
         if st["stop_hit"]:
-            when = (f"in the bar forming now (by {st['stop_hit_at']} ET)" if st["stop_hit_in_forming_bar"]
-                    else f"at {st['stop_hit_at']} ET")
+            when = (f"in the bar forming now (by {st['stop_hit_at']} {_tz()})" if st["stop_hit_in_forming_bar"]
+                    else f"at {st['stop_hit_at']} {_tz()}")
             notes.append(f"the suggested stop {tc.fmt_price(stop)} was already hit {when} "
                          f"- this trigger has failed")
         elif not over and st["move_r"] is not None and st["move_r"] >= 1.0:
@@ -452,13 +515,14 @@ def find_trigger(session_bars: Sequence[tc.Bar], setup: str = "orb", side: Optio
     else:
         res["watching"] = watching
         if now_ts is not None and horizon < open_ts:
-            notes.append("market not open yet (regular session starts 09:30 ET)")
+            notes.append(f"market not open yet (regular session starts {tc.hhmm(tc.MARKET_OPEN)} {_tz()})")
         elif completed and horizon - (completed[-1].ts + BAR_SECONDS) > STALE_MINUTES * 60:
-            notes.append(f"newest completed bar ended {res['last_bar']} ET, "
+            notes.append(f"newest completed bar ended {res['last_bar']} {_tz()}, "
                          f"{int((horizon - completed[-1].ts - BAR_SECONDS) // 60)} min ago - data delayed "
                          f"or trading halted?")
         elif not completed and horizon >= open_ts + 2 * BAR_SECONDS:
-            notes.append("no 5-minute bars yet today (market holiday, halt, or data delay?)")
+            notes.append("no 5-minute bars yet today (" + ("no trades, or a data delay?)" if tc.market().every_day
+                                                         else "market holiday, halt, or data delay?)"))
     return res
 
 
@@ -492,15 +556,19 @@ def pick_session(sessions: Dict[str, List[tc.Bar]], now: datetime,
                  day: Optional[str] = None) -> Tuple[str, bool, List[str]]:
     """(session date, is_replay, notes). Today if it trades; else the latest session as a replay."""
     today = now.strftime("%Y-%m-%d")
-    before_close = now.weekday() < 5 and now.hour * 60 + now.minute < tc.MARKET_CLOSE
+    trades_today = tc.market().every_day or now.weekday() < 5
+    before_close = trades_today and now.hour * 60 + now.minute < tc.MARKET_CLOSE
     if day:
         if day > today:
-            raise ValueError(f"--date {day} is in the future (today is {today} ET)")
+            raise ValueError(f"--date {day} is in the future (today is {today} {_tz()})")
         if day == today:
             if today in sessions or before_close:
                 return today, False, []
             raise ValueError(f"no regular session on {day} (weekend or holiday)")
         if day not in sessions:
+            if tc.market().every_day:
+                raise ValueError(f"no 5-minute candles for {day} (older than the ~60 days of 5-minute history "
+                                 f"fetched, or no trades that day)")
             raise ValueError(f"no 5-minute bars for {day} (weekend, holiday, or older than Yahoo's "
                              f"~60 days of 5-minute history)")
         return day, True, []
@@ -529,10 +597,10 @@ def evaluate(symbol: str, bars: Sequence[tc.Bar], meta: Optional[Dict[str, Any]]
     out.update(res)
     out["notes"] = notes + res["notes"]
     if res["expired_reason"] == "cutoff" and p.get("cutoff") in (None, ""):
-        out["notes"].append(f"{res['cutoff']} ET is only the default cutoff; to look for a later trigger "
-                            f"re-run with --cutoff HH:MM (up to 16:00)")
+        out["notes"].append(f"{res['cutoff']} {_tz()} is only the default cutoff; to look for a later trigger "
+                            f"re-run with --cutoff HH:MM (up to {tc.hhmm(_latest_hhmm())})")
     if p["session_end"] < tc.MARKET_CLOSE:
-        out["notes"].append(f"short session: regular close {tc.hhmm(p['session_end'])} ET")
+        out["notes"].append(f"short session: regular close {tc.hhmm(p['session_end'])} {_tz()}")
     out["disclaimer"] = tc.DISCLAIMER
     return out
 
@@ -542,6 +610,8 @@ def finished_session_note(res: Dict[str, Any]) -> Optional[str]:
     warning that goes with it into the plan, since its entry has already played out."""
     if res.get("status") != "TRIGGERED" or not (res.get("session_over") or res.get("replay")):
         return None
+    if tc.market().every_day:   # a 24/7 market has no next open: the price has simply moved on
+        return f"trigger is from the finished {res.get('date')} {_tz()} session - re-plan from the current price"
     return f"trigger is from the finished {res.get('date')} session - re-plan from the next open"
 
 
@@ -561,6 +631,8 @@ def plan_from_result(res: Dict[str, Any], existing: Optional[Dict[str, Any]]) ->
                                        "trigger_bar", "cutoff", "min_rvol", "replay", "as_of")}
     if res.get("or_minutes") is not None:
         signal["or_minutes"] = res["or_minutes"]
+    if res.get("or_start") is not None:
+        signal["or_start"] = res["or_start"]
     note = finished_session_note(res)
     signal["session_over"] = note is not None
     if note:
@@ -595,7 +667,8 @@ def _ref_summary(res: Dict[str, Any]) -> str:
     if res["setup"] == "orb":
         if r.get("or_high") is None:
             return ""
-        return f"OR {fp(r['or_low'])}–{fp(r['or_high'])}" + ("" if r.get("or_complete") else " forming")
+        window = f"{r['or_start']}-{r['or_end']} " if res.get("or_start") else ""   # only if --or-start moved it
+        return f"OR {window}{fp(r['or_low'])}–{fp(r['or_high'])}" + ("" if r.get("or_complete") else " forming")
     if res["setup"] == "vwap":
         return f"VWAP {fp(r['vwap'])}" if r.get("vwap") is not None else ""
     k = res["setup"]
@@ -609,6 +682,16 @@ def _as_of_hhmm(res: Dict[str, Any]) -> str:
         return "?"
 
 
+def _unit(symbol: str) -> str:
+    """What one unit of size is: a share, or one coin of a crypto product ('BTC' for BTC-USD)."""
+    return symbol.split("-")[0] if _crypto() else "share"
+
+
+def _vol(v: float) -> str:
+    """Bar volume: shares as 1.23M; crypto in coins, which can be a fraction (12.35)."""
+    return f"{v:,.2f}" if _crypto() and v < 1000 else tc.fmt_big(v)
+
+
 def render_header(res: Dict[str, Any]) -> str:
     parts = [f"{res['symbol']} 5m"]
     if res.get("replay"):
@@ -617,17 +700,17 @@ def render_header(res: Dict[str, Any]) -> str:
     ref = _ref_summary(res)
     st = res["status"]
     if st == "TRIGGERED":
-        parts.append(f"TRIGGERED {res['triggered_at']} ET")
+        parts.append(f"TRIGGERED {res['triggered_at']} {_tz()}")
         parts.append(f"{res['side'].upper()} @ {tc.fmt_price(res['entry'])}" + (f" ({ref})" if ref else ""))
     elif st == "WAITING":
-        parts.append(f"WAITING as of {_as_of_hhmm(res)} ET")
+        parts.append(f"WAITING as of {_as_of_hhmm(res)} {_tz()}")
         if ref:
             parts.append(ref)
         if res.get("last_price") is not None:
             parts.append(f"last {tc.fmt_price(res['last_price'])}"
                          + (" (prev close)" if res.get("last_source") == "prev_close" else ""))
     else:
-        why = (f"no trigger by {res['cutoff']} ET" if res.get("expired_reason") == "cutoff"
+        why = (f"no trigger by {res['cutoff']} {_tz()}" if res.get("expired_reason") == "cutoff"
                else "session over, no trigger")
         parts.append(f"EXPIRED ({why})")
         if ref:
@@ -637,7 +720,7 @@ def render_header(res: Dict[str, Any]) -> str:
 
 def render_line(res: Dict[str, Any]) -> str:
     """One status line per --watch poll."""
-    bits = [f"{_as_of_hhmm(res)} ET", f"{res['status']:<9}", res["symbol"], res["label"]]
+    bits = [f"{_as_of_hhmm(res)} {_tz()}", f"{res['status']:<9}", res["symbol"], res["label"]]
     if res["status"] == "TRIGGERED":
         bits.append(f"{res['side'].upper()} @ {tc.fmt_price(res['entry'])} at {res['triggered_at']}")
     if res.get("last_price") is not None:
@@ -657,11 +740,11 @@ def render(res: Dict[str, Any]) -> str:
     if res["status"] == "TRIGGERED":
         tb = res["trigger_bar"]
         rv = f"  rvol {tb['rvol']:.1f}x" if tb.get("rvol") is not None else ""
-        lines.append(f"  trigger bar {tb['start']}-{tb['end']} ET  O {fp(tb['open'])}  H {fp(tb['high'])}  "
-                     f"L {fp(tb['low'])}  C {fp(tb['close'])}  vol {tc.fmt_big(tb['volume'])}{rv}")
+        lines.append(f"  trigger bar {tb['start']}-{tb['end']} {_tz()}  O {fp(tb['open'])}  H {fp(tb['high'])}  "
+                     f"L {fp(tb['low'])}  C {fp(tb['close'])}  vol {_vol(tb['volume'])}{rv}")
         extra = f" · OR mid {fp(r['or_mid'])}" if res["setup"] == "orb" and r.get("or_mid") is not None else ""
         lines.append(f"  suggested stop {fp(res['suggested_stop'])} ({res['stop_basis']}) · risk "
-                     f"{fp(res['risk_per_share'])}/share ({res['risk_pct']:.2f}%){extra}")
+                     f"{fp(res['risk_per_share'])}/{_unit(res['symbol'])} ({res['risk_pct']:.2f}%){extra}")
         st = res.get("since_trigger") or {}
         if st:
             mins = st.get("minutes")
@@ -673,8 +756,8 @@ def render(res: Dict[str, Any]) -> str:
             if st.get("high") is not None:
                 seg.append(f"high {fp(st['high'])} · low {fp(st['low'])}")
             if st["stop_hit"]:
-                seg.append(f"STOP HIT by {st['stop_hit_at']} ET (bar still forming)"
-                           if st.get("stop_hit_in_forming_bar") else f"STOP HIT {st['stop_hit_at']} ET")
+                seg.append(f"STOP HIT by {st['stop_hit_at']} {_tz()} (bar still forming)"
+                           if st.get("stop_hit_in_forming_bar") else f"STOP HIT {st['stop_hit_at']} {_tz()}")
             else:
                 seg.append("stop not hit")
             lines.append(f"  {what}: " + " · ".join(seg))
@@ -697,10 +780,10 @@ def render(res: Dict[str, Any]) -> str:
                 lines.append(f"  {w['side']:<5} not armed: needs a 5m close {back} {name}{fp(w['level'])} "
                              f"first, then a close {word}")
         vol = f" with rvol >= {res['min_rvol']:g}x" if res.get("min_rvol") else ""
-        lines.append(f"  checks each completed 5m bar{vol} until {res['cutoff']} ET "
+        lines.append(f"  checks each completed 5m bar{vol} until {res['cutoff']} {_tz()} "
                      f"({res['bars_checked']} checked so far)")
     else:
-        lines.append(f"  {res['bars_checked']} completed bars checked through {res['cutoff']} ET"
+        lines.append(f"  {res['bars_checked']} completed bars checked through {res['cutoff']} {_tz()}"
                      + (f"; last {fp(res['last_price'])}" if res.get("last_price") is not None else ""))
     c = res.get("context") or {}
     ctx = []
@@ -738,14 +821,17 @@ def render(res: Dict[str, Any]) -> str:
 def build_parser() -> argparse.ArgumentParser:
     p = tc.make_parser("Watch a 5-minute setup (opening-range breakout, VWAP reclaim, price level, "
                        "previous-day high/low break) and report the moment it triggers.")
-    p.add_argument("symbol", help="ticker, e.g. TSLA")
+    p.add_argument("symbol", help="ticker, e.g. TSLA, or a Coinbase product such as BTC-USD")
     p.add_argument("--setup", type=str.lower, choices=SETUPS,
                    help="orb (default), vwap, level, pdh, pdl; --level alone implies level")
     p.add_argument("--side", type=str.lower, choices=("long", "short", "both"),
                    help="default: both for orb/vwap/level, long for pdh, short for pdl")
     p.add_argument("--or-minutes", type=int, help=f"opening-range length for orb (default {DEFAULT_OR_MINUTES})")
+    p.add_argument("--or-start", metavar="HH:MM", help="orb: start the opening range here instead of the session "
+                   "open (09:30 ET; 00:00 UTC for crypto, which has no opening bell)")
     p.add_argument("--level", type=float, help="price for --setup level")
-    p.add_argument("--cutoff", help=f"no trigger after this ET time -> EXPIRED (default {DEFAULT_CUTOFF})")
+    p.add_argument("--cutoff", help="no trigger after this time (ET; UTC for crypto) -> EXPIRED (default: 2 h "
+                   "after the opening-range start - 11:30 ET, 02:00 UTC for crypto)")
     p.add_argument("--min-rvol", type=float, help="trigger bar volume >= this x the prior bars' average")
     p.add_argument("--date", help="replay a past session (YYYY-MM-DD, last ~60 days)")
     p.add_argument("--watch", action="store_true", help="re-check every --interval until it triggers or expires")
@@ -766,6 +852,8 @@ def options_from_args(args: argparse.Namespace, now: datetime) -> Dict[str, Any]
         setup = "level" if args.level is not None else "orb"
     if args.or_minutes is not None and setup != "orb":
         raise ValueError("--or-minutes only applies to --setup orb")
+    if args.or_start is not None and setup != "orb":
+        raise ValueError("--or-start only applies to --setup orb")
     if not args.watch and (args.interval is not None or args.max_minutes is not None):
         raise ValueError("--interval and --max-minutes only apply with --watch")
     interval = 60.0 if args.interval is None else args.interval
@@ -782,11 +870,15 @@ def options_from_args(args: argparse.Namespace, now: datetime) -> Dict[str, Any]
             raise ValueError(f"--date must be YYYY-MM-DD, got {args.date!r}") from None
         today = now.strftime("%Y-%m-%d")
         if day > today:
-            raise ValueError(f"--date {day} is in the future (today is {today} ET)")
+            raise ValueError(f"--date {day} is in the future (today is {today} {_tz()})")
         if day < (now - timedelta(days=59)).strftime("%Y-%m-%d"):
+            if _crypto():
+                raise ValueError("entry replays the last ~60 days of 5-minute candles; pick a more recent --date")
             raise ValueError("Yahoo keeps only about 60 days of 5-minute bars; pick a more recent --date")
     params = {"or_minutes": args.or_minutes, "level": args.level, "cutoff": args.cutoff,
               "min_rvol": args.min_rvol}
+    if args.or_start is not None:
+        params["or_start"] = args.or_start
     check_params(setup, params)          # fail fast on bad input, before any download
     resolve_side(setup, args.side)
     past = day is not None and day != now.strftime("%Y-%m-%d")
@@ -799,18 +891,38 @@ def fetch(symbol: str, range_: str, ttl: Optional[float] = None) -> Tuple[List[t
         bars, meta = tc.fetch_bars(symbol, "5m", range_, ttl=ttl)
     except tc.FetchError as e:
         msg = str(e)
+        if _crypto() and "HTTP 404" in msg:
+            raise ValueError(f"{symbol}: Coinbase has no such product (crypto symbols look like BTC-USD)") from e
         if "HTTP 404" in msg or "Yahoo: Not Found" in msg:
             raise ValueError(f"{symbol}: Yahoo has no chart for this symbol (unknown or delisted ticker?)") from e
         raise
     if not bars:
+        if _crypto():
+            raise ValueError(f"{symbol}: Coinbase returned no 5-minute candles (delisted or not trading?)")
         raise ValueError(f"{symbol}: Yahoo returned no 5-minute bars (thinly traded or not a US listing?)")
     return bars, meta
 
 
+def price_tick(symbol: str) -> Optional[float]:
+    """Crypto: the product's price increment (Coinbase quote_increment), None if unreachable -
+    find_trigger then falls back to fallback_tick. Stocks: None (cents; $0.0001 below $1)."""
+    if not _crypto():
+        return None
+    try:
+        return float(tc.product_info(symbol)["quote_increment"])
+    except (tc.FetchError, KeyError, TypeError, ValueError):
+        return None
+
+
 def check_once(opts: Dict[str, Any], ttl: Optional[float] = None) -> Dict[str, Any]:
     bars, meta = fetch(opts["symbol"], opts["range"], ttl)
+    params = opts["params"]
+    if _crypto():
+        if "tick" not in opts:                 # once per run (the product list is cached for a day)
+            opts["tick"] = price_tick(opts["symbol"])
+        params = dict(params, tick=opts["tick"])
     return evaluate(opts["symbol"], bars, meta, tc.now_et(), opts["setup"], opts["side"],
-                    opts["params"], opts["date"])
+                    params, opts["date"])
 
 
 def save_result(res: Dict[str, Any]) -> None:
@@ -849,7 +961,7 @@ def watch(opts: Dict[str, Any], as_json: bool, save: bool) -> int:
                 # check. Once a check has worked, ride out up to 2 transient errors in a row.
                 if res is None or failures >= 3:
                     raise
-                print(f"{tc.now_et().strftime('%H:%M')} ET  data error (retrying): {e}", file=sys.stderr)
+                print(f"{tc.now_et().strftime('%H:%M')} {_tz()}  data error (retrying): {e}", file=sys.stderr)
             else:
                 failures = 0
                 print(json.dumps(dict(res, poll=k + 1), default=str) if as_json else render_line(res),
@@ -888,6 +1000,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if e.code == 2:
             return 1
         raise
+    tc.use_market_for(args.symbol)       # crypto (BTC-USD): UTC days, 24/7, Coinbase prices
     opts = options_from_args(args, tc.now_et())
     if args.watch:
         return watch(opts, args.json, args.save)

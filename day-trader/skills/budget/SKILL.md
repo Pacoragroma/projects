@@ -9,8 +9,9 @@ description: >-
   the limits and shows per-day history. Use when the user asks "how am I doing today?", "how much
   have I risked today?", "can I still trade?", "am I done for the day?", "how much budget is left?", "check the budget
   for this trade", "is $46.88 of risk OK?", "set my daily max loss to $200", "max 4 trades a day",
-  "stop me after 3 losses", "how did my last 10 days go?", or before any broker ticket. Reads the
-  local paper ledger; no API key. Paper only; not financial advice.
+  "stop me after 3 losses", "how did my last 10 days go?", or before any broker ticket. Crypto
+  (BTC-USD) counts on the UTC day, fees included. Reads the local paper ledger; no API key. Paper
+  only; not financial advice.
 ---
 # Budget
 
@@ -36,11 +37,15 @@ python3 scripts/budget.py set                             # show the limits
 python3 scripts/budget.py set --daily-max-loss 200 --max-open-risk 150 --max-trades 4 --max-losses 3
 python3 scripts/budget.py history --days 10
 python3 scripts/budget.py check --risk 46.88 --json       # --json on any command, for chaining
+python3 scripts/budget.py check --symbol BTC-USD --risk 34.52   # crypto: the UTC day
+python3 scripts/budget.py status --market crypto          # today = the UTC day (24/7 market)
 ```
 
-* `check`: the new trade's risk in dollars: `--risk X` (from the risk skill's `risk_used`), **or**
-  `--entry`, `--stop` and `--qty` (risk = |entry − stop| × shares). With `--symbol`, any of the three
-  not given comes from `plans/SYM.json` (shares from its `sizing`, written by `risk.py size --save`).
+* `check`: the new trade's risk in dollars: `--risk X` (from the risk skill's `risk_used`; crypto:
+  its `max_loss`, fees included), **or** `--entry`, `--stop` and `--qty` (risk = |entry − stop| ×
+  shares, crypto + the fees of both fills at the stop). With `--symbol`, any of the three not given
+  comes from `plans/SYM.json` (shares from its `sizing`, written by `risk.py size --save`). Every
+  command takes `--market us|crypto`: whose day is today (default US; `--symbol` wins).
 * `set` flags: `--daily-max-loss $`, `--max-open-risk $`, `--max-trades N`, `--max-losses N` (all > 0).
   No flags = show. Loosening a limit while today's status is STOP TRADING is refused unless
   `--force` is passed. Tightening is always allowed.
@@ -74,12 +79,15 @@ BLOCKED. Only exit 0 from `check` means go.
   (account × risk %, from the risk skill), or (`--mark`) a position trades through its stop.
 * **Room for the next trade** = min(loss budget left, max open risk − open risk), rounded down to
   the cent, 0 when stopped. Checking exactly that amount passes; one cent more is BLOCKED.
-* "Today" is the US/Eastern date (`$DAYTRADER_NOW` overrides). Trades count on the day they were
-  opened, P&L on the day they closed. The loss streak counts today's closed trades from the latest
-  back. A win or a scratch resets it, and it starts fresh each day.
+* "Today" is the US/Eastern date, or the **UTC day** for crypto (`check --symbol BTC-USD`, `--market
+  crypto`; `$DAYTRADER_NOW` overrides). Every trade is placed on that clock: trades count on the day
+  they were opened, P&L on the day they closed. The loss streak counts today's closed trades from
+  the latest back. A win or a scratch resets it, and it starts fresh each day.
+* **Crypto fees** (`crypto_fee_pct`, default 0.6% per fill) count as risk: a crypto position, order
+  or ticket risks |entry − stop| × qty + both fills' fees at the stop. Its P&L is net of fees.
 * `--date` rebuilds that day as it stood at its close: trades closed later count as open.
-* `--mark` fetches each open symbol's last price (Yahoo). It is informational. The budget still
-  counts open positions at their full stop risk.
+* `--mark` fetches each open symbol's last price (Yahoo; Coinbase for crypto, net of fees). It is
+  informational. The budget still counts open positions at their full stop risk.
 * The ledger is validated first. An open/closed/working trade with no usable qty, entry or stop, an
   unreadable `opened_at`/`closed_at`, a closed trade with no P&L or close time, or a ledger,
   settings or plan file that is not a JSON object, is an error (exit 1). The guard-rail fails closed
@@ -137,6 +145,6 @@ Room for the next trade: $63.12 of risk (a standard trade risks $50.00)
   (the Claude apps) it may be gone next conversation, and an empty ledger reads OPEN FOR TRADING: offer
   `ledger.json` and `settings.json` as downloads before the user leaves, and restore uploads there first.
 * If the script exits with code 2 ("data error: ..."), tell the user which host failed (it is in the
-  message, usually `query1`/`query2.finance.yahoo.com`). In sandboxes the host may need to be
-  allow-listed. Never invent prices, headlines, or odds to fill the gap. Plain `status` (without
+  message, usually `query1`/`query2.finance.yahoo.com`, or `api.exchange.coinbase.com`). In sandboxes
+  the host may need to be allow-listed. Never invent prices, headlines, or odds to fill the gap. Plain `status` (without
   `--mark`) works offline.

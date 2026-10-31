@@ -2,16 +2,16 @@
 name: risk
 description: >-
   Day-trading desk: position sizing and pre-trade risk checks. Works out how many shares to trade
-  so hitting the stop loses at most the risk budget (default 0.2% of a $25,000 paper account =
-  $50), capped by max position size and buying power, and prints "BUY 8 TSLA" (or "SELL SHORT")
-  with risk per share, dollars at risk, notional, % of account, R:R and what capped the size.
-  Checks R:R below your minimum, a stop inside the noise, 0 shares (stop too wide for the budget),
-  margin / buying power, today's remaining loss budget from the paper ledger, an existing position
-  in the ticker, and a pattern-day-trader heads-up for small accounts. Use when the user asks "how
-  many shares should I buy?", "size this trade", "position size with a stop at 358.32?", "how much
-  should I risk?", "am I risking too much?", "risk $100 on this", "set my account to 30k / risk
-  0.5% per trade", "how much risk do I have open?", or after the exit skill sets the stop. Reads
-  the saved trade plan. Paper only; not financial advice.
+  so hitting the stop loses at most the risk budget (default 0.2% of a $25,000 paper account),
+  capped by max position size and buying power, and prints "BUY 8 TSLA" (or "SELL SHORT")
+  with dollars at risk, notional, R:R and what capped the size. Crypto (Coinbase prices) is sized
+  in fractions, paper fees counted: "BUY 0.02946375 BTC-USD". Checks R:R below your minimum, a
+  stop inside the noise, 0 shares, buying power, today's loss budget from the paper ledger, an
+  open position, fees in R and a PDT heads-up. Use when the user asks "how many shares should
+  I buy?", "size this trade", "position size with a stop at 358.32?", "paper trade BTC", "how much
+  BTC-USD should I buy?", "how much should I risk?", "am I risking too much?", "risk $100 on
+  this", "set my account to 30k / risk 0.5% per trade", "how much risk do I have open?", or after
+  the exit skill sets the stop. Reads the saved plan. Paper only; not financial advice.
 ---
 # Risk
 
@@ -36,6 +36,9 @@ python3 scripts/risk.py config                                              # sh
 python3 scripts/risk.py config --account 30000 --risk-pct 0.25 --max-position-pct 25 --min-rr 1.5
 python3 scripts/risk.py show                                                # settings + today's open risk
 python3 scripts/risk.py size --symbol TSLA --json                           # --json on any command
+python3 scripts/risk.py size --symbol BTC-USD --entry 100000 --stop 98000 --target 104000   # fractional
+python3 scripts/risk.py config --crypto-fee-pct 0.4                         # your Coinbase fee tier
+python3 scripts/risk.py show --market crypto                                # today = the UTC day
 ```
 
 `size` flags:
@@ -50,8 +53,10 @@ python3 scripts/risk.py size --symbol TSLA --json                           # --
 * `--save`: merge `sizing {...}` (and the levels) into the plan. Needs a symbol. A 0-share size is
   not saved (exit 1).
 
-`config` flags: `--account`, `--risk-pct`, `--max-position-pct`, `--min-rr` (0 = off). No flags =
-show. Daily limits (max loss, open risk, trades, tilt guard) belong to the **budget** skill.
+`config` flags: `--account`, `--risk-pct`, `--max-position-pct`, `--min-rr` (0 = off),
+`--crypto-fee-pct` (paper fee per crypto fill, default 0.6). No flags = show. `show --market
+crypto` counts today as the UTC day. Daily limits (max loss, open risk, trades, tilt guard) belong
+to the **budget** skill.
 
 Exit codes: 0 ok · 1 bad input or state · 2 data source down (only when the current price is
 fetched). A blocked daily budget is reported, not an error: check JSON `budget.ok`.
@@ -78,13 +83,22 @@ fetched). A blocked daily budget is reported, not an error: check JSON `budget.o
 * **Plan merge:** a saved target is only reused if it was set for the same side and entry. When
   `--save` changes the plan's levels, the `exit_plan` and `time_machine` sections (and a target
   that no longer applies) are cleared, because they were computed for the old levels.
+* **Crypto** (`BTC-USD`, ...; Coinbase prices, 24/7, the UTC day): the size is fractional, floored
+  to the product's size step (Coinbase `base_increment`, else 1e-8), and the paper fees of the
+  entry and of the stop exit count toward the loss: units = budget ÷ (|entry − stop| + fee% ×
+  (entry + stop)). `max_loss` = `risk_used` + `fees_at_stop` stays within the budget, and that is
+  the risk the budget and the broker count. R is still the stop distance: the card says
+  "round-trip fees ≈ 2.39R at these levels" and the R:R after fees, and warns when fees reach 1R
+  or push the R:R after fees under your minimum. Spot crypto has no margin (leverage 1x unless you
+  pass it), cannot be shorted on Coinbase, and has no PDT rule. Off-tick prices get a note.
 * **Limits:** the stop is assumed to fill at its price. Gaps, halts and slippage can lose more.
-  Commissions and borrow fees are not included. The account size is what you set; nothing reads
-  a real brokerage account. PDT and margin rules vary by broker and can change.
+  Stock commissions and borrow fees are not included. The account size is what you set; nothing
+  reads a real brokerage account. PDT and margin rules vary by broker and can change.
 
 ## Reading the output / how to present it to the user
 * Lead with the order line as printed (`BUY 8 TSLA @ 364.18 · STOP 358.32 · TARGET 370.04 ·
-  PAPER`), then $ at risk, notional and % of account, R:R, and what set the size.
+  PAPER`), then $ at risk, notional and % of account, R:R, and what set the size. For crypto also
+  the fees: $ at the stop, round-trip fees in R and the R:R after fees - never hide them.
 * Relay every `!` line (JSON `warnings`) in plain words. `-` lines (`notes`) are context: where
   the levels came from, short-selling needs, and the time-machine odds when the plan's odds were
   computed for exactly these levels (printed as the time machine printed them, from its
@@ -100,12 +114,15 @@ fetched). A blocked daily budget is reported, not an error: check JSON `budget.o
   reward_at_target, breakeven_win_rate_pct, budget {ok, reasons, loss_budget_left,
   loss_budget_left_after, max_risk_now, max_shares_now, open_risk (incl. working orders),
   working_order_risk, working_orders, open_positions, realized_pnl, trades_today, loss_streak,
-  limits}, warnings[], notes[], sources, saved, plan_file, dropped_sections, save_error`.
+  limits}, warnings[], notes[], sources, saved, plan_file, dropped_sections, save_error, market,
+  max_loss`; crypto adds `unit, step, tick, fee_pct, fees_at_stop, loss_per_unit, fees_r,
+  fees_at_target, rr_after_fees` (`shares` is then a fractional size).
 * `show` JSON: `settings, risk_per_trade_dollars, max_position_dollars, warnings, today {...},
   next_trade {risk, ok, reasons}, open_positions[], orders[], sized_plans[]`.
 
 ## Next step on the desk
-* **budget** skill (`budget.py check --risk <risk_used>`) before any ticket.
+* **budget** skill (`budget.py check --risk <risk_used>`; crypto: `--symbol BTC-USD --risk
+  <max_loss>`) before any ticket.
 * **broker** skill: a paper ticket for exactly `shares`, which waits for the user's explicit yes.
 * No stop yet? Use the **exit** skill first. Want the odds for these levels? **time-machine**.
 
@@ -119,7 +136,7 @@ fetched). A blocked daily budget is reported, not an error: check JSON `budget.o
   `--leverage 2|4` only if the user says their account has that margin.
 * Report only what the script printed. Never invent prices, account sizes or budget numbers.
 * If the script exits with code 2 ("data error: ..."), tell the user which host failed (it is in
-  the message, usually `query1`/`query2.finance.yahoo.com`). In sandboxes the host may need to
-  be allow-listed. Never invent prices, headlines, or odds to fill the gap. Sizing still works
+  the message, usually `query1`/`query2.finance.yahoo.com`, or `api.exchange.coinbase.com` for
+  crypto). In sandboxes the host may need to be allow-listed. Never invent prices, headlines, or odds to fill the gap. Sizing still works
   offline when the user gives `--entry` and `--stop`. Exit code 1 means bad input: show the
   error and ask.

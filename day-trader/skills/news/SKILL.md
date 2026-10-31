@@ -8,7 +8,8 @@ description: >-
   --new-only show only headlines you have not seen yet. Use when the user asks "any news on
   TSLA?", "why is NVDA moving?", "what's the catalyst?", "check headlines before I trade",
   "did AAPL file an 8-K?", "earnings news for my watchlist", "anything new since last time?",
-  or wants to keep an eye on breaking news for a ticker.
+  or wants to keep an eye on breaking news for a ticker. Crypto pairs (BTC-USD, ETH-USD) work too:
+  Yahoo headlines only (SEC does not apply), times in UTC.
 ---
 # News
 
@@ -31,10 +32,12 @@ python3 scripts/news.py TSLA --tags EARNINGS,GUIDANCE,DEAL
 python3 scripts/news.py TSLA --tags HIGH            # only high-impact items
 python3 scripts/news.py TSLA NVDA --new-only        # only what you have not been shown yet
 python3 scripts/news.py TSLA --json                 # machine-readable, for chaining
+python3 scripts/news.py BTC-USD ETH-USD --since 12h # crypto pairs: Yahoo news, times in UTC
 ```
 
 * `--since`: `90m`, `24h` (default), `2d`, `1w`, `today`, a clock time today (`09:30`), or an ET
-  date/time (`2026-10-29`, `2026-10-29T08:00`).
+  date/time (`2026-10-29`, `2026-10-29T08:00`). A run of crypto pairs only reads (and prints)
+  times in UTC, since a crypto day is a UTC day; any run with a stock in it uses ET.
 * `--tags`: comma-separated, matches any. Valid tags: EARNINGS, GUIDANCE, DEAL, ANALYST, FDA,
   LEGAL, OFFERING, INSIDER, EXEC, MACRO, plus `HIGH`.
 * `--new-only` is how you track news. Each `--new-only` run (text or `--json`) remembers what it
@@ -51,6 +54,9 @@ python3 scripts/news.py TSLA --json                 # machine-readable, for chai
   * SEC EDGAR filings (`www.sec.gov`, `data.sec.gov`). These become headlines like
     `8-K: Results of operations (earnings)`, timed by EDGAR's acceptance time (ET). ETFs and
     indexes have no EDGAR filer, so SEC shows as `n/a` for them, which is not an error.
+  * **Crypto pairs** (`BTC-USD`, `ETH-USD`, ...): the two Yahoo feeds are asked for the pair's
+    symbol. SEC EDGAR does not apply to crypto, so it is not asked at all and shows as `n/a`
+    (JSON `not_applicable`) - never as a failure, and never a reason to say filings are missing.
 * **Dedupe**: copies count as one story when they share a link (ignoring tracking parameters) or a
   normalized headline within 12 hours. A merged story keeps the earliest time, every ticker and
   source it came from, and the real publisher name. SEC filings merge only on the same filing URL.
@@ -77,7 +83,8 @@ HIGH  Oct 29 16:05 ET  18h 09m ago  TSLA  SEC EDGAR · EARNINGS
       8-K: Results of operations (earnings)
 ```
 
-* Lead with the HIGH items. For each one give the time in ET, how long ago, the source, the
+* Lead with the HIGH items. For each one give the time (ET; UTC for a crypto-only run - JSON
+  `tz`), how long ago, the source, the
   **exact** headline and its link. Do not paraphrase it into something stronger than it says.
 * Group by ticker when there are several. Mention when one story covers more than one ticker
   (`TSLA,NVDA`).

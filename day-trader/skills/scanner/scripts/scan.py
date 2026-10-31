@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""Scanner: rank US stocks by daily-chart day-trading setups.
+"""Scanner: rank US stocks (or crypto) by daily-chart day-trading setups.
 
 Fetches ~6 months of daily bars per symbol from Yahoo Finance, drops illiquid names, and
 looks for breakouts, breakdowns, gaps, unusual volume, trend pullbacks and NR7 coils on the
 latest bar (today's bar while the market is open, with volume compared at time-of-day pace).
+
+Crypto (`--market crypto`, or crypto `--symbols` like BTC-USD): the universe is Coinbase's
+USD pairs (stablecoins dropped), daily candles come from Coinbase Exchange and a "day" is a
+UTC day. Crypto trades 24/7, so each daily bar opens where the last one closed: gap setups are
+skipped (and the output says so), and today's volume is paced linearly across the UTC day.
 
 Usage:
   python3 scripts/scan.py --symbols TSLA,NVDA,AAPL           # quick: only these symbols
   python3 scripts/scan.py --limit 300 --top 15               # first 300 names of the universe
   python3 scripts/scan.py --setups breakout,gap_up           # whole market (~5,900 names, minutes)
   python3 scripts/scan.py --min-price 10 --min-dollar-volume 50M --top 25 --json
+  python3 scripts/scan.py --market crypto --top 15           # Coinbase USD pairs (24/7, UTC days)
+  python3 scripts/scan.py --symbols BTC-USD,ETH-USD,SOL-USD  # crypto symbols scan as crypto
 
 Exit codes: 0 ok (even with zero matches), 1 bad input, 2 data source unreachable.
 """
@@ -46,6 +53,10 @@ PROGRESS_EVERY = 250
 EPS = 1e-9               # thresholds are inclusive; don't lose an exact 3.0% gap to float error
 DEFAULT_MIN_PRICE = 5.0
 DEFAULT_MIN_DOLLAR_VOLUME = 20_000_000.0
+CRYPTO_MIN_PRICE = 0.0               # sub-dollar coins are normal; liquidity is the real filter
+CRYPTO_MIN_DOLLAR_VOLUME = 5_000_000.0
+CRYPTO_WORKERS = 4                   # Coinbase's public API allows ~10 requests/second
+GAP_SETUPS = ("gap_up", "gap_down")  # need an opening bell: skipped for 24/7 markets
 NR7_WEIGHT = 0.6         # a coil has not done anything yet: rank it below active setups (max 60)
 
 # Typical cumulative share of a US stock's daily volume by minutes after the 09:30 open
@@ -56,6 +67,8 @@ VOLUME_CURVE = (
     (150, 0.37), (180, 0.42), (210, 0.47), (240, 0.52), (270, 0.57), (300, 0.63),
     (330, 0.69), (360, 0.76), (390, 0.92),
 )
+# Crypto has no open, close or auction: pace a UTC day's volume evenly over its 24 hours.
+CRYPTO_VOLUME_CURVE = ((0, 0.0), (1440, 1.0))
 
 LEVEL_LABELS = {
     "high_20d": "20d high", "low_20d": "20d low", "prior_close": "gap fill",
@@ -98,15 +111,17 @@ def normalize_daily(bars: Iterable[tc.Bar], today: str, before_open: bool = Fals
     return [by_date[d] for d in sorted(by_date)]
 
 
-def volume_progress(minutes_since_open: float, session_minutes: float = 390.0) -> float:
+def volume_progress(minutes_since_open: float, session_minutes: float = 390.0,
+                    curve: Sequence[tuple] = VOLUME_CURVE) -> float:
     """Expected share (0..1) of a full day's volume traded `minutes_since_open` into a session."""
     if session_minutes <= 0 or minutes_since_open >= session_minutes:
         return 1.0
-    x = max(0.0, minutes_since_open) * 390.0 / session_minutes   # half days: compress the curve
-    for (x0, y0), (x1, y1) in zip(VOLUME_CURVE, VOLUME_CURVE[1:]):
+    span = float(curve[-1][0])
+    x = max(0.0, minutes_since_open) * span / session_minutes   # half days: compress the curve
+    for (x0, y0), (x1, y1) in zip(curve, curve[1:]):
         if x <= x1:
             return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
-    return VOLUME_CURVE[-1][1]
+    return curve[-1][1]
 
 
 def session_bounds(now: datetime, meta: Optional[Dict[str, Any]] = None) -> tuple:
@@ -125,7 +140,10 @@ def session_bounds(now: datetime, meta: Optional[Dict[str, Any]] = None) -> tupl
 
 
 def _market_time(meta: Optional[Dict[str, Any]]) -> Optional[float]:
-    """Yahoo's regularMarketTime (time of the last trade in the data), if usable."""
+    """Yahoo's regularMarketTime (time of the last trade in the data), if usable. Coinbase data
+    has none: its regularMarketTime is the start of the last candle, not the last trade."""
+    if (meta or {}).get("market") == "crypto":
+        return None
     stamp = (meta or {}).get("regularMarketTime")
     if isinstance(stamp, (int, float)) and not isinstance(stamp, bool) and math.isfinite(stamp):
         return float(stamp)
@@ -145,7 +163,8 @@ def day_progress(last: tc.Bar, now: datetime, meta: Optional[Dict[str, Any]] = N
         t = stamp
     if t >= end:
         return 1.0
-    return volume_progress((t - start) / 60.0, (end - start) / 60.0)
+    curve = CRYPTO_VOLUME_CURVE if tc.market().every_day else VOLUME_CURVE
+    return volume_progress((t - start) / 60.0, (end - start) / 60.0, curve)
 
 
 def lookahead(last: tc.Bar, now: datetime, meta: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -233,9 +252,11 @@ def _setup(name: str, bias: Optional[str], v: float, mv: float, tr: float, detai
     }
 
 
-def setups_from_metrics(m: Dict[str, Any], coil: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+def setups_from_metrics(m: Dict[str, Any], coil: Optional[Dict[str, Any]] = None,
+                        gaps: bool = True) -> List[Dict[str, Any]]:
     """All setups present in snapshot `m`, best score first. `coil` is the last *completed*
-    bar's snapshot, used for NR7 (defaults to `m`)."""
+    bar's snapshot, used for NR7 (defaults to `m`). `gaps=False` (24/7 markets: no opening
+    bell, so no opening gap) leaves out gap_up / gap_down."""
     coil = coil or m
     fp = tc.fmt_price
     c, o, h, l, pc = m["close"], m["open"], m["high"], m["low"], m["prior_close"]
@@ -263,7 +284,7 @@ def setups_from_metrics(m: Dict[str, Any], coil: Optional[Dict[str, Any]] = None
                 {"low_20d": m["low_20d"], "day_high": h, "prior_close": pc}, "low_20d"))
 
     gap = (o / pc - 1) * 100
-    if abs(gap) >= GAP_PCT - EPS:
+    if gaps and abs(gap) >= GAP_PCT - EPS:
         up = gap > 0
         hold = ("holding above the open" if c >= o else "faded below the open") if up else \
             ("holding below the open" if c <= o else "bounced above the open")
@@ -324,7 +345,7 @@ def setups_from_metrics(m: Dict[str, Any], coil: Optional[Dict[str, Any]] = None
     return out
 
 
-def detect_setups(bars: Sequence[tc.Bar], progress: float = 1.0) -> List[Dict[str, Any]]:
+def detect_setups(bars: Sequence[tc.Bar], progress: float = 1.0, gaps: bool = True) -> List[Dict[str, Any]]:
     """Setups on the last bar of `bars` (daily, oldest first). `progress` < 1 marks the last
     bar as today's unfinished session (see volume_progress); NR7 then uses yesterday's bar."""
     bars = list(bars)
@@ -332,7 +353,7 @@ def detect_setups(bars: Sequence[tc.Bar], progress: float = 1.0) -> List[Dict[st
         return []
     m = metrics_at(bars, len(bars) - 1, progress)
     coil = m if progress >= 1.0 else metrics_at(bars, len(bars) - 2, 1.0)
-    return setups_from_metrics(m, coil)
+    return setups_from_metrics(m, coil, gaps)
 
 
 def _key_level_text(row: Dict[str, Any]) -> str:
@@ -349,12 +370,13 @@ def evaluate_symbol(symbol: str, bars: Sequence[tc.Bar], now: datetime,
                     meta: Optional[Dict[str, Any]] = None, *,
                     min_price: float = DEFAULT_MIN_PRICE,
                     min_dollar_volume: float = DEFAULT_MIN_DOLLAR_VOLUME,
-                    wanted: Optional[Iterable[str]] = None, replay: bool = False) -> Dict[str, Any]:
+                    wanted: Optional[Iterable[str]] = None, replay: bool = False,
+                    gaps: bool = True) -> Dict[str, Any]:
     """One symbol through history checks, liquidity filters and setup detection.
 
     `replay` ($DAYTRADER_NOW set) only adds "lookahead" (see lookahead()) when the as-of day's
-    daily bar holds trading after `now`. Returns {"symbol", "status": ok|none|filtered|skipped,
-    "reason"?, "row"?, "lookahead"?}."""
+    daily bar holds trading after `now`. `gaps=False` skips gap setups (24/7 markets). Returns
+    {"symbol", "status": ok|none|filtered|skipped, "reason"?, "row"?, "lookahead"?}."""
     today = now.strftime("%Y-%m-%d")
     before_open = now.hour * 60 + now.minute < tc.MARKET_OPEN
     bars = normalize_daily(bars, today, before_open)
@@ -378,7 +400,7 @@ def evaluate_symbol(symbol: str, bars: Sequence[tc.Bar], now: datetime,
                 "reason": f"20-day avg $ volume ${tc.fmt_big(m['dollar_volume'])} < "
                           f"${tc.fmt_big(min_dollar_volume)}", **extra}
     coil = m if progress >= 1.0 else metrics_at(bars, len(bars) - 2, 1.0)
-    found = setups_from_metrics(m, coil)
+    found = setups_from_metrics(m, coil, gaps)
     if wanted is not None:
         keep = set(wanted)
         found = [s for s in found if s["setup"] in keep]
@@ -415,7 +437,7 @@ def evaluate_symbol(symbol: str, bars: Sequence[tc.Bar], now: datetime,
 
 
 def _is_not_found(msg: str) -> bool:
-    return any(s in msg for s in ("HTTP 404", "Not Found", "No data found", "no chart data"))
+    return any(s in msg for s in ("HTTP 404", "Not Found", "No data found", "no chart data", "no candles"))
 
 
 def scan_one(entry: Dict[str, Any], now: datetime, ttl: Optional[float] = None,
@@ -451,7 +473,7 @@ def replay_warning(ahead: Sequence[Dict[str, Any]], now: datetime) -> Optional[s
     the scanner then sees the later price, volume and setups, not the market at `now`."""
     if not ahead:
         return None
-    hm = now.strftime("%H:%M")
+    hm, tz = now.strftime("%H:%M"), tc.tz_label()
     syms = sorted(a["symbol"] for a in ahead)
     if len(syms) == 1:
         who, verb = f"bar of {syms[0]}", "includes"
@@ -461,20 +483,39 @@ def replay_warning(ahead: Sequence[Dict[str, Any]], now: datetime) -> Optional[s
     known = [a["through"] for a in ahead if a.get("through") is not None]
     if known:
         span = ("data runs to the close" if any(a.get("to_close") for a in ahead)
-                else f"data through {tc.et_hhmm(max(known))} ET")
-        what = f"{verb} trading after {hm} ET ({span})"
+                else f"data through {tc.et_hhmm(max(known))} {tz}")
+        what = f"{verb} trading after {hm} {tz} ({span})"
     else:
-        what = f"may {verb.rstrip('s')} trading after {hm} ET (no timestamp says otherwise)"
-    return (f"replay at {hm} ET ($DAYTRADER_NOW): the {now.strftime('%Y-%m-%d')} daily {who} {what} - "
+        what = f"may {verb.rstrip('s')} trading after {hm} {tz} (no timestamp says otherwise)"
+    return (f"replay at {hm} {tz} ($DAYTRADER_NOW): the {now.strftime('%Y-%m-%d')} daily {who} {what} - "
             f"last, change, rvol and setups reflect those later prices, not the market at {hm} "
             "(a daily bar cannot be cut at a time of day)")
+
+
+def market_notes(m: tc.Market, wanted: Optional[Sequence[str]] = None) -> List[str]:
+    """What a scan of market `m` leaves out, in words (none for US stocks)."""
+    if not m.every_day:
+        return []
+    skipped = [s for s in GAP_SETUPS if wanted is None or s in wanted]
+    notes = [f"{m.name.lower()}: {m.source} daily candles, one per UTC day (24/7 trading); today's volume "
+             "is paced evenly across the UTC day"]
+    if skipped:
+        notes.append(f"gap setups ({', '.join(skipped)}) are skipped: a 24/7 market has no opening bell, "
+                     "so each daily bar opens where the last one closed")
+    return notes
 
 
 def run_scan(universe: Sequence[Dict[str, Any]], now: datetime, *, workers: int = 8,
              top: int = 25, ttl: Optional[float] = None,
              progress: Optional[Callable[[str], None]] = None, **opts: Any) -> Dict[str, Any]:
-    """Scan `universe` rows ({symbol, name?, exchange?}) concurrently and rank the matches."""
+    """Scan `universe` rows ({symbol, name?, exchange?}) concurrently and rank the matches.
+
+    All rows belong to the active market (tc.market()); for a 24/7 market gap setups are
+    skipped. The market is not switched here: worker threads share it."""
     total = len(universe)
+    mkt = tc.market()
+    if mkt.every_day:
+        opts.setdefault("gaps", False)
     t0 = time.monotonic()
     matches: List[Dict[str, Any]] = []
     quiet_rows: List[Dict[str, Any]] = []   # passed filters, no setup
@@ -541,16 +582,17 @@ def run_scan(universe: Sequence[Dict[str, Any]], now: datetime, *, workers: int 
     if fetched == 0 and failures:
         if all(f["status"] == "notfound" for f in failures) and len(failures) < NOT_FOUND_ABORT:
             names = ", ".join(f["symbol"] for f in failures[:8])
-            raise ValueError(f"Yahoo Finance has no data for {names} - check the symbol(s)")
+            raise ValueError(f"{mkt.source} has no data for {names} - check the symbol(s)")
         first = next((f for f in failures if f["status"] == "failed"), failures[0])
         raise tc.FetchError(first["reason"] if first["status"] == "failed" else
-                            f"Yahoo Finance knew none of the first {len(failures)} symbols "
+                            f"{mkt.source} knew none of the first {len(failures)} symbols "
                             f"(last: {first['reason']}) - the API may have changed")
 
     ranked = rank(matches)
     small = total <= 100
     return {
         "as_of": now.isoformat(timespec="seconds"),
+        "market": mkt.key,
         "market_open": tc.is_market_open(now),
         "partial_day": any(r["partial_day"] for r in matches + quiet_rows),
         "scanned": done,
@@ -569,6 +611,7 @@ def run_scan(universe: Sequence[Dict[str, Any]], now: datetime, *, workers: int 
         "incomplete": stop_reason is not None,
         "warning": stop_reason,
         "replay_warning": replay_warning(ahead, now),
+        "notes": market_notes(mkt, opts.get("wanted")),
         "filters": {"min_price": opts.get("min_price", DEFAULT_MIN_PRICE),
                     "min_dollar_volume": opts.get("min_dollar_volume", DEFAULT_MIN_DOLLAR_VOLUME),
                     "setups": list(opts.get("wanted") or [])},
@@ -643,23 +686,30 @@ def short_reason(reason: str, symbol: str = "") -> str:
 
 
 def render(res: Dict[str, Any]) -> str:
-    now = tc.parse_et(res["as_of"])
-    if res["partial_day"]:
+    mkt = tc.MARKETS.get(res.get("market") or "") or tc.market()
+    now = tc.to_local(datetime.fromisoformat(res["as_of"]).timestamp(), mkt)
+    if mkt.every_day:
+        state = ("24/7 - today's UTC bar is in progress; volume is compared at time-of-day pace "
+                 "(rvol is a projection)" if res["partial_day"] else "24/7 - latest completed UTC day")
+    elif res["partial_day"]:
         state = ("market open - today's bar is in progress; volume is compared at time-of-day "
                  "pace (rvol is a projection)")
     elif res["market_open"]:
         state = "market open"
     elif now.weekday() >= 5:
         state = "market closed (weekend) - latest completed session"
-    elif now.hour * 60 + now.minute < tc.MARKET_OPEN:
+    elif now.hour * 60 + now.minute < mkt.open_min:
         state = "pre-market - latest completed session (today's gaps show after 09:30 ET)"
     else:
         state = "market closed - latest completed session"
-    lines = [f"SCANNER · {now.strftime('%a %Y-%m-%d %H:%M')} ET · {state}"]
+    label = " · crypto" if mkt.every_day else ""
+    lines = [f"SCANNER{label} · {now.strftime('%a %Y-%m-%d %H:%M')} {mkt.tz_label} · {state}"]
     if res["warning"]:
         lines.append(f"WARNING: {res['warning']} - results below are partial")
     if res.get("replay_warning"):
         lines.append(f"WARNING: {res['replay_warning']}")
+    for n in res.get("notes") or []:
+        lines.append(f"Note: {n}")
     rows = res["results"]
     if rows:
         table = [[i, r["symbol"], "+".join(s["setup"] for s in r["setups"]), r["score"],
@@ -705,26 +755,72 @@ def render(res: Dict[str, Any]) -> str:
 # CLI
 # ---------------------------------------------------------------------------
 
+class _Explicit(argparse.Action):
+    """Store the value and remember the user gave the flag (its default depends on the market)."""
+
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace,
+                 values: Any, option_string: Optional[str] = None) -> None:
+        setattr(namespace, self.dest, values)
+        namespace.explicit = frozenset(getattr(namespace, "explicit", None) or ()) | {self.dest}
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = tc.make_parser("Scan US stocks for daily-chart setups (breakout, breakdown, gaps, unusual "
-                       "volume, pullback, NR7) and rank them.")
-    p.add_argument("--symbols", help="comma-separated tickers to scan instead of the whole market")
+    p = tc.make_parser("Scan US stocks (or Coinbase crypto pairs) for daily-chart setups (breakout, "
+                       "breakdown, gaps, unusual volume, pullback, NR7) and rank them.")
+    p.set_defaults(explicit=frozenset())
+    p.add_argument("--symbols", help="comma-separated tickers to scan instead of the whole market "
+                                     "(crypto pairs like BTC-USD scan as crypto)")
+    p.add_argument("--market", choices=tuple(tc.MARKETS),
+                   help="us (default) or crypto (Coinbase USD pairs, 24/7, UTC days)")
     p.add_argument("--limit", type=int, help="scan only the first N symbols of the universe")
     p.add_argument("--setups", help=f"only these setups (comma-separated): {', '.join(SETUPS)}")
     p.add_argument("--top", type=int, default=25, help="rows to show (default 25, 0 = all)")
-    p.add_argument("--min-price", type=float, default=DEFAULT_MIN_PRICE,
-                   help="minimum last price (default 5)")
-    p.add_argument("--min-dollar-volume", default=str(int(DEFAULT_MIN_DOLLAR_VOLUME)),
-                   help="minimum 20-day average close x volume, e.g. 20M (default 20,000,000)")
-    p.add_argument("--include-etfs", action="store_true", help="add ETFs to the market universe")
-    p.add_argument("--workers", type=int, default=8, help="parallel downloads (default 8, max 32)")
+    p.add_argument("--min-price", type=float, default=DEFAULT_MIN_PRICE, action=_Explicit,
+                   help="minimum last price (default 5; crypto 0)")
+    p.add_argument("--min-dollar-volume", default=str(int(DEFAULT_MIN_DOLLAR_VOLUME)), action=_Explicit,
+                   help="minimum 20-day average close x volume, e.g. 20M (default 20,000,000; crypto 5M)")
+    p.add_argument("--include-etfs", action="store_true", help="add ETFs to the market universe (US only)")
+    p.add_argument("--workers", type=int, default=8, action=_Explicit,
+                   help=f"parallel downloads (default 8, crypto {CRYPTO_WORKERS}; max 32)")
     p.add_argument("--quiet", action="store_true", help="no progress lines on stderr")
     return p   # tc's parser: bad flags are bad input, exit 1 (2 means a data source is down)
+
+
+def scan_market(market_flag: Optional[str], symbols: Optional[Sequence[str]]) -> tc.Market:
+    """The one market a scan runs in: --market, else that of every --symbols entry, else
+    $DAYTRADER_MARKET / US. A scan never mixes markets (its worker threads share one)."""
+    if market_flag:
+        m = tc.MARKETS[market_flag]
+    elif symbols:
+        found = {tc.market_for(s) for s in symbols}
+        if len(found) > 1:
+            stocks = [s for s in symbols if not tc.is_crypto_symbol(s)]
+            coins = [s for s in symbols if tc.is_crypto_symbol(s)]
+            raise ValueError(f"--symbols mixes US stocks ({', '.join(stocks[:4])}) and crypto "
+                             f"({', '.join(coins[:4])}) - scan each market separately")
+        m = found.pop()
+    else:
+        m = tc.market_for(None)
+    wrong = [s for s in symbols or () if tc.market_for(s) is not m]
+    if wrong:
+        raise ValueError(f"{', '.join(wrong[:4])}: not {m.name} (--market {m.key}) - scan each market separately")
+    return m
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     wanted = parse_setups(args.setups)
+    symbols = parse_symbol_list(args.symbols) if args.symbols else None
+    mkt = tc.set_market(scan_market(args.market, symbols))
+    crypto = mkt.every_day
+    if crypto and args.include_etfs:
+        raise ValueError("--include-etfs applies to the US stock universe only")
+    if crypto and "min_price" not in args.explicit:
+        args.min_price = CRYPTO_MIN_PRICE
+    if crypto and "min_dollar_volume" not in args.explicit:
+        args.min_dollar_volume = str(int(CRYPTO_MIN_DOLLAR_VOLUME))
+    if crypto and "workers" not in args.explicit:
+        args.workers = CRYPTO_WORKERS
     min_dv = parse_amount(args.min_dollar_volume)
     if args.min_price < 0 or not math.isfinite(args.min_price):
         raise ValueError("--min-price must be >= 0")
@@ -736,8 +832,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise ValueError("--workers must be between 1 and 32")
     say = None if args.quiet else (lambda msg: print(msg, file=sys.stderr, flush=True))
 
-    if args.symbols:
-        universe = [{"symbol": s} for s in parse_symbol_list(args.symbols)]
+    if symbols:
+        universe = [{"symbol": s} for s in symbols]
+    elif crypto:
+        universe = tc.crypto_symbols("USD")
+        if not universe:
+            raise tc.FetchError("Coinbase's product list has no online USD pairs")
     else:
         universe = tc.us_symbols(include_etfs=args.include_etfs)
         if not universe:
@@ -759,7 +859,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    ttl=120 if tc.is_market_open(now) else 900, progress=say,
                    min_price=args.min_price, min_dollar_volume=min_dv, wanted=wanted,
                    replay=bool(os.environ.get("DAYTRADER_NOW")))
-    res["filters"]["universe"] = ("symbols" if args.symbols else
+    res["filters"]["universe"] = ("symbols" if args.symbols else "coinbase_usd" if crypto else
                                   "us_common+etfs" if args.include_etfs else "us_common")
     res["disclaimer"] = tc.DISCLAIMER
     tc.emit(res, args.json, render)

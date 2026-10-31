@@ -2,16 +2,16 @@
 name: time-machine
 description: >-
   Day-trading desk: the Time Machine. Before risking a dollar, replay the rest of today's session
-  10,000 times from the stock's own 5-minute bars at the same clock times, plus a history check
-  of past sessions entered at the same time, and show the honest odds that a trade hits its
-  target first, its stop first, or neither by the close - with expected value in R, break-even
-  win rate, trend check and a verdict (ODDS LEAN YOUR WAY / CLOSE TO A COIN FLIP / ODDS LEAN
-  AGAINST YOU). Reads the saved trade plan or takes entry/stop/target; can draw an SVG and save
-  the odds. Use when the user asks "what are the odds?", "test my trade", "plan a trade on TSLA
-  and test it", "plan and test a trade", "will it hit my target or my stop first?", "backtest
-  this setup", "simulate the rest of the day", "replay this 10,000 times", "is this trade worth
-  taking?", "run the time machine on TSLA", or right after the exit skill sets a plan. Free
-  Yahoo Finance data, no API key. Simulation, not a guarantee; not financial advice.
+  10,000 times from the stock's own 5-minute bars at the same clock times, plus a history check of
+  past sessions entered at the same time, and show the honest odds that a trade hits its target
+  first, its stop first, or neither by the close - with expected value in R, break-even rate,
+  trend check and a verdict (ODDS LEAN YOUR WAY / CLOSE TO A COIN FLIP / ODDS LEAN AGAINST YOU).
+  Reads the saved plan or takes entry/stop/target; can draw an SVG. Use when the user asks "what
+  are the odds?", "test my trade", "plan a trade on TSLA and test it", "plan and test a trade",
+  "will it hit my target or my stop first?", "backtest this setup", "replay this 10,000 times",
+  "is this trade worth taking?", "run the time machine on TSLA", after an exit plan,
+  or for crypto: "paper trade BTC", "plan a trade on BTC-USD" (UTC days, fees in R). Free Yahoo
+  Finance / Coinbase data, no API key. Simulation, not a guarantee; not financial advice.
 ---
 # Time Machine
 
@@ -43,6 +43,8 @@ and updates the shared plan (`plans/<SYM>.json`). Run sibling skills' scripts fr
 Skip any step the user rules out. Show the plan card, the Time Machine verdict and the ticket together,
 and say plainly that it is paper trading and not financial advice.
 
+Crypto works the same way: use a Coinbase product such as `BTC-USD` for SYM ("paper trade BTC"). Times are UTC, a session is a UTC day, sizes are fractional and the paper broker charges fees (shown in R).
+
 ## Run
 > Scripts live in this skill's `scripts/` folder. Run them from the skill's folder (`python3 scripts/<tool>.py ...`) or by absolute path. Python 3.9+, standard library only.
 
@@ -55,16 +57,20 @@ python3 scripts/time_machine.py TSLA --paths 20000 --seed 7 --block 3 --sessions
 python3 scripts/time_machine.py TSLA --detrend                # odds with the recent trend taken out
 python3 scripts/time_machine.py TSLA --svg tsla_replays.svg   # draw 300 of the replays
 python3 scripts/time_machine.py TSLA --save --json            # store the odds in plans/TSLA.json
+python3 scripts/time_machine.py BTC-USD --save                # crypto: UTC days, to the 23:55 UTC time stop
+python3 scripts/time_machine.py BTC-USD --entry 94500 --stop 93500 --target 96500 --at 04:40
 ```
 
 Flags:
 * `--entry/--stop/--target`: each defaults to the saved plan's value (`plans/<SYM>.json` in
   `$DAYTRADER_HOME`, default `~/.day-trader`). All three must end up known.
 * `--side long|short`: default inferred from the levels (stop below entry = long).
-* `--at HH:MM`: start time ET (09:30-15:55, rounded down to the 5-minute grid). Default: now,
+* `--at HH:MM`: start time ET (09:30-15:55, rounded down to the 5-minute grid; crypto: UTC, before
+  the time stop). Default: now,
   rounded down, if the market is open and today has bars; otherwise a full session from the
   09:30 open (the output says "market closed - simulating the next session from the open").
-* `--paths 10000` (100-200,000), `--sessions 59` (most recent past sessions to learn from),
+* `--paths 10000` (100-200,000), `--sessions 59` (most recent past sessions - crypto: UTC days -
+  to learn from),
   `--block 3` (bars copied from one past day at a time), `--seed N` (default: from symbol + date,
   so reruns the same day give the same numbers).
 * `--detrend`: make the trend-removed replays the headline (see the trend check below).
@@ -106,6 +112,14 @@ Flags:
   60 days is a small sample (± after each odds line is simulation noise only - the real
   uncertainty is several points wider, as the output says); news days, earnings and halts are
   not modelled; exchange holidays are not modelled; Yahoo data can be delayed.
+* **Crypto** (a Coinbase product such as `BTC-USD`): 24/7, so a session is a **UTC day** of 288
+  five-minute slots (00:00-23:55 UTC), the library is the past 59 UTC days of Coinbase candles
+  (weekends included), and the replays run from now to the plan's **time stop** (the saved exit
+  plan's, else 23:55 UTC) - the card says "OPEN AT TIME STOP" and "past 59 days (UTC)". **Fees:**
+  the paper broker charges `crypto_fee_pct` (default 0.6%) of notional per fill, so the card adds
+  a `Fees` line - the round trip in R, the expected value after fees and the break-even rate after
+  fees - and the **verdict judges the expected value after fees** (a note says what it would be
+  before fees). 10,000 replays over a full UTC day take about a second.
 * Method details, edge cases and every JSON field: [reference.md](reference.md).
 
 ## Reading the output / how to present it to the user
@@ -125,6 +139,8 @@ Flags:
 * A good one-line summary: "In 10,000 replays from TSLA's last 59 sessions, the target came
   first 29% of the time, the stop 26%, and 45% were still open at the close: about +0.04R per
   trade - close to a coin flip."
+* Crypto: always quote the `Fees` line too ("round trip ≈ 1.13R at these levels, so about +0.08R
+  before fees becomes -1.05R after them") - with 0.6% per fill, fees often decide the verdict.
 
 ## Next step on the desk
 * **risk** skill: size the position from the stop (`risk.py size --symbol TSLA` reads the plan).
@@ -143,6 +159,7 @@ Flags:
 * Paper trading only. This skill places nothing; orders go through the broker skill and only
   after the user's explicit yes.
 * If the script exits with code 2 ("data error: ..."), tell the user which host failed (it is in
-  the message, usually `query1`/`query2.finance.yahoo.com`). In sandboxes the host may need to
+  the message, usually `query1`/`query2.finance.yahoo.com`, or `api.exchange.coinbase.com` for
+  crypto). In sandboxes the host may need to
   be allow-listed. Never invent prices, headlines, or odds to fill the gap. Exit code 1 means
   bad input or too little history: show the error and fix the flags or levels.

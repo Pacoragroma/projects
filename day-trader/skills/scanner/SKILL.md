@@ -7,7 +7,8 @@ description: >-
   and rank them by a 0-100 score. Use when the user asks "what's moving", "find me setups",
   "scan the market", "any breakouts today", "what's gapping", "stocks with unusual volume",
   "screen my watchlist", "which of TSLA, NVDA, AMD look good", or wants trade ideas to start
-  the day. Free Yahoo Finance and Nasdaq Trader data, no API key. Ideas to research, not advice.
+  the day. Also scans crypto (Coinbase USD pairs like BTC-USD: `--market crypto`, 24/7, UTC days).
+  Free Yahoo Finance, Nasdaq Trader and Coinbase data, no API key. Ideas to research, not advice.
 ---
 # Scanner
 
@@ -27,13 +28,23 @@ python3 scripts/scan.py --setups breakout,gap_up --top 20     # whole market: a 
 python3 scripts/scan.py --setups gap_up,gap_down,unusual_volume --min-dollar-volume 50M
 python3 scripts/scan.py --setups pullback --min-price 20 --include-etfs --top 10
 python3 scripts/scan.py --symbols TSLA,NVDA --json            # machine-readable, for chaining
+python3 scripts/scan.py --market crypto --top 15              # crypto: Coinbase USD pairs (24/7)
+python3 scripts/scan.py --symbols BTC-USD,ETH-USD,SOL-USD      # crypto symbols scan as crypto
 ```
 
 Flags: `--symbols A,B` (only these), `--limit N` (first N of the universe), `--setups` (any of
 `breakout, breakdown, gap_up, gap_down, unusual_volume, pullback, nr7`), `--top N` (default 25,
 0 = all), `--min-price` (default 5), `--min-dollar-volume` (20-day average close x volume, default
 20M; accepts `20M`, `500K`, `1.5B`, `20,000,000`), `--include-etfs`, `--workers` (parallel downloads, default 8),
-`--quiet` (no progress lines on stderr), `--json`.
+`--quiet` (no progress lines on stderr), `--market us|crypto` (default us, or the market of
+`--symbols`; one market per scan - a mixed list is refused), `--json`.
+
+**Crypto** (`--market crypto`, or crypto `--symbols` such as `BTC-USD`): the universe is every
+online Coinbase USD pair minus stablecoins; daily candles come from Coinbase Exchange
+(`api.exchange.coinbase.com`, public, no key) and a "day" is a UTC day. Defaults change to
+`--min-price 0`, `--min-dollar-volume 5M` and 4 workers (explicit flags win). Crypto trades 24/7,
+so a daily bar opens where the last one closed: **gap setups are skipped** and the output says so
+(`Note:` lines, JSON `notes`); today's volume is paced evenly across the UTC day.
 
 **Speed:** a full-market scan is ~5,900 Yahoo requests and takes a few minutes (progress prints to
 stderr every 250 symbols). If the user wants something quick, or names tickers, use `--symbols` or
@@ -74,6 +85,7 @@ Re-running within ~2 minutes (market open) or ~15 minutes (closed) reuses the do
    A symbol's score is its best setup's score; ties are broken by rvol.
 
 Limits: daily bars only (no pre-market: before 09:30 ET the scan shows the last completed day;
+crypto: today's UTC bar is always in progress, so its rvol is always a projection;
 today's gaps appear after the open). Early closes come from Yahoo's trading period when it
 reports one; exchange holidays are otherwise not modelled. Replays (`$DAYTRADER_NOW` set
 mid-session): a daily bar cannot be cut at a time of day, so if the data was fetched later, that
@@ -82,7 +94,8 @@ delayed or wrong for thinly traded names. A score ranks how strongly a chart fit
 not a probability of profit.
 
 ## Reading the output / how to present it to the user
-- Header: time (ET) and whether today's bar is still forming. Mid-session, say "rvol is projected".
+- Header: time (ET; UTC for crypto, marked `SCANNER · crypto`) and whether today's bar is still
+  forming. Mid-session, say "rvol is projected". Relay crypto `Note:` lines (no gap setups).
 - `WARNING: replay at HH:MM ET ...` (JSON `replay_warning`; `after_as_of: true` on each affected
   row): the as-of day's daily bar includes trading after that time, so last, change, rvol and
   setups show the later picture. Relay it; do not present those numbers as "at HH:MM".
@@ -101,7 +114,7 @@ not a probability of profit.
   levels, key_level, components}, last, change_pct, gap_pct, rvol, partial_day, after_as_of, atr14,
   atr_pct, sma20, sma50, rsi14, high_20d, low_20d, dollar_volume_20d, key_level {name, price}`; top
   level has `scanned, skipped, skipped_by_reason, filtered, matched, incomplete, warning,
-  replay_warning, filters`.
+  replay_warning, filters, market (us|crypto), notes`.
 
 ## Next step on the desk
 - **news** skill: check each candidate for a catalyst (earnings, deal, FDA, offering) before
@@ -122,7 +135,8 @@ not a probability of profit.
 - Paper trading only - this skill places nothing; orders go through the broker skill and only
   after the user's explicit yes.
 - If the script exits with code 2 ("data error: ..."), tell the user which host failed (it is in
-  the message, e.g. `query1.finance.yahoo.com` or `www.nasdaqtrader.com`) - in sandboxes the
+  the message, e.g. `query1.finance.yahoo.com`, `www.nasdaqtrader.com` or
+  `api.exchange.coinbase.com`) - in sandboxes the
   host may need to be allow-listed. Never invent prices, headlines, or odds to fill the gap.
   Exit code 1 means bad input (e.g. an unknown setup name, or no `--symbols` ticker that Yahoo
   knows; a single unknown ticker in a list is just reported under "Skipped").

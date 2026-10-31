@@ -6,6 +6,10 @@ row). `status` prints the desk's "RISKED SO FAR" card, `check` says OK or BLOCKE
 trade's risk (run it before every ticket), `set` changes the limits and `history` shows past
 days. Everything is read from the local paper ledger; only `status --mark` fetches prices.
 
+"Today" is the calendar day of the market being checked: US/Eastern for stocks, the UTC day for
+crypto (`check --symbol BTC-USD`, or `--market crypto`). Crypto risk includes the paper fees of
+both fills at the stop (the crypto_fee_pct setting), as the broker counts it.
+
 Usage:
   python3 scripts/budget.py status                          # RISKED SO FAR card for today
   python3 scripts/budget.py status --mark                   # + live P&L of open positions (Yahoo)
@@ -17,6 +21,8 @@ Usage:
   python3 scripts/budget.py set                             # show the limits
   python3 scripts/budget.py history --days 10
   python3 scripts/budget.py status --json                   # --json on any command
+  python3 scripts/budget.py status --market crypto          # the UTC day (crypto trades 24/7)
+  python3 scripts/budget.py check --symbol BTC-USD --risk 34.52
 
 Exit codes: 0 ok (check: OK) · 1 bad input or state · 2 data source down (status --mark only)
 · 3 check BLOCKED.
@@ -49,7 +55,7 @@ LIMITS: Dict[str, Tuple[str, str, str]] = {
     "max_trades_per_day": ("--max-trades", "count", "max trades per day"),
     "max_consecutive_losses": ("--max-losses", "count", "tilt guard (losses in a row)"),
 }
-NUMERIC_SETTINGS = ("account_size", "risk_per_trade_pct", "daily_max_loss", "max_open_risk")
+NUMERIC_SETTINGS = ("account_size", "risk_per_trade_pct", "daily_max_loss", "max_open_risk", "crypto_fee_pct")
 INT_SETTINGS = ("max_trades_per_day", "max_consecutive_losses")
 TRADE_STATUSES = ("open", "closed", "working")   # anything else (cancelled, ...) never traded
 
@@ -87,9 +93,10 @@ def standard_trade_risk(settings: Dict[str, Any]) -> float:
 
 
 def et_stamp(value: Any) -> Any:
-    """Normalise an ISO stamp to US/Eastern so its first 10 chars are the ET trading date.
+    """Normalise an ISO stamp to the active market's zone (US/Eastern; UTC once a crypto market is
+    active) so its first 10 chars are that market's date - "today" is the checked market's day.
 
-    Naive stamps are already ET wall-clock (the ledger convention). 'Z'/UTC stamps are converted
+    Naive stamps are wall-clock time in that zone (the ledger convention). 'Z'/UTC stamps are converted
     (Python 3.9's fromisoformat does not accept 'Z'). Unparseable values are returned unchanged.
     """
     if not isinstance(value, str) or not value.strip():
@@ -158,14 +165,54 @@ def _order_entry(row: Dict[str, Any]) -> Any:
     return None
 
 
-def normalize_ledger(raw: Dict[str, Any]) -> Dict[str, Any]:
+def row_market(row: Dict[str, Any]) -> tc.Market:
+    """A ledger row's market: from its symbol (BTC-USD -> crypto), else its `market` field."""
+    sym = str(row.get("symbol") or "").strip()
+    if sym:
+        return tc.market_for(sym)
+    return tc.MARKETS.get(str(row.get("market") or "").strip().lower()) or tc.market_for(None)
+
+
+def fee_rate(row: Dict[str, Any], settings: Optional[Dict[str, Any]] = None) -> float:
+    """Paper fee per fill (a fraction) a row's fills pay: 0 for stocks; crypto: its own fee_pct,
+    else the crypto_fee_pct setting (fail closed: never 0 just because the field is missing)."""
+    if row_market(row).key != "crypto":
+        return 0.0
+    v = _num(row.get("fee_pct"))
+    if v is None or v < 0:
+        v = tc.fee_pct(tc.CRYPTO, settings)
+    return v / 100.0
+
+
+def fee_stop(side: str, entry: float, stop: float, rate: float) -> float:
+    """The stop moved by both fills' fees: the price risk to it is the whole loss if the stop fills
+    (|entry - stop| x qty + rate x (entry + stop) x qty), so tc.trade_initial_risk - and with it
+    tc.day_summary's open risk - counts crypto fees too."""
+    pad = rate * (entry + stop)
+    return stop - pad if side == "long" else stop + pad
+
+
+def _add_fees(c: Dict[str, Any], settings: Optional[Dict[str, Any]]) -> None:
+    """Crypto: keep the real stop as `stop_price` and count the fees at the stop in `stop`."""
+    rate = fee_rate(c, settings)
+    c["market"] = row_market(c).key
+    if rate <= 0:
+        return
+    c["stop_price"], c["fee_pct"] = c["stop"], round(rate * 100, 6)
+    c["fees_at_stop"] = round(rate * (c["entry_price"] + c["stop"]) * c["qty"], 2)
+    c["stop"] = fee_stop(c["side"], c["entry_price"], c["stop"], rate)
+
+
+def normalize_ledger(raw: Dict[str, Any], settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """A validated copy of the ledger the budget can trust.
 
     * trades keep only open / closed / working (a cancelled order never traded);
     * open, closed and working trades must have numeric qty, entry and stop (else StateError -
       the guard-rail fails closed rather than under-count risk);
-    * closed trades need closed_at, and a pnl (computed from exit_price when missing);
-    * opened_at / closed_at are normalised to ET.
+    * closed trades need closed_at, and a pnl (computed from exit_price when missing; crypto net
+      of fees);
+    * opened_at / closed_at are normalised to the active market's zone (ET; UTC for crypto days);
+    * crypto rows count the fees of both fills at the stop as risk (`stop_price` keeps the stop).
     Working orders (unfilled limit orders, as a trade or ticket with status "working") and live
     pending tickets are listed separately.
     """
@@ -202,12 +249,18 @@ def normalize_ledger(raw: Dict[str, Any]) -> Dict[str, Any]:
                 if exit_price is None or exit_price <= 0:
                     raise tc.StateError(f"ledger.json: {label} is closed but has no pnl or exit_price")
                 pnl = round(tc.trade_pnl(c, exit_price), 2)
+                rate = fee_rate(c, settings)
+                if rate > 0:     # crypto P&L is net of both fills' fees, as the broker books it
+                    fees = _num(t.get("fees"))
+                    pnl = round(pnl - (fees if fees is not None else
+                                       rate * (c["entry_price"] + exit_price) * c["qty"]), 2)
             c["pnl"] = pnl
             r_mult = _num(t.get("r_multiple"))
             if r_mult is None:   # P&L in units of the trade's initial risk
                 risk = tc.trade_initial_risk(c)
                 r_mult = round(pnl / risk, 2) if risk > 0 else None
             c["r_multiple"] = r_mult
+        _add_fees(c, settings)
         trades.append(c)
     by_id = {t.get("id"): t for t in trades if t.get("id")}
     linked = {t.get("ticket_id") for t in trades if t.get("ticket_id")}
@@ -232,6 +285,7 @@ def normalize_ledger(raw: Dict[str, Any]) -> Dict[str, Any]:
             c["stop"] = _need(k, label, "stop", k.get("stop"))
             # A trade on the day it was confirmed (as the broker counts it); unknown -> today.
             c["opened_at"] = dated_stamp(k.get("confirmed_at"))
+            _add_fees(c, settings)
             working.append(c)
         elif status == "pending":
             c = dict(k)
@@ -241,7 +295,9 @@ def normalize_ledger(raw: Dict[str, Any]) -> Dict[str, Any]:
                 c["risk"] = None
             else:   # no side: inferred from the levels, as the broker does
                 side = side if side in ("long", "short") else ("long" if s < e else "short")  # type: ignore[operator]
-                c["risk"] = order_risk({"side": side, "qty": q, "entry_price": e, "stop": s})
+                rate = fee_rate(k, settings)       # crypto: the loss at the stop includes fees
+                c["risk"] = order_risk({"side": side, "qty": q, "entry_price": e,
+                                        "stop": fee_stop(side, e, s, rate) if rate > 0 else s})  # type: ignore[arg-type]
             pending.append(c)
     return {"trades": trades, "working": working, "pending": pending}
 
@@ -432,16 +488,21 @@ def assess(view: Dict[str, Any], settings: Dict[str, Any], day: str) -> Dict[str
 
 
 def position_row(t: Dict[str, Any]) -> Dict[str, Any]:
-    return {"id": t.get("id"), "symbol": str(t.get("symbol") or "?").upper(), "side": t["side"],
-            "qty": t["qty"], "entry": t["entry_price"], "stop": t["stop"],
-            "target": _num(t.get("target")), "risk": order_risk(t), "opened_at": t.get("opened_at"),
-            "setup": t.get("setup")}
+    """A position or working order as shown; `risk` is what the budget counts (crypto: incl. fees)."""
+    row = {"id": t.get("id"), "symbol": str(t.get("symbol") or "?").upper(), "side": t["side"],
+           "qty": t["qty"], "entry": t["entry_price"], "stop": t.get("stop_price", t["stop"]),
+           "target": _num(t.get("target")), "risk": order_risk(t), "opened_at": t.get("opened_at"),
+           "setup": t.get("setup")}
+    if "stop_price" in t:
+        row.update(market="crypto", fee_pct=t.get("fee_pct"), fees_at_stop=t.get("fees_at_stop"))
+    return row
 
 
 def check_new_risk(view: Dict[str, Any], settings: Dict[str, Any], day: str, new_risk: float,
-                   per_share: Optional[float] = None) -> Dict[str, Any]:
+                   per_share: Optional[float] = None, step: Optional[float] = None) -> Dict[str, Any]:
     """Would a new trade risking `new_risk` dollars break a daily limit? Same rules as the broker
-    (tc.budget_check), with working orders counted as committed risk."""
+    (tc.budget_check), with working orders counted as committed risk. `step`: the size increment
+    for max_shares_now (default whole shares; crypto e.g. 1e-8)."""
     if new_risk is None or not math.isfinite(new_risk) or new_risk <= 0:
         raise ValueError("the new trade's risk must be a positive dollar amount")
     bc = tc.budget_check(new_risk, settings=settings, ledger=view, day=day)
@@ -475,7 +536,7 @@ def check_new_risk(view: Dict[str, Any], settings: Dict[str, Any], day: str, new
         "reasons": list(bc["reasons"]),
         "warnings": warnings,
         "max_new_risk_now": room,
-        "max_shares_now": int(math.floor(room / per_share + 1e-9)) if per_share else None,
+        "max_shares_now": max_size(room, per_share, step),
         "after": after,
         "before": {k: base[k] for k in ("status", "loss_budget", "open_risk", "trades_today",
                                         "loss_streak", "limits_hit")},
@@ -483,6 +544,21 @@ def check_new_risk(view: Dict[str, Any], settings: Dict[str, Any], day: str, new
         "limits": lim,
     }
     return out
+
+
+def max_size(room: float, per_share: Optional[float], step: Optional[float] = None) -> Any:
+    """Most shares (whole) or crypto units (multiples of `step`) whose risk fits in `room`."""
+    if not per_share:
+        return None
+    if not step or step >= 1:
+        return int(math.floor(room / per_share + 1e-9))
+    return floor_step(room / per_share, step)
+
+
+def floor_step(x: float, step: float) -> float:
+    """Round down to a multiple of `step` (a crypto size increment such as 1e-8)."""
+    decimals = max(0, -int(math.floor(math.log10(step) + 1e-9)))
+    return round(math.floor(x / step + 1e-9) * step, decimals)
 
 
 def mark_positions(positions: Sequence[Dict[str, Any]], prices: Dict[str, float]) -> List[Dict[str, Any]]:
@@ -496,10 +572,15 @@ def mark_positions(positions: Sequence[Dict[str, Any]], prices: Dict[str, float]
             row.update(unrealized=None, r_now=None, note="no price")
             out.append(row)
             continue
-        trade = {"qty": p["qty"], "entry_price": p["entry"], "side": p["side"]}
-        pnl = round(tc.trade_pnl(trade, last), 2)
+        trade = {"id": p.get("id"), "qty": p["qty"], "entry_price": p["entry"], "side": p["side"], "stop": p.get("stop")}
+        pnl = tc.trade_pnl(trade, last)
+        rate = (_num(p.get("fee_pct")) or 0.0) / 100.0
+        if rate > 0:           # crypto: net of both fills' fees, as if closed now
+            pnl -= rate * (p["entry"] + last) * p["qty"]
+        pnl = round(pnl, 2)
+        price_risk = tc.trade_initial_risk(trade) if rate > 0 else p["risk"]     # R = the stop distance
         row["unrealized"] = pnl
-        row["r_now"] = round(pnl / p["risk"], 2) if p["risk"] > 0 else None
+        row["r_now"] = round(pnl / price_risk, 2) if price_risk > 0 else None
         long_ = p["side"] == "long"
         tgt = p.get("target")
         if (last <= p["stop"]) if long_ else (last >= p["stop"]):
@@ -643,13 +724,16 @@ def _plural(n: int, word: str) -> str:
 
 
 def _qty(q: Any) -> str:
+    if isinstance(q, float) and not q.is_integer():
+        return tc.fmt_qty(q)          # crypto sizes such as 0.01234567 (":g" would cut them to 6 digits)
     return f"{q:g}" if isinstance(q, (int, float)) else str(q)
 
 
 def render_status(r: Dict[str, Any]) -> str:
     lb, orisk = r["loss_budget"], r["open_risk"]
     live = r["view"] == "live"
-    when = (f"{r['weekday']} {r['date']} · {r['time']} ET ({'market open' if r['market_open'] else 'market closed'})"
+    when = (f"{r['weekday']} {r['date']} · {r['time']} {tc.tz_label()} "
+            f"({'market open' if r['market_open'] else 'market closed'})"
             if live else f"{r['weekday']} {r['date']} · as of that day's close")
     if live:
         headline = f"STATUS: {r['status']}"
@@ -742,7 +826,10 @@ def render_check(r: Dict[str, Any]) -> str:
         lines.append(f"  ! {w}")
     if not r["ok"]:
         room = f"Most you can risk on a new trade right now: {tc.fmt_money(r['max_new_risk_now'])}"
-        if r.get("max_shares_now") is not None and r.get("risk_per_share"):
+        if r.get("max_shares_now") is not None and r.get("risk_per_share") and r.get("unit"):
+            room += (f" (= {tc.fmt_qty(r['max_shares_now'])} {r['unit']} at {fine_money(r['risk_per_share'])}/"
+                     f"{r['unit']} risk incl. fees)")
+        elif r.get("max_shares_now") is not None and r.get("risk_per_share"):
             room += f" (= {r['max_shares_now']} shares at {fine_money(r['risk_per_share'])}/share risk)"
         lines.append(room)
     if r["working_order_risk"]:
@@ -871,6 +958,8 @@ def _date(value: str) -> str:
 
 def _symbol(value: str) -> str:
     s = value.strip().upper()
+    if tc.is_crypto_symbol(s):
+        return s
     if not re.fullmatch(r"[A-Z0-9][A-Z0-9.\-]{0,11}", s):
         raise argparse.ArgumentTypeError(f"not a ticker symbol: {value!r}")
     return s
@@ -892,7 +981,8 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="the RISKED SO FAR card: P&L, open risk, budget left, status")
     st.add_argument("--date", type=_date, help="show how a past day ended (YYYY-MM-DD); default today")
     st.add_argument("--mark", action="store_true",
-                    help="also fetch live prices (Yahoo) for open positions' unrealized P&L")
+                    help="also fetch live prices (Yahoo; Coinbase for crypto) for open positions' unrealized P&L")
+    _market_flag(st)
     tc.add_json_flag(st)
     ck = sub.add_parser("check", help="OK / BLOCKED for a new trade's risk (exit 0 OK, 3 BLOCKED)")
     ck.add_argument("--risk", type=_money, help="dollars the new trade risks (|entry - stop| x shares)")
@@ -900,18 +990,40 @@ def build_parser() -> argparse.ArgumentParser:
     ck.add_argument("--stop", type=_price, help="stop price")
     ck.add_argument("--qty", type=_qty_arg, help="shares")
     ck.add_argument("--symbol", type=_symbol,
-                    help="ticker; without --risk, missing levels/shares come from its saved plan")
+                    help="ticker (or crypto product, e.g. BTC-USD: its UTC day and fees); without --risk, "
+                         "missing levels/shares come from its saved plan")
+    _market_flag(ck)
     tc.add_json_flag(ck)
     se = sub.add_parser("set", help="change the daily limits (no flags = show them)")
     for key, (flag, kind, label) in LIMITS.items():
         se.add_argument(flag, dest=key, type=_money if kind == "money" else _count, help=label)
     se.add_argument("--force", action="store_true",
                     help="allow loosening limits while today's status is STOP TRADING")
+    _market_flag(se)
     tc.add_json_flag(se)
     hi = sub.add_parser("history", help="per-day realized P&L, trades and wins/losses")
     hi.add_argument("--days", type=_days, default=10, help="calendar days back from today (default 10)")
+    _market_flag(hi)
     tc.add_json_flag(hi)
     return p
+
+
+def _market_flag(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--market", choices=("us", "crypto"),
+                    help="whose day is today: us (US/Eastern, default) or crypto (the UTC day)")
+
+
+def use_market(args: argparse.Namespace) -> tc.Market:
+    """Activate the market whose calendar day is "today": --symbol's market, else --market, else
+    $DAYTRADER_MARKET, else US. Must run before the ledger is read (stamps follow its zone)."""
+    sym = getattr(args, "symbol", None)
+    flag = getattr(args, "market", None)
+    if sym:
+        m = tc.market_for(sym)
+        if flag and flag != m.key:
+            raise ValueError(f"--market {flag} does not match {sym}, which trades in the {m.key} market")
+        return tc.set_market(m)
+    return tc.set_market(flag or tc.market_for(None))
 
 
 def load_settings_raw() -> Dict[str, Any]:
@@ -935,7 +1047,8 @@ def load_ledger_raw() -> Dict[str, Any]:
 
 
 def _load() -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    return clean_settings(load_settings_raw()), normalize_ledger(load_ledger_raw())
+    settings = clean_settings(load_settings_raw())
+    return settings, normalize_ledger(load_ledger_raw(), settings)
 
 
 def _today_view(settings: Dict[str, Any], norm: Dict[str, Any], day: Optional[str] = None
@@ -944,7 +1057,7 @@ def _today_view(settings: Dict[str, Any], norm: Dict[str, Any], day: Optional[st
     today = now.strftime("%Y-%m-%d")
     day = day or today
     if day > today:
-        raise ValueError(f"{day} is in the future (today is {today} ET)")
+        raise ValueError(f"{day} is in the future (today is {today} {tc.tz_label()})")
     view = budget_view(norm, day, today, now.isoformat(timespec="seconds"))
     return day, view, assess(view, settings, day)
 
@@ -965,6 +1078,7 @@ def fetch_marks(positions: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    use_market(args)
     settings, norm = _load()
     now = tc.now_et()
     day, view, r = _today_view(settings, norm, args.date)
@@ -994,14 +1108,19 @@ def cmd_status(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def resolve_risk(args: argparse.Namespace) -> Dict[str, Any]:
-    """New-trade risk from --risk, or |entry - stop| x qty from flags and/or the saved plan."""
+def resolve_risk(args: argparse.Namespace, settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """New-trade risk from --risk, or |entry - stop| x qty from flags and/or the saved plan.
+    Crypto (the active market): plus the paper fees of both fills at the stop, as the broker counts it."""
     notes: List[str] = []
+    crypto = tc.market().key == "crypto"
     if args.risk is not None:
         given = [f for f in ("entry", "stop", "qty") if getattr(args, f) is not None]
         if given:
             raise ValueError(f"give either --risk or --entry/--stop/--qty, not both (got --risk and "
                              f"--{', --'.join(given)})")
+        if crypto:
+            notes.append("crypto: --risk is taken as the whole loss at the stop, paper fees included "
+                         "(the risk skill prints it)")
         return {"new_risk": args.risk, "source": "--risk", "per_share": None, "notes": notes}
     plan = tc.load_plan(args.symbol) if args.symbol else None
     if plan is not None and not isinstance(plan, dict):
@@ -1038,20 +1157,36 @@ def resolve_risk(args: argparse.Namespace) -> Dict[str, Any]:
         src.append(f"{name} from {'flag' if getattr(args, flag) is not None else 'plan'}")
     # Unrounded, as the broker computes it: rounding $63.1225 down to $63.12 could pass a trade
     # the broker's own budget check then refuses (sub-penny prices). Rounded only for display.
-    return {"new_risk": per * qty, "source": ", ".join(src), "per_share": per,
-            "entry": entry, "stop": stop, "qty": qty, "notes": notes}
+    out = {"new_risk": per * qty, "source": ", ".join(src), "per_share": per,
+           "entry": entry, "stop": stop, "qty": qty, "notes": notes}
+    if crypto:
+        rate = tc.fee_pct(tc.CRYPTO, settings) / 100.0
+        fees = rate * (entry + stop) * qty
+        out.update(new_risk=per * qty + fees, per_share=per + rate * (entry + stop),
+                   fees_at_stop=round(fees, 2), fee_pct=round(rate * 100, 6))
+        notes.append(f"includes {tc.fmt_money(fees)} of paper fees at the stop ({rate * 100:g}% per fill, entry "
+                     "and exit), as the broker counts it")
+    return out
 
 
 def cmd_check(args: argparse.Namespace) -> int:
+    market = use_market(args)
     settings, norm = _load()
-    risk = resolve_risk(args)
+    risk = resolve_risk(args, settings)
     day, view, _ = _today_view(settings, norm)
-    r = check_new_risk(view, settings, day, risk["new_risk"], risk["per_share"])
+    crypto = market.key == "crypto"
+    r = check_new_risk(view, settings, day, risk["new_risk"], risk["per_share"],
+                       tc.qty_step(market) if crypto else None)
     per = risk["per_share"]
-    r.update(symbol=args.symbol, date=day, as_of=tc.iso_now(), risk_source=risk["source"],
+    r.update(symbol=args.symbol, market=market.key, date=day, as_of=tc.iso_now(), risk_source=risk["source"],
              risk_per_share=None if per is None else round(per, 4), notes=risk["notes"],
              exit_code=EXIT_OK if r["ok"] else EXIT_BLOCKED,
              disclaimer=tc.DISCLAIMER)
+    if crypto:
+        r["unit"] = args.symbol.split("-")[0] if args.symbol else "units"
+        for k in ("fees_at_stop", "fee_pct"):
+            if k in risk:
+                r[k] = risk[k]
     for k in ("entry", "stop", "qty"):
         if k in risk:
             r[k] = risk[k]
@@ -1068,6 +1203,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_set(args: argparse.Namespace) -> int:
+    use_market(args)
     raw = load_settings_raw()
     updates = {k: getattr(args, k) for k in LIMITS if getattr(args, k, None) is not None}
     previous = {k: raw[k] for k in LIMITS}
@@ -1106,6 +1242,7 @@ def cmd_set(args: argparse.Namespace) -> int:
 
 
 def cmd_history(args: argparse.Namespace) -> int:
+    use_market(args)
     settings, norm = _load()
     r = history(norm, settings, tc.today_et(), args.days)
     r["disclaimer"] = tc.DISCLAIMER

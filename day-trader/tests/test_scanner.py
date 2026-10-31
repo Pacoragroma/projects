@@ -14,7 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from helpers import (SKILLS, TempHomeTestCase, daily_bars, et_ts, fake_bars, run_cli,
                      skill_script, tc, trading_days, write_fixture, yahoo_chart_url,
-                     yahoo_payload, load_skill_module)
+                     yahoo_payload, load_skill_module, utc_ts, write_coinbase_fixtures,
+                     write_coinbase_products)
+from datetime import datetime, timedelta, timezone
 
 scan = load_skill_module("scanner", "scan")
 SCRIPT = skill_script("scanner", "scan.py")
@@ -741,6 +743,176 @@ class CliTests(TempHomeTestCase):
             p = run_cli(SCRIPT, *args, env=self.env)
             self.assertEqual(p.returncode, 1, (args, p.stderr))
             self.assertNotIn("Traceback", p.stderr)
+
+
+
+# ---------------------------------------------------------------------------
+# Crypto (24/7, UTC days, Coinbase daily candles)
+# ---------------------------------------------------------------------------
+
+CDAY = "2026-10-31"          # a Saturday: crypto trades, US stocks do not
+CNOW = f"{CDAY}T04:40"       # UTC
+
+
+def crypto_daily(closes, volumes, end=CDAY, gap_open=None):
+    """Daily candles stamped 00:00 UTC on consecutive days (weekends included) ending on `end`;
+    each opens at the prior close unless `gap_open` overrides the last bar's open."""
+    first = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc) - timedelta(days=len(closes) - 1)
+    out, prev = [], closes[0]
+    for i, c in enumerate(closes):
+        o = gap_open if gap_open is not None and i == len(closes) - 1 else prev
+        out.append(tc.Bar(int((first + timedelta(days=i)).timestamp()), o, max(o, c) * 1.01,
+                          min(o, c) * 0.99, c, volumes[i]))
+        prev = c
+    return out
+
+
+def crypto_breakout(price=1000.0, vol=200.0):
+    return crypto_daily([price * x / 100 for x in wave(150)] + [price * 1.04], [vol] * 150 + [vol * 2])
+
+
+def crypto_gap(price=30.0):
+    closes = [price * x / 100 for x in wave(150)]
+    return crypto_daily(closes + [closes[-1] * 1.06], [3e5] * 151, gap_open=closes[-1] * 1.06)
+
+
+class CryptoCoreTests(TempHomeTestCase):
+    NOW = CNOW
+
+    def setUp(self):
+        super().setUp()
+        os.environ["DAYTRADER_NOW"] = CNOW
+        tc.set_market(tc.CRYPTO)
+
+    def test_gap_setups_are_skipped_for_24_7_markets(self):
+        bars = crypto_gap()
+        self.assertIn("gap_up", names(scan.detect_setups(bars)))              # the pure detector still can
+        self.assertNotIn("gap_up", names(scan.detect_setups(bars, gaps=False)))
+        res = scan.evaluate_symbol("ETH-USD", bars, tc.now_et(), {"market": "crypto"},
+                                   min_price=0, min_dollar_volume=0, gaps=False)
+        self.assertNotIn("gap_up", names(res["row"]["setups"]))
+
+    def test_volume_is_paced_linearly_over_the_utc_day(self):
+        bars = crypto_breakout()
+        now = tc.now_et()
+        self.assertEqual((now.tzname(), now.hour, now.minute), ("UTC", 4, 40))
+        self.assertAlmostEqual(scan.day_progress(bars[-1], now, {"market": "crypto"}), 280 / 1440)
+        self.assertEqual(scan.day_progress(bars[-2], now, {"market": "crypto"}), 1.0)   # yesterday is complete
+        res = scan.evaluate_symbol("BTC-USD", bars, now, {"market": "crypto"}, min_price=0, min_dollar_volume=0)
+        row = res["row"]
+        self.assertTrue(row["partial_day"])
+        self.assertAlmostEqual(row["rvol"], round(2 / (280 / 1440), 2), places=2)   # 2x a day's volume in 4h40m
+
+    def test_coinbase_candle_start_is_not_a_last_trade_time(self):
+        # Coinbase's regularMarketTime is the last candle's *start*: a replay cannot tell how much
+        # of the day the bar holds, so it must not call the view honest as-of.
+        bars = crypto_breakout()
+        meta = {"market": "crypto", "regularMarketTime": bars[-1].ts}
+        self.assertIsNone(scan._market_time(meta))
+        self.assertEqual(scan.lookahead(bars[-1], tc.now_et(), meta), {"through": None, "to_close": False})
+
+    def test_run_scan_in_crypto_mode_notes_the_skipped_gaps(self):
+        with fake_bars({"BTC-USD": crypto_breakout(), "ETH-USD": crypto_gap()}, meta={"market": "crypto"}):
+            res = scan.run_scan([{"symbol": "BTC-USD"}, {"symbol": "ETH-USD"}], tc.now_et(),
+                                min_price=0, min_dollar_volume=0)
+        self.assertEqual(res["market"], "crypto")
+        self.assertTrue(res["market_open"])                                     # Saturday, 24/7
+        for r in res["results"]:
+            self.assertFalse({"gap_up", "gap_down"} & set(names(r["setups"])), r["symbol"])
+        self.assertTrue(any("gap setups (gap_up, gap_down) are skipped" in n for n in res["notes"]))
+        text = scan.render(res)
+        self.assertTrue(text.startswith("SCANNER · crypto · Sat 2026-10-31 04:40 UTC · 24/7"), text)
+        self.assertIn("Note: gap setups", text)
+        self.assertNotRegex(text, r"\bET\b")
+        # breakout-only scans do not claim to have skipped anything else
+        self.assertEqual(len(scan.market_notes(tc.CRYPTO, ["breakout"])), 1)
+        self.assertEqual(scan.market_notes(tc.US), [])
+
+    def test_unknown_product_is_not_found(self):
+        self.assertTrue(scan._is_not_found("XYZ-USD: Coinbase returned no candles - is it a listed product?"))
+        with mock.patch.object(tc, "fetch_bars", side_effect=tc.FetchError("XYZ-USD: Coinbase returned no candles")):
+            with self.assertRaises(ValueError) as cm:
+                scan.run_scan([{"symbol": "XYZ-USD"}], tc.now_et())
+        self.assertIn("Coinbase Exchange has no data for XYZ-USD", str(cm.exception))
+
+    def test_scan_market_resolution(self):
+        self.assertIs(scan.scan_market(None, ["BTC-USD", "ETH-USD"]), tc.CRYPTO)
+        self.assertIs(scan.scan_market(None, ["TSLA", "BRK-B"]), tc.US)            # BRK-B is a stock
+        self.assertIs(scan.scan_market("crypto", None), tc.CRYPTO)
+        self.assertIs(scan.scan_market(None, None), tc.US)
+        with mock.patch.dict(os.environ, {"DAYTRADER_MARKET": "crypto"}):
+            self.assertIs(scan.scan_market(None, None), tc.CRYPTO)
+        with self.assertRaisesRegex(ValueError, r"mixes US stocks \(TSLA\) and crypto \(BTC-USD\)"):
+            scan.scan_market(None, ["TSLA", "BTC-USD"])
+        with self.assertRaisesRegex(ValueError, r"BTC-USD: not US stocks \(--market us\)"):
+            scan.scan_market("us", ["BTC-USD"])
+
+    def test_us_defaults_and_volume_curve_unchanged(self):
+        tc.set_market(tc.US)
+        args = scan.build_parser().parse_args([])
+        self.assertEqual((args.min_price, args.min_dollar_volume, args.workers, args.explicit),
+                         (5.0, "20000000", 8, frozenset()))
+        self.assertEqual(scan.build_parser().parse_args(["--min-price", "2"]).explicit, frozenset({"min_price"}))
+        self.assertAlmostEqual(scan.volume_progress(30), 0.115)
+        self.assertAlmostEqual(scan.volume_progress(720, 1440, scan.CRYPTO_VOLUME_CURVE), 0.5)
+
+
+class CryptoCliTests(TempHomeTestCase):
+    NOW = CNOW
+
+    def setUp(self):
+        super().setUp()
+        self.fx = self.home / "fixtures"
+        now_ts = utc_ts(CDAY, "04:40")
+        thin = crypto_daily([x / 100 for x in wave(151)], [1_000.0] * 151)     # ~$1K a day
+        for sym, bars in {"BTC-USD": crypto_breakout(100_000.0, 200.0), "ETH-USD": crypto_gap(3_000.0),
+                          "SOL-USD": thin}.items():
+            write_coinbase_fixtures(self.fx, sym, bars, "1d", "6mo", now_ts)
+        write_coinbase_products(self.fx)                       # BTC, ETH, SOL and USDT (a stablecoin)
+        self.env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(self.fx), "DAYTRADER_NOW": CNOW}
+
+    def test_market_crypto_text_on_a_saturday(self):
+        p = run_cli(SCRIPT, "--market", "crypto", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        out = p.stdout
+        self.assertIn("SCANNER · crypto · Sat 2026-10-31 04:40 UTC · 24/7 - today's UTC bar is in progress", out)
+        self.assertIn("Note: gap setups (gap_up, gap_down) are skipped", out)
+        self.assertIn("WARNING: replay at 04:40 UTC ($DAYTRADER_NOW)", out)
+        self.assertIn("Scanned 3 symbols", out)                # USDT-USD (stablecoin) is not in the universe
+        self.assertIn("Filtered out: SOL-USD (20-day avg $ volume $", out)
+        self.assertIn("Filters: last >= $0.00, 20-day avg $ volume >= $5.00M", out)
+        self.assertNotIn("gap_up", out.split("Top setups:")[0].split("\n", 4)[-1])
+        self.assertNotRegex(out, r"\bET\b")
+
+    def test_crypto_symbols_json(self):
+        p = run_cli(SCRIPT, "--symbols", "btc-usd,ETH-USD", "--min-dollar-volume", "1M", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        res = json.loads(p.stdout)
+        self.assertEqual((res["market"], res["filters"]["universe"]), ("crypto", "symbols"))
+        self.assertEqual((res["filters"]["min_price"], res["filters"]["min_dollar_volume"]), (0.0, 1e6))
+        self.assertEqual(sorted(r["symbol"] for r in res["results"]), ["BTC-USD", "ETH-USD"])
+        btc = next(r for r in res["results"] if r["symbol"] == "BTC-USD")
+        self.assertEqual(btc["setups"][0]["setup"], "breakout")
+        self.assertTrue(btc["partial_day"])
+        self.assertEqual(btc["date"], CDAY)
+        self.assertTrue(res["as_of"].endswith("+00:00"))
+        for r in res["results"]:
+            self.assertFalse({"gap_up", "gap_down"} & {s["setup"] for s in r["setups"]})
+
+    def test_bad_crypto_input_is_exit_1(self):
+        for args in (("--symbols", "BTC-USD,TSLA"), ("--market", "us", "--symbols", "ETH-USD"),
+                     ("--market", "crypto", "--include-etfs"), ("--market", "moon")):
+            p = run_cli(SCRIPT, *args, env=self.env)
+            self.assertEqual(p.returncode, 1, (args, p.stderr))
+            self.assertNotIn("Traceback", p.stderr)
+
+    def test_coinbase_down_is_exit_2(self):
+        empty = self.home / "empty"
+        empty.mkdir()
+        p = run_cli(SCRIPT, "--market", "crypto", env=dict(self.env, DAYTRADER_FIXTURES=str(empty)))
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("api.exchange.coinbase.com", p.stderr)
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
 
 
 if __name__ == "__main__":

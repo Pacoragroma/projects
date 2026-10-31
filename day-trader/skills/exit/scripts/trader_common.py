@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DISCLAIMER = (
     "Not financial advice. Paper trading only - nothing here can place a real order. "
     "Simulations and backtests are not guarantees."

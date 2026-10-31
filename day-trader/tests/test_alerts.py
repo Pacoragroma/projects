@@ -12,7 +12,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import (SKILLS, TempHomeTestCase, et_ts, fake_bars, load_skill_module, run_cli,  # noqa: E402
-                     skill_script, tc, write_fixture, yahoo_chart_url, yahoo_payload)
+                     skill_script, tc, utc_ts, write_coinbase_fixtures, write_fixture, yahoo_chart_url,
+                     yahoo_payload)
 
 A = load_skill_module("alerts", "alerts")
 SCRIPT = skill_script("alerts", "alerts.py")
@@ -794,6 +795,155 @@ class SkillDocTests(unittest.TestCase):
                 except SystemExit as e:
                     self.fail(f"SKILL.md command does not parse: {c!r} ({e})")
         self.assertLess(len(text.splitlines()), 160)
+
+
+
+# ---------------------------------------------------------------------------
+# Crypto: Coinbase 5m candles, 24/7, UTC days; per-symbol market in a mixed check
+# ---------------------------------------------------------------------------
+
+CDAY = "2026-10-31"     # a Saturday
+
+
+def crypto_bars(until="05:10", dip_at="04:50", dip=97_900.0, start=f"2026-10-30"):
+    """Flat 100,000 BTC candles from 00:00 UTC on `start` up to `until` on CDAY; one dip to `dip`."""
+    out, t, stop = [], utc_ts(start, "00:00"), utc_ts(CDAY, until)
+    while t < stop:
+        low = dip if dip_at and t == utc_ts(CDAY, dip_at) else 99_950.0
+        out.append(tc.Bar(t, 100_000.0, 100_050.0, low, 100_000.0, 2.0))
+        t += 300
+    return out
+
+
+class CryptoCoreTests(TempHomeTestCase):
+    NOW = f"{CDAY}T04:40"
+
+    def setUp(self):
+        super().setUp()
+        tc.set_market(tc.CRYPTO)
+
+    def test_crypto_ranges_and_never_done(self):
+        now = utc_ts(CDAY, "05:10")
+        self.assertEqual(A.range_for(now - 600, now, tc.CRYPTO), "2d")
+        self.assertEqual(A.range_for(now - int(3.5 * 86400), now, tc.CRYPTO), "5d")
+        self.assertEqual(A.range_for(now - 90 * 86400, now, tc.CRYPTO), "60d")
+        self.assertEqual(A.range_for(now - 3 * 86400, now, tc.US), "5d")              # stocks unchanged
+        sat_night = tc.to_local(utc_ts(CDAY, "23:59"), tc.CRYPTO)
+        self.assertFalse(A.market_done_for_day(sat_night, tc.CRYPTO))
+        self.assertTrue(A.market_done_for_day(tc.to_local(utc_ts(CDAY, "16:00"), tc.US), tc.US))
+        self.assertFalse(A.markets_done([tc.US, tc.CRYPTO], sat_night))
+        self.assertTrue(A.markets_done([tc.US], sat_night))
+
+    def test_alert_fires_on_a_saturday_and_times_print_in_utc(self):
+        bars = crypto_bars()
+        now = tc.now_et()
+        ctx = A.market_context([b for b in bars if b.ts < now.timestamp()], None, now)
+        self.assertTrue(ctx["market_open"])
+        self.assertEqual(ctx["prev_close"], 100_000.0)                                 # Friday's UTC day
+        a = A.make_alert("BTC-USD", "below", ctx, now, [], level=98_000.0, once=True)
+        self.assertEqual((a["market"], a["created_at"]), ("crypto", f"{CDAY}T04:40:00+00:00"))
+        later = tc.to_local(utc_ts(CDAY, "05:10"), tc.CRYPTO)
+        r = A.evaluate(a, bars, None, later)
+        self.assertEqual([(e["bar_time"], e["market"]) for e in r["events"]], [("04:50", "crypto")])
+        tc.set_market(tc.US)                                    # rendering does not depend on the active market
+        line = A.event_line(r["events"][0], later)
+        self.assertIn("traded below 98,000.00 04:50-04:55 UTC (low 97,900.00)", line)
+        self.assertIn("fired 2026-10-31 04:50 UTC", A.waiting_reason(r["alert"]))
+
+    def test_unknown_pair_is_bad_input(self):
+        with mock.patch.object(tc, "fetch_bars", side_effect=tc.FetchError("XYZ-USD: Coinbase returned no candles")):
+            with self.assertRaisesRegex(ValueError, "Coinbase has no candles for this pair"):
+                A.fetch("XYZ-USD", "2d")
+
+    def test_alert_without_market_field_follows_its_symbol(self):
+        self.assertIs(A.alert_market({"symbol": "ETH-USD"}), tc.CRYPTO)
+        self.assertIs(A.alert_market({"symbol": "TSLA", "market": "crypto"}), tc.US)
+        self.assertIs(A.alert_market({"market": "crypto"}), tc.CRYPTO)
+
+
+class CryptoCommandTests(TempHomeTestCase):
+    NOW = f"{DAY}T09:42"
+
+    def cli(self, *argv, now):
+        os.environ["DAYTRADER_NOW"] = now
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = A.main(list(argv))
+        return code, out.getvalue()
+
+    def test_mixed_check_runs_each_symbol_in_its_own_market(self):
+        crypto = crypto_bars()
+        with fake_bars({("TSLA", "5m"): BARS, ("BTC-USD", "5m"): [b for b in crypto if b.ts < utc_ts(CDAY, "04:40")]}):
+            self.cli("add", "TSLA", "--above", "150", now=f"{DAY}T09:42")
+            self.cli("add", "BTC-USD", "--below", "98000", now=f"{CDAY}T04:40")
+        seen = []
+
+        def fake(symbol, interval="5m", range_="5d", prepost=False, ttl=None):
+            seen.append((symbol, tc.market().key, int(tc.now_et().timestamp()), range_))
+            return (list(crypto) if symbol == "BTC-USD" else list(BARS)), {}
+        with mock.patch.object(tc, "fetch_bars", side_effect=fake):
+            code, out = self.cli("check", now=f"{CDAY}T01:10")              # naive: ET (mixed -> US clock)
+        self.assertEqual(code, 0)
+        instant = int(tc.parse_et(f"{CDAY}T01:10").timestamp())                # 05:10 UTC
+        self.assertEqual(sorted(seen), [("BTC-USD", "crypto", instant, "2d"), ("TSLA", "us", instant, "5d")])
+        self.assertTrue(out.startswith("ALERTS CHECK · 01:10 ET · 2 active alerts on 2 symbols · "
+                                       "US market closed (crypto trades 24/7)"), out)
+        self.assertIn("FIRED  ALR-20261031-001  BTC-USD  below 98,000.00", out)
+        self.assertIn("04:50-04:55 UTC", out)
+        self.assertEqual(os.environ["DAYTRADER_NOW"], f"{CDAY}T01:10")         # the pin is undone
+
+    def test_crypto_watch_does_not_stop_for_a_closed_market(self):
+        crypto = crypto_bars(dip_at=None)
+        with fake_bars({("BTC-USD", "5m"): crypto}):
+            self.cli("add", "BTC-USD", "--above", "150000", now=f"{CDAY}T04:40")
+            tc.set_market(tc.CRYPTO)
+            c = Clock(f"{CDAY}T05:00")
+            c.now = tc.to_local(utc_ts(CDAY, "05:00"), tc.CRYPTO)             # a Saturday, in UTC
+            os.environ["DAYTRADER_NOW"] = c.now.strftime("%Y-%m-%dT%H:%M:%S")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                code = A.watch(None, 60, 3, False, sleep=c.sleep, clock=c.mono)
+        text = out.getvalue()
+        self.assertEqual((code, c.sleeps), (0, 3))
+        self.assertIn("05:00 UTC · 1 active · nothing new", text)
+        self.assertIn("after 3 min: 4 checks", text)
+        self.assertNotIn("market closed", text)
+
+
+class CryptoCliTests(TempHomeTestCase):
+    def setUp(self):
+        super().setUp()
+        self.fx = self.home / "fx"
+        bars = crypto_bars()
+        for hhmm in ("04:40", "05:10"):                       # the live window's URL moves with "now"
+            write_coinbase_fixtures(self.fx, "BTC-USD", bars, "5m", "2d", utc_ts(CDAY, hhmm))
+        self.env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(self.fx),
+                    "DAYTRADER_NOW": f"{CDAY}T04:40"}
+
+    def test_add_check_list_on_a_saturday(self):
+        p = run_cli(SCRIPT, "add", "BTC-USD", "--below", "98000", "--once", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("Added ALR-20261031-001 · BTC-USD below 98,000.00 · once · armed", p.stdout)
+        self.assertIn("fires at <= 98,000.00 (-2.00% away)", p.stdout)
+        p = run_cli(SCRIPT, "check", env=dict(self.env, DAYTRADER_NOW=f"{CDAY}T05:10"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(p.stdout.startswith("ALERTS CHECK · 05:10 UTC · 1 active alert on 1 symbol\n"), p.stdout)
+        self.assertIn("traded below 98,000.00 04:50-04:55 UTC (low 97,900.00) · last 100,000.00 · one-shot, now off",
+                      p.stdout)
+        self.assertNotIn("market closed", p.stdout)
+        j = run_cli(SCRIPT, "list", "--json", env=dict(self.env, DAYTRADER_NOW=f"{CDAY}T05:10"))
+        row = json.loads(j.stdout)["alerts"][0]
+        self.assertEqual((row["market"], row["status"], row["fire_count"]), ("crypto", "fired", 1))
+        t = run_cli(SCRIPT, "list", env=dict(self.env, DAYTRADER_NOW=f"{CDAY}T05:10"))
+        self.assertIn("prices as of 10-31 05:10 UTC", t.stdout)
+
+    def test_missing_coinbase_data_is_exit_2(self):
+        empty = self.home / "empty"
+        empty.mkdir()
+        p = run_cli(SCRIPT, "add", "BTC-USD", "--above", "101000", env=dict(self.env, DAYTRADER_FIXTURES=str(empty)))
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("api.exchange.coinbase.com", p.stderr)
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
 
 
 if __name__ == "__main__":

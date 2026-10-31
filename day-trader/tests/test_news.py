@@ -818,5 +818,120 @@ class ReviewRegressionTests(TempHomeTestCase):
         self.assertNotIn("No headlines for TSLA", text)
 
 
+
+# ---------------------------------------------------------------------------
+# Crypto pairs: Yahoo feeds for the pair, SEC not applicable, UTC clock for crypto-only runs
+# ---------------------------------------------------------------------------
+
+CNOW = "2026-10-31T04:40"   # UTC; a Saturday
+RSS_BTC = rss(
+    ("Bitcoin tops $104,000 as ETF inflows jump", "https://finance.yahoo.com/news/bitcoin-tops-1.html",
+     "Sat, 31 Oct 2026 04:10:00 +0000", ""),
+    ("Crypto exchange settles SEC lawsuit", "https://www.coindesk.com/policy/settles",
+     "Sat, 31 Oct 2026 01:30:00 +0000", "<source url=\"https://www.coindesk.com\">CoinDesk</source>"),
+    ("Bitcoin weekly outlook", "https://finance.yahoo.com/news/btc-old.html", "Tue, 27 Oct 2026 12:00:00 +0000", ""),
+    symbol="BTC-USD")
+SEARCH_BTC = {"news": [
+    {"uuid": "b1", "title": "Bitcoin tops $104,000 as ETF inflows jump", "publisher": "Bloomberg",
+     "link": "https://finance.yahoo.com/news/bitcoin-tops-1.html", "providerPublishTime": helpers.utc_ts("2026-10-31", "03:50"),
+     "relatedTickers": ["BTC-USD"]},
+    {"uuid": "b2", "title": "Tesla recalls cars", "publisher": "Reuters", "link": "https://e.com/tsla",
+     "providerPublishTime": helpers.utc_ts("2026-10-31", "04:20"), "relatedTickers": ["TSLA"]}]}
+
+
+class CryptoNewsTests(TempHomeTestCase):
+    NOW = CNOW
+
+    def setUp(self):
+        super().setUp()
+        tc.set_market(tc.CRYPTO)          # as main() does for a crypto-only run
+        self.now = tc.now_et()
+
+    def test_market_of_a_run(self):
+        self.assertIs(news.news_market(["BTC-USD", "eth-usd".upper()]), tc.CRYPTO)
+        self.assertIs(news.news_market(["BTC-USD", "TSLA"]), tc.US)          # any stock: ET clock
+        self.assertIs(news.news_market(["BRK-B"]), tc.US)
+        self.assertEqual(news.rss_url("BTC-USD"),
+                         "https://feeds.finance.yahoo.com/rss/2.0/headline?s=BTC-USD&region=US&lang=en-US")
+        self.assertIn("q=BTC-USD&", news.search_url("BTC-USD"))
+
+    def test_crypto_only_never_asks_sec(self):
+        self.assertEqual((self.now.tzname(), self.now.hour), ("UTC", 4))
+        routes = {"headline?s=BTC-USD": RSS_BTC, "search?q=BTC-USD": SEARCH_BTC}
+        with fake_http(routes) as m:
+            raw, rows = news.gather(["BTC-USD"], self.now - timedelta(hours=24), self.now)
+        self.assertFalse([c for c in m.call_args_list if "sec.gov" in c.args[0]])
+        sec = [r for r in rows if r["source"] == "sec-edgar"]
+        self.assertEqual([(r["symbols"], r["status"]) for r in sec], [(["BTC-USD"], "n/a")])
+        summary, warnings = news.source_summary(rows)
+        self.assertEqual(warnings, [])
+        self.assertEqual(next(x for x in summary if x["source"] == "sec-edgar")["not_applicable"], ["BTC-USD"])
+        titles = {i["title"] for i in raw}
+        self.assertNotIn("Tesla recalls cars", titles)                       # related to other tickers
+        feed = news.build_feed(raw, self.now, self.now - timedelta(hours=24))
+        self.assertEqual([i["title"] for i in feed["items"]],
+                         ["Bitcoin tops $104,000 as ETF inflows jump", "Crypto exchange settles SEC lawsuit"])
+        item = news.public_item(feed["items"][0], self.now)
+        self.assertEqual((item["date_et"], item["time_et"]), ("2026-10-31", "03:50"))   # UTC clock
+
+    def test_crypto_sources_failing_is_still_a_data_error(self):
+        with fake_http({}):
+            with self.assertRaises(tc.FetchError) as cm:
+                news.gather(["BTC-USD"], self.now - timedelta(hours=24), self.now)
+        self.assertIn("feeds.finance.yahoo.com", str(cm.exception))
+        self.assertNotIn("sec.gov", str(cm.exception))
+
+    def test_mixed_run_asks_sec_for_the_stock_only(self):
+        tc.set_market(tc.US)
+        now = tc.parse_et("2026-10-30T10:15")
+        routes = {"headline?s=BTC-USD": RSS_BTC, "search?q=BTC-USD": SEARCH_BTC,
+                  "headline?s=TSLA": RSS_TSLA, "search?q=TSLA": SEARCH_TSLA,
+                  "company_tickers.json": SEC_TICKERS, "CIK0001318605.json": SEC_SUBS}
+        with fake_http(routes):
+            raw, rows = news.gather(["TSLA", "BTC-USD"], now - timedelta(hours=24), now)
+        sec = {tuple(r["symbols"]): r["status"] for r in rows if r["source"] == "sec-edgar"}
+        self.assertEqual(sec, {("TSLA",): "ok", ("BTC-USD",): "n/a"})
+        self.assertEqual(news.source_summary(rows)[1], [])
+
+    def test_since_clock_time_is_utc_for_crypto(self):
+        since = news.parse_since("03:00", self.now)
+        self.assertEqual(since.isoformat(), "2026-10-31T03:00:00+00:00")
+        with self.assertRaisesRegex(ValueError, r"now is 2026-10-31 04:40 UTC"):
+            news.parse_since("05:00", self.now)
+
+
+class CryptoNewsCliTests(TempHomeTestCase):
+    NOW = CNOW
+
+    def setUp(self):
+        super().setUp()
+        self.fx = self.home / "fx"
+        write_fixture(self.fx, news.rss_url("BTC-USD"), RSS_BTC)
+        write_fixture(self.fx, news.search_url("BTC-USD"), SEARCH_BTC)
+        # No SEC fixtures at all: asking SEC would show up as a failed source.
+        self.env = {"DAYTRADER_HOME": str(self.home / "state"), "DAYTRADER_FIXTURES": str(self.fx),
+                    "DAYTRADER_NOW": CNOW}
+
+    def test_crypto_text_and_json(self):
+        r = run_cli(SCRIPT, "BTC-USD", env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = r.stdout
+        self.assertIn("NEWS · BTC-USD · last 24h", out)
+        self.assertIn("2 headlines, 2 high impact · as of Sat Oct 31 04:40 UTC", out)
+        self.assertIn("HIGH  03:50 UTC", out)
+        self.assertIn("Sources: Yahoo RSS ok · Yahoo search ok · SEC EDGAR n/a", out)
+        self.assertNotIn("! ", out)
+        self.assertNotIn("FAILED", out)
+        self.assertNotIn("weekly outlook", out)                               # older than 24h
+        j = run_cli(SCRIPT, "BTC-USD", "--since", "03:00", "--json", env=self.env)
+        self.assertEqual(j.returncode, 0, j.stderr)
+        data = json.loads(j.stdout)
+        self.assertEqual((data["market"], data["tz"], data["warnings"]), ("crypto", "UTC", []))
+        self.assertEqual(data["since_label"], "since Sat Oct 31 03:00 UTC")
+        self.assertEqual([i["title"] for i in data["items"]], ["Bitcoin tops $104,000 as ETF inflows jump"])
+        self.assertTrue(data["as_of"].endswith("+00:00"))
+        self.assertEqual(j.stderr, "")
+
+
 if __name__ == "__main__":
     unittest.main()

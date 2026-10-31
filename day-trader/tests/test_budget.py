@@ -13,8 +13,8 @@ from contextlib import redirect_stderr, redirect_stdout
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import helpers  # noqa: E402
-from helpers import (SKILLS, TempHomeTestCase, bars_from_closes, fake_bars, tc, write_fixture,  # noqa: E402
-                     yahoo_chart_url, yahoo_payload)
+from helpers import (SKILLS, TempHomeTestCase, bars_from_closes, fake_bars, tc, write_coinbase_quote,  # noqa: E402
+                     write_fixture, yahoo_chart_url, yahoo_payload)
 
 bud = helpers.load_skill_module("budget", "budget")
 SCRIPT = helpers.skill_script("budget", "budget.py")
@@ -760,6 +760,102 @@ class DirectionalRiskTests(unittest.TestCase):
         bad = {"id": "TKT-X", "symbol": "AMZN", "qty": 10, "entry": 220.0, "stop": 218.0, "status": "working"}
         with self.assertRaises(tc.StateError):
             bud.normalize_ledger(ledger(tickets=[bad]))
+
+
+def btc(tid="TRADE-20261031-001", status="open", qty=0.01, entry=101234.56, stop=99000.0, **kw):
+    """A crypto ledger trade as the broker writes it (UTC stamps, its own fee_pct)."""
+    t = {"id": tid, "symbol": "BTC-USD", "market": "crypto", "side": "long", "qty": qty, "entry_price": entry,
+         "stop": stop, "target": 104000.0, "status": status, "fee_pct": 0.6,
+         "opened_at": "2026-10-31T01:00:00+00:00"}
+    t.update(kw)
+    return t
+
+
+class CryptoBudgetTests(TempHomeTestCase):
+    """The budget day follows the market checked (the UTC day for crypto); crypto fees count as risk."""
+    NOW = "2026-10-31T02:00:00Z"     # Saturday 02:00 UTC = Friday 22:00 in New York
+
+    def setUp(self):
+        super().setUp()
+        tc.save_ledger(ledger(
+            trade("TRADE-20261030-001", pnl=-60, symbol="TSLA", opened=f"{DAY}T10:00:00-04:00",
+                  closed=f"{DAY}T15:00:00-04:00"),
+            btc(status="closed", pnl=-40.0, r_multiple=-1.79, exit_price=99000.0,
+                closed_at="2026-10-31T01:30:00+00:00")))
+
+    def json_of(self, *argv):
+        code, out, err = run_main(*argv, "--json")
+        return code, json.loads(out)
+
+    def test_today_is_the_utc_day_for_crypto_and_the_et_day_for_stocks(self):
+        code, j = self.json_of("status", "--market", "crypto")
+        self.assertEqual((j["date"], j["realized_pnl"], j["closed_today"]), ("2026-10-31", -40.0, 1))
+        code, j = self.json_of("status")                    # the stock day: both losses are on Friday 10-30 ET
+        self.assertEqual((j["date"], j["realized_pnl"], j["closed_today"]), (DAY, -100.0, 2))
+        code, out, _ = run_main("status", "--market", "crypto")
+        self.assertIn("RISKED SO FAR · Sat 2026-10-31 · 02:00 UTC (market open)", out)
+        code, out, _ = run_main("status")
+        self.assertIn("RISKED SO FAR · Fri 2026-10-30 · 22:00 ET (market closed)", out)
+        code, j = self.json_of("history", "--market", "crypto")
+        self.assertEqual([(r["date"], r["realized_pnl"]) for r in j["rows"]], [(DAY, -60.0), ("2026-10-31", -40.0)])
+        code, j = self.json_of("history")
+        self.assertEqual([(r["date"], r["realized_pnl"]) for r in j["rows"]], [(DAY, -100.0)])
+
+    def test_check_symbol_uses_its_market(self):
+        code, j = self.json_of("check", "--symbol", "BTC-USD", "--risk", "100")      # $40 + $100 <= $150
+        self.assertEqual((code, j["verdict"], j["market"], j["date"]), (0, "OK", "crypto", "2026-10-31"))
+        code, j = self.json_of("check", "--symbol", "TSLA", "--risk", "100")         # $100 + $100 > $150
+        self.assertEqual((code, j["verdict"], j["date"]), (bud.EXIT_BLOCKED, "BLOCKED", DAY))
+        code, j = self.json_of("check", "--market", "crypto", "--risk", "100")
+        self.assertEqual(j["verdict"], "OK")
+        with self.assertRaises(ValueError):
+            run_main("check", "--symbol", "BTC-USD", "--market", "us", "--risk", "10")
+
+    def test_crypto_risk_includes_both_fills_fees(self):
+        tc.save_ledger(ledger(btc(qty=0.02946375, entry=100000.0, stop=99500.0), tickets=[
+            {"id": "TKT-20261031-002", "symbol": "BTC-USD", "side": "long", "qty": 0.01, "entry": 101250.0,
+             "stop": 99000.0, "status": "pending", "expires_at": "2026-10-31T02:10:00+00:00"}]))
+        code, j = self.json_of("status", "--market", "crypto")
+        pos = j["positions"][0]
+        # $14.73 of price risk + $35.27 of fees at the stop; the row still shows the real stop
+        self.assertEqual((j["open_risk"]["total"], pos["risk"], pos["stop"], pos["fees_at_stop"]), (50.0, 50.0, 99500.0, 35.27))
+        self.assertEqual(j["pending_tickets"][0]["risk"], 34.52)                    # $22.50 + $12.02 of fees
+        code, j = self.json_of("check", "--symbol", "BTC-USD", "--entry", "100000", "--stop", "99500",
+                               "--qty", "0.02946375")
+        self.assertAlmostEqual(j["new_risk"], 50.0, places=3)
+        self.assertEqual((j["fees_at_stop"], j["unit"], j["ok"]), (35.27, "BTC", True))
+        self.assertTrue(any("includes $35.27 of paper fees at the stop" in n for n in j["notes"]))
+        code, j = self.json_of("check", "--symbol", "BTC-USD", "--entry", "100000", "--stop", "99500", "--qty", "0.1")
+        self.assertEqual((j["verdict"], j["max_shares_now"]), ("BLOCKED", 0.05892751))    # $100 left / $1,697 per BTC
+        code, out, _ = run_main("check", "--symbol", "BTC-USD", "--entry", "100000", "--stop", "99500", "--qty", "0.1")
+        self.assertIn("(= 0.05892751 BTC at $1,697.00/BTC risk incl. fees)", out)
+
+    def test_closed_crypto_pnl_is_net_of_fees(self):
+        norm = bud.normalize_ledger(ledger(btc(status="closed", exit_price=104000.0,
+                                               closed_at="2026-10-31T01:30:00+00:00"),
+                                           btc("B", status="closed", exit_price=104000.0, fees=12.31,
+                                               closed_at="2026-10-31T01:40:00+00:00")))
+        self.assertEqual([t["pnl"] for t in norm["trades"]], [15.34, 15.34])         # 27.65 gross - 12.31 fees
+        self.assertEqual(norm["trades"][0]["r_multiple"], 0.69)                       # R = the stop distance
+
+    def test_mark_is_net_of_fees(self):
+        rows = bud.mark_positions([{"id": "T", "symbol": "BTC-USD", "side": "long", "qty": 0.01, "entry": 101234.56,
+                                    "stop": 99000.0, "target": 104000.0, "risk": 34.36, "fee_pct": 0.6}],
+                                  {"BTC-USD": 102000.0})
+        # gross 7.65 - fees 0.6% x (101234.56 + 102000) x 0.01 = 12.19; R over the 22.35 price risk
+        self.assertEqual((rows[0]["unrealized"], rows[0]["r_now"], rows[0]["note"]), (-4.54, -0.2, ""))
+
+    def test_cli_mark_reads_the_coinbase_ticker(self):
+        tc.save_ledger(ledger(btc()))
+        fx = self.home / "fx"
+        write_coinbase_quote(fx, "BTC-USD", 102000.0, when="2026-10-31T01:59:00Z")
+        p = helpers.run_cli(SCRIPT, "status", "--market", "crypto", "--mark", "--json",
+                            env={"DAYTRADER_FIXTURES": str(fx)})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        j = json.loads(p.stdout)
+        self.assertEqual((j["date"], j["marks"]["prices"], j["marks"]["unrealized_total"]),
+                         ("2026-10-31", {"BTC-USD": 102000.0}, -4.54))
+        self.assertEqual(j["open_risk"]["total"], 34.36)
 
 
 class SkillDocTests(unittest.TestCase):

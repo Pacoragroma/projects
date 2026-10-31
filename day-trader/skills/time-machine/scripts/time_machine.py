@@ -15,6 +15,11 @@ Usage:
   python3 scripts/time_machine.py TSLA --at 10:15 --paths 20000 --seed 7
   python3 scripts/time_machine.py TSLA --side short --entry 364.18 --stop 368.00 --target 356.50
   python3 scripts/time_machine.py TSLA --svg tsla_replays.svg --save --json
+  python3 scripts/time_machine.py BTC-USD --save               # crypto: UTC days, to the 23:55 time stop
+
+Crypto (a Coinbase product such as BTC-USD) trades 24/7: a session is a UTC day of 288 five-minute
+slots, the library is the past ~59 UTC days, the replays run to the plan's time stop (23:55 UTC by
+default) and the paper broker's fees are shown in R (the verdict counts them).
 
 Exit codes: 0 ok, 1 bad input (or not enough history), 2 data source unreachable.
 """
@@ -40,10 +45,10 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union  #
 
 BAR_MINUTES = 5
 BAR_SECONDS = BAR_MINUTES * 60
-SLOTS = (tc.MARKET_CLOSE - tc.MARKET_OPEN) // BAR_MINUTES   # 78 five-minute slots, 09:30..15:55
-LAST_SLOT = SLOTS - 1
+# The slot count follows the active market (78 = 09:30..15:55 ET; 288 = a crypto UTC day), so it
+# is computed at call time - session_slots() / last_slot(); tm.SLOTS and tm.LAST_SLOT still work.
 DEFAULT_PATHS = 10_000
-DEFAULT_SESSIONS = 59          # Yahoo keeps about 60 days of 5-minute bars
+DEFAULT_SESSIONS = 59          # Yahoo keeps about 60 days of 5-minute bars (crypto: 59 UTC days)
 DEFAULT_BLOCK = 3              # consecutive bars copied from one past session (15 minutes)
 SVG_PATHS = 300                # replays drawn in the SVG (the first 300 of the run)
 MIN_SESSIONS = 5               # refuse to give odds from fewer past sessions than this
@@ -51,6 +56,7 @@ FEW_SESSIONS = 20              # warn below this many
 MIN_SESSION_BARS = 12          # a past session needs >= 1 hour of bars to count (drops glitches)
 STALE_DATA_SECONDS = 600       # market open but no new bar for 10 minutes -> halted / delayed?
 STALE_LIBRARY_DAYS = 7         # newest past session older than this -> stale data warning
+STALE_LIBRARY_DAYS_24H = 2     # ... for a 24/7 market, where yesterday is always a session
 AMBIGUOUS_NOTE_PCT = 5.0       # note when this share of replays touched both levels in one bar
 EPS = 1e-12                    # float tolerance so a bar that exactly touches a level counts
 TREND_MATERIAL_R = 0.1         # trend-removed replays this far off in expected R -> say so
@@ -58,15 +64,47 @@ TREND_MATERIAL_PCT = 5.0       # ... or this many points off in target-first %
 TREND_EXPLAINS_R = 0.05        # drift to the median exit at least this many R can explain that gap
 
 Shape = Tuple[float, float, float]           # (close, high, low) relative to the previous close
-Library = List[List[Optional[Shape]]]        # one row of SLOTS shapes per past session
+Library = List[List[Optional[Shape]]]        # one row of session_slots() shapes per past session
 
 
 # ---------------------------------------------------------------------------
 # Pure core: slots and the bar-shape library
 # ---------------------------------------------------------------------------
 
+def session_slots() -> int:
+    """5-minute slots in the active market's session: 78 (09:30-16:00 ET); 288 for a crypto UTC day."""
+    return (tc.MARKET_CLOSE - tc.MARKET_OPEN) // BAR_MINUTES
+
+
+def last_slot() -> int:
+    return session_slots() - 1
+
+
+def __getattr__(name: str) -> Any:
+    """`tm.SLOTS` / `tm.LAST_SLOT` for callers: the active market's, never an import-time copy."""
+    if name == "SLOTS":
+        return session_slots()
+    if name == "LAST_SLOT":
+        return last_slot()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _crypto() -> bool:
+    return tc.market().key == "crypto"
+
+
+def _tz() -> str:
+    return tc.tz_label()
+
+
+def _days(n: int) -> str:
+    """How a number of past sessions reads: '59 sessions'; crypto: '59 days (UTC)'."""
+    return f"{n} days (UTC)" if _crypto() else f"{n} sessions"
+
+
 def slot_of(ts: float) -> Optional[int]:
-    """5-minute slot of the regular session (0 = 09:30 bar, 77 = 15:55 bar), None outside it."""
+    """5-minute slot of the regular session (0 = 09:30 bar, 77 = 15:55 bar; crypto 0 = 00:00 UTC,
+    287 = 23:55), None outside it."""
     m = tc.minute_of_day(ts)
     if m < tc.MARKET_OPEN or m >= tc.MARKET_CLOSE:
         return None
@@ -74,7 +112,7 @@ def slot_of(ts: float) -> Optional[int]:
 
 
 def slot_time(slot: int) -> str:
-    """Start time (HH:MM ET) of a slot; slot SLOTS is the 16:00 close."""
+    """Start time (HH:MM, market time) of a slot; slot session_slots() is the close (16:00 ET)."""
     return tc.hhmm(tc.MARKET_OPEN + slot * BAR_MINUTES)
 
 
@@ -97,7 +135,7 @@ def slot_bars(bars: Sequence[tc.Bar]) -> Dict[int, tc.Bar]:
     return out
 
 
-def build_library(sessions: Sequence[Sequence[tc.Bar]], n_slots: int = SLOTS) -> Library:
+def build_library(sessions: Sequence[Sequence[tc.Bar]], n_slots: Optional[int] = None) -> Library:
     """Per-session, per-slot bar shapes: close/high/low divided by the previous bar's close.
 
     The first bar of a session is measured from its own open, so overnight gaps are left out
@@ -105,7 +143,9 @@ def build_library(sessions: Sequence[Sequence[tc.Bar]], n_slots: int = SLOTS) ->
     no trades in those 5 minutes and becomes a flat bar (1, 1, 1); the next bar's shape then
     carries the whole move since the last trade. Slots before the first bar or after the last
     (late open, early close on half days) stay None - they did not exist that day.
+    `n_slots` defaults to the active market's session_slots().
     """
+    n_slots = session_slots() if n_slots is None else n_slots
     lib: Library = []
     for bars in sessions:
         row: List[Optional[Shape]] = [None] * n_slots
@@ -293,7 +333,7 @@ def simulate(library: Library, start_slot: int, entry: float, stop: float, targe
     shapes = library if side == "long" else invert_library(library)
     eligible = [[j for j, row in enumerate(shapes) if row[k] is not None] for k in range(n_slots)]
     if not eligible[start_slot]:
-        raise ValueError(f"no past session has a 5-minute bar at {slot_time(start_slot)} ET to replay from")
+        raise ValueError(f"no past session has a 5-minute bar at {slot_time(start_slot)} {_tz()} to replay from")
     end = start_slot
     while end < last and eligible[end + 1]:
         end += 1
@@ -423,7 +463,7 @@ def simulate(library: Library, start_slot: int, entry: float, stop: float, targe
 
 def replay_history(sessions: Union[Mapping[str, Sequence[tc.Bar]], Sequence[Sequence[tc.Bar]]],
                    start_slot: int, stop_pct: float, target_pct: float, side: str,
-                   end_slot: int = LAST_SLOT) -> Dict[str, Any]:
+                   end_slot: Optional[int] = None) -> Dict[str, Any]:
     """Walk every past session's real bars from the same clock time with the same % levels.
 
     Entry each day = the close of the last bar before `start_slot` (or, when the day's first bar
@@ -435,6 +475,7 @@ def replay_history(sessions: Union[Mapping[str, Sequence[tc.Bar]], Sequence[Sequ
     """
     if side not in ("long", "short"):
         raise ValueError(f"side must be long or short, not {side!r}")
+    end_slot = last_slot() if end_slot is None else end_slot
     stop_r, target_r = 1.0 + stop_pct / 100.0, 1.0 + target_pct / 100.0
     _check_levels(side, 1.0, stop_r, target_r)
     risk_frac = abs(stop_pct) / 100.0
@@ -488,9 +529,40 @@ def replay_history(sessions: Union[Mapping[str, Sequence[tc.Bar]], Sequence[Sequ
     }
 
 
+def fee_summary(result: Mapping[str, Any], fee_pct: float) -> Dict[str, Any]:
+    """What paper fees (fee_pct % of notional per fill, crypto) do to a simulate() result, in R.
+
+    A round trip pays the fee on the entry and on the exit: at the target, at the stop, or at the
+    average closing price of the replays still open at the end (fees are linear in the exit price,
+    so that average gives the exact expected fee).
+    """
+    rate = float(fee_pct) / 100.0
+    entry, stop, target = float(result["entry"]), float(result["stop"]), float(result["target"])
+    risk = abs(entry - stop)
+    sign = 1.0 if result["side"] == "long" else -1.0
+    rr = float(result["rr"])
+    c, n = result["counts"], int(result["paths"])
+    at_target, at_stop = rate * (entry + target) / risk, rate * (entry + stop) / risk
+    open_exit = entry + sign * float(result.get("avg_r_open") or 0.0) * risk
+    at_open = rate * (entry + open_exit) / risk
+    expected = (c["target"] * at_target + c["stop"] * at_stop + c["open"] * at_open) / n if n else 0.0
+    win, loss = rr - at_target, 1.0 + at_stop
+    return {"fee_pct": float(fee_pct), "round_trip_r": round(2.0 * rate * entry / risk, 3),
+            "at_target_r": round(at_target, 3), "at_stop_r": round(at_stop, 3),
+            "expected_fees_r": round(expected, 3),
+            "expected_r_after_fees": round(float(result["expected_r"]) - expected, 3),
+            "breakeven_win_rate_after_fees_pct": round(100.0 * loss / (win + loss), 2) if win > 0 else None}
+
+
+def _net_r(result: Mapping[str, Any]) -> float:
+    """Expected R the verdict judges: after the paper fees when there are any (crypto)."""
+    fees = result.get("fees")
+    return float(fees["expected_r_after_fees"] if fees else result["expected_r"])
+
+
 def verdict(result: Mapping[str, Any]) -> str:
-    """ODDS LEAN YOUR WAY / ODDS LEAN AGAINST YOU / CLOSE TO A COIN FLIP."""
-    er = float(result["expected_r"])
+    """ODDS LEAN YOUR WAY / ODDS LEAN AGAINST YOU / CLOSE TO A COIN FLIP (on R after fees, if any)."""
+    er = _net_r(result)
     if er > 0.1 and result["target_first_pct"] > result["stop_first_pct"]:
         return "ODDS LEAN YOUR WAY"
     if er < -0.1:
@@ -506,8 +578,20 @@ def verdict_notes(result: Mapping[str, Any]) -> List[str]:
     out = [f"with R:R {rr:.2f} you need more than {be:.1f}% of resolved trades (target or stop) to "
            f"hit the target to break even" + ("" if share is None else f"; the replays got {share:.1f}%")]
     if share is None:
-        out.append("no replay reached the stop or the target before the close")
-    er = float(result["expected_r"])
+        out.append("no replay reached the stop or the target before the "
+                   + ("time stop" if tc.market().every_day else "close"))
+    fees = result.get("fees")
+    if fees:
+        gross = verdict({k: v for k, v in result.items() if k != "fees"})
+        main = result.get("verdict") or verdict(result)
+        be = fees.get("breakeven_win_rate_after_fees_pct")
+        out.append(f"the verdict counts the paper fees ({fees['fee_pct']:g}% per fill): about "
+                   f"{fees['expected_fees_r']:.2f}R per trade, so the expected value after fees is "
+                   f"{fees['expected_r_after_fees']:+.2f}R"
+                   + (f" and break-even needs more than {be:.1f}% of resolved trades" if be is not None else
+                      " - even the target loses money after fees at these levels")
+                   + (f"; before fees it would be {gross}" if gross != main else ""))
+    er = _net_r(result)
     if er > 0.1 and result["target_first_pct"] <= result["stop_first_pct"]:
         out.append("the positive expected value comes from the reward:risk, not the odds - the stop is hit "
                    "at least as often as the target")
@@ -519,7 +603,7 @@ def verdict_notes(result: Mapping[str, Any]) -> List[str]:
     main_v = result.get("verdict") or verdict(result)
     if alt:
         flips = alt["verdict"] != main_v
-        material = (abs(float(alt["expected_r"]) - er) >= TREND_MATERIAL_R
+        material = (abs(float(alt["expected_r"]) - float(result["expected_r"])) >= TREND_MATERIAL_R  # before fees
                     or abs(alt["target_first_pct"] - result["target_first_pct"]) >= TREND_MATERIAL_PCT)
         if flips or material:
             out.append(_trend_note(result, trend, alt, flips))
@@ -543,14 +627,23 @@ def _drift_words(trend: Mapping[str, Any], side: str) -> Tuple[str, bool]:
 
 
 def _trend_note(result: Mapping[str, Any], trend: Mapping[str, Any], alt: Mapping[str, Any], flips: bool) -> str:
+    """The trend note (see _trend_note_words); crypto's past sessions are UTC days."""
+    note = _trend_note_words(result, trend, alt, flips)
+    return note.replace("the past sessions", "the past days") if _crypto() else note
+
+
+def _trend_note_words(result: Mapping[str, Any], trend: Mapping[str, Any], alt: Mapping[str, Any],
+                      flips: bool) -> str:
     """Why the trend-included and trend-removed replays differ - worded so it never contradicts itself.
 
     The drift is measured from the entry to the median exit (see trend_check). It is named as the
     cause only when it is big enough (>= 0.05R) and points the way the two answers differ;
     otherwise the note says the odds are sensitive to small slot-by-slot drifts.
     """
+    after = alt.get("expected_r_after_fees")
     odds = (f"{alt['target_first_pct']:.1f}% target / {alt['stop_first_pct']:.1f}% stop, "
-            f"{alt['expected_r']:+.2f}R, {alt['verdict']}")
+            + (f"{alt['expected_r']:+.2f}R" if after is None else f"{after:+.2f}R after fees")
+            + f", {alt['verdict']}")
     words, big = _drift_words(trend, str(result.get("side") or "trade"))
     detrended = bool(trend.get("detrended"))
     gain = float(result["expected_r"]) - float(alt["expected_r"])
@@ -598,10 +691,11 @@ def session_end_minute(meta: Mapping[str, Any], day: str) -> Optional[int]:
 
 
 def parse_at(value: str) -> Tuple[int, Optional[str]]:
-    """--at HH:MM -> (slot, note-if-rounded). Must fall inside 09:30-15:59 ET."""
+    """--at HH:MM -> (slot, note-if-rounded). Must fall inside 09:30-15:59 ET (crypto: any UTC time)."""
     minute = tc.parse_hhmm(value)
     if not tc.MARKET_OPEN <= minute < tc.MARKET_CLOSE:
-        raise ValueError(f"--at must be a regular-session time from 09:30 to 15:55 ET, not {value}")
+        what = "a time" if tc.market().every_day else "a regular-session time"
+        raise ValueError(f"--at must be {what} from {slot_time(0)} to {slot_time(last_slot())} {_tz()}, not {value}")
     slot = (minute - tc.MARKET_OPEN) // BAR_MINUTES
     note = None
     if minute % BAR_MINUTES:
@@ -610,55 +704,76 @@ def parse_at(value: str) -> Tuple[int, Optional[str]]:
 
 
 def choose_start(now: datetime, at: Optional[str], today_bars: Sequence[tc.Bar],
-                 today_close: Optional[int] = None) -> Dict[str, Any]:
+                 today_close: Optional[int] = None, horizon_end: Optional[int] = None) -> Dict[str, Any]:
     """Where the replays start and end.
 
     today_bars: today's regular-session bars that had started by `now`.
     today_close: today's close in minutes ET if Yahoo reports one (early-close days).
+    horizon_end: where every day's replays end, in minutes (crypto, which never closes: the plan's
+    time stop, 23:55 UTC by default); None = the close.
     --at wins; else "now" (rounded down to the 5-minute grid) when the market is open and today
     has bars; else a full session from the 09:30 open. The session simulated is today's while
-    today's close is still ahead, otherwise the next one.
+    today's close (or the time stop) is still ahead, otherwise the next one.
     """
+    every_day, tz = tc.market().every_day, _tz()
     now_min = now.hour * 60 + now.minute
-    weekday = now.weekday() < 5
+    weekday = every_day or now.weekday() < 5
     close = today_close if today_close and tc.MARKET_OPEN < today_close <= tc.MARKET_CLOSE else tc.MARKET_CLOSE
+    full_end = last_slot()
+    if horizon_end is not None:
+        if not tc.MARKET_OPEN + BAR_MINUTES <= horizon_end <= tc.MARKET_CLOSE:
+            raise ValueError(f"the replays' end {tc.hhmm(horizon_end)} {tz} is outside the session")
+        close = min(close, horizon_end)
+        full_end = (horizon_end - tc.MARKET_OPEN) // BAR_MINUTES - 1
+    early = close < (tc.MARKET_CLOSE if horizon_end is None else horizon_end)   # Yahoo's early close
     before_close = weekday and now_min < close
     market_open = before_close and now_min >= tc.MARKET_OPEN
-    end_slot = (close - tc.MARKET_OPEN) // BAR_MINUTES - 1 if before_close else LAST_SLOT
+    end_slot = (close - tc.MARKET_OPEN) // BAR_MINUTES - 1 if before_close else full_end
+    start_word = "from 00:00 UTC" if every_day else "from the open"
+    next_day = "the next UTC day" if every_day else "the next session"
+    past = f"past the {tc.hhmm(close)} {tz} time stop" if every_day else "market closed"
     notes: List[str] = []
     warnings: List[str] = []
     if at is not None:
         slot, note = parse_at(at)
         if note:
             notes.append(note)
-        if before_close and slot > end_slot:
+        if before_close and early and slot > end_slot:
             raise ValueError(f"today's session closes early at {tc.hhmm(close)} ET - --at {at} is after "
                              "its last 5-minute bar")
+        if slot > end_slot:
+            raise ValueError(f"--at {at} is at or after the {tc.hhmm(horizon_end or close)} {tz} time stop, "
+                             "where the replays end")
         mode = "at"
         if not before_close:
-            notes.append(f"market closed - simulating the next session from {slot_time(slot)} ET")
+            notes.append(f"{past} - simulating {next_day} from {slot_time(slot)} {tz}")
     elif market_open and today_bars:
         slot = min((now_min - tc.MARKET_OPEN) // BAR_MINUTES, end_slot)
         mode = "now"
         latest = max(today_bars, key=lambda b: b.ts)
         age = now.timestamp() - (latest.ts + BAR_SECONDS)
         if age > STALE_DATA_SECONDS:
-            warnings.append(f"the latest 5-minute bar started at {latest.time} ET ({int(age // 60) + 5} min ago) - "
-                            "halted, early close or delayed data? Check before trading")
+            why = "no trades or delayed data?" if every_day else "halted, early close or delayed data?"
+            warnings.append(f"the latest 5-minute bar started at {latest.time} {tz} ({int(age // 60) + 5} min ago) - "
+                            f"{why} Check before trading")
     else:
         slot, mode = 0, "open"
         if before_close and now_min < tc.MARKET_OPEN:
             notes.append("market not open yet - simulating today's session from the 09:30 open")
+        elif market_open and every_day:
+            notes.append("no 5-minute candles from today yet (delayed data?) - simulating a full UTC day "
+                         "from 00:00 UTC")
         elif market_open:
             notes.append("no 5-minute bars from today yet (holiday, halt or delayed data) - simulating a "
                          "full session from the 09:30 open")
         else:
-            notes.append("market closed - simulating the next session from the open")
-    if before_close and close < tc.MARKET_CLOSE:
+            notes.append(f"{past} - simulating {next_day} {start_word}")
+    if before_close and early:
         notes.append(f"early close today at {tc.hhmm(close)} ET - replays end there")
     return {"start_slot": slot, "end_slot": end_slot, "mode": mode,
             "session": "today" if before_close else "next",
-            "include_today": weekday and not before_close,   # today's session is complete
+            # today's session is complete (a 24/7 UTC day never is before midnight)
+            "include_today": weekday and not before_close and not every_day,
             "market_open": market_open, "notes": notes, "warnings": warnings}
 
 
@@ -743,18 +858,23 @@ def render_svg(res: Mapping[str, Any], samples: Sequence[Mapping[str, Any]],
            f'<rect width="{SVG_W}" height="{SVG_H}" fill="{c["bg"]}"/>',
            f'<defs><clipPath id="plot"><rect x="{PX0}" y="{PY0}" width="{PX1 - PX0}" '
            f'height="{PY1 - PY0}"/></clipPath></defs>']
-    when = "from the open" if res.get("mode") == "open" else f"from {res['start']} ET"
+    crypto, tz = _crypto(), _tz()
+    if res.get("mode") == "open":
+        when = "from 00:00 UTC" if crypto else "from the open"
+    else:
+        when = f"from {res['start']} {tz}"
     if res.get("session") == "next":
-        when += " (next session)"
+        when += " (next UTC day)" if crypto else " (next session)"
     out.append(text(PX0, 32, f"TIME MACHINE · {sym} · {side.upper()} {when}", 18, "bold"))
     # plot frame, the shaded "rest of the day" and the time axis
     out.append(f'<rect x="{PX0}" y="{PY0}" width="{PX1 - PX0}" height="{PY1 - PY0}" fill="#ffffff" '
                f'stroke="{c["ink"]}" stroke-width="1.5"/>')
     out.append(f'<rect x="{x(start):.1f}" y="{PY0}" width="{PX1 - x(start):.1f}" height="{PY1 - PY0}" '
                f'fill="{c["shade"]}"/>')
-    labels = [(0, "09:30"), (start, res["start"]), (n_cols, res["end"])]
-    if abs(x(30) - x(start)) > 45 and abs(x(30) - x(n_cols)) > 45 and 30 < n_cols:
-        labels.append((30, "12:00"))
+    labels = [(0, slot_time(0)), (start, res["start"]), (n_cols, res["end"])]
+    noon = (12 * 60 - tc.MARKET_OPEN) // BAR_MINUTES          # 12:00 (slot 30 for stocks, 144 for crypto)
+    if abs(x(noon) - x(start)) > 45 and abs(x(noon) - x(n_cols)) > 45 and 0 < noon < n_cols:
+        labels.append((noon, "12:00"))
     for b, lab in sorted(set(labels)):
         if b == start and b != 0 and (abs(x(b) - x(0)) < 40 or abs(x(b) - x(n_cols)) < 40):
             continue
@@ -804,12 +924,13 @@ def render_svg(res: Mapping[str, Any], samples: Sequence[Mapping[str, Any]],
     # right panel: the odds
     rx0, rx1 = 572.0, 780.0
     out.append(text(rx0, 84, f"{res['paths']:,}", 30, "bold"))
-    out.append(text(rx0, 102, f"REPLAYS FROM {res['sessions_used']} PAST SESSIONS", 10, "bold", c["muted"],
+    past = "PAST DAYS (UTC)" if crypto else "PAST SESSIONS"
+    out.append(text(rx0, 102, f"REPLAYS FROM {res['sessions_used']} {past}", 10, "bold", c["muted"],
                     "start", "Menlo, Consolas, monospace"))
     shown = res.get("display_pct") or display_pct(res["counts"], res["paths"])   # same as the text
     rows = (("HIT TARGET FIRST", shown["target_first"], c["target"]),
             ("HIT STOP FIRST", shown["stop_first"], c["stop"]),
-            ("OPEN AT CLOSE", shown["open_at_close"], c["open"]))
+            ("OPEN AT TIME STOP" if crypto else "OPEN AT CLOSE", shown["open_at_close"], c["open"]))
     for i, (label, pct, col) in enumerate(rows):
         ty = 138 + i * 46
         out.append(text(rx0, ty, label, 11, "bold", c["ink"], "start", "Menlo, Consolas, monospace"))
@@ -817,8 +938,10 @@ def render_svg(res: Mapping[str, Any], samples: Sequence[Mapping[str, Any]],
         out.append(f'<rect x="{rx0}" y="{ty + 7}" width="{rx1 - rx0}" height="10" fill="#ffffff" '
                    f'stroke="{c["muted"]}" stroke-width="0.6" stroke-dasharray="2 2"/>')
         out.append(f'<rect x="{rx0}" y="{ty + 7}" width="{(rx1 - rx0) * pct / 100:.1f}" height="10" fill="{col}"/>')
-    er = res["expected_r"]
-    out.append(text(rx0, 286, "EXPECTED VALUE", 11, "bold", c["ink"], "start", "Menlo, Consolas, monospace"))
+    fees = res.get("fees")
+    er = fees["expected_r_after_fees"] if fees else res["expected_r"]   # crypto: what the verdict judges
+    out.append(text(rx0, 286, "EV AFTER FEES" if fees else "EXPECTED VALUE", 11, "bold", c["ink"], "start",
+                    "Menlo, Consolas, monospace"))
     out.append(text(rx1, 286, f"{er:+.2f}R", 16, "bold", c["ink"], "end"))
     out.append(text(rx0, 318, "THE TIME MACHINE'S VERDICT", 10, "bold", c["muted"], "start",
                     "Menlo, Consolas, monospace"))
@@ -826,11 +949,11 @@ def render_svg(res: Mapping[str, Any], samples: Sequence[Mapping[str, Any]],
         out.append(text(rx0, 342 + i * 22, part, 20, "bold"))
     hist = res.get("history") or {}
     if hist.get("sessions"):
-        out.append(text(PX0, 412, f"History, same clock time, last {hist['sessions']} sessions: "
+        out.append(text(PX0, 412, f"History, same clock time, last {_days(hist['sessions'])}: "
                         f"{hist['target']} target / {hist['stop']} stop / {hist['open']} open at close",
                         11, "normal", c["ink"]))
-    out.append(text(PX0, 434, "Simulated from the stock's own past 5-minute bars - not a guarantee. "
-                    "Not financial advice. Paper trading only.", 10, "normal", c["muted"]))
+    out.append(text(PX0, 434, f"Simulated from the {'coin' if crypto else 'stock'}'s own past 5-minute bars - not a "
+                    "guarantee. Not financial advice. Paper trading only.", 10, "normal", c["muted"]))
     out.append("</svg>")
     return "\n".join(out) + "\n"
 
@@ -865,18 +988,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = tc.make_parser("Replay the rest of the session thousands of times from the stock's own past "
                        "5-minute bars and show the odds of target first, stop first or neither. "
                        "Simulation only - not financial advice.")
-    p.add_argument("symbol", help="ticker, e.g. TSLA")
+    p.add_argument("symbol", help="ticker, e.g. TSLA, or a Coinbase product such as BTC-USD")
     p.add_argument("--entry", type=_price, help="fill price (default: the saved plan's entry)")
     p.add_argument("--stop", type=_price, help="stop price (default: the saved plan's stop)")
     p.add_argument("--target", type=_price, help="target price (default: the saved plan's target)")
     p.add_argument("--side", type=str.lower, choices=("long", "short"),
                    help="default: inferred from the levels (stop below entry = long)")
-    p.add_argument("--at", metavar="HH:MM", help="start time ET (default: now if the market is open, "
-                   "else the 09:30 open)")
+    p.add_argument("--at", metavar="HH:MM", help="start time ET, UTC for crypto (default: now if the market "
+                   "is open, else the 09:30 open)")
     p.add_argument("--paths", type=_int_in(100, 200_000), default=DEFAULT_PATHS,
                    help=f"number of replays (default {DEFAULT_PATHS:,})")
     p.add_argument("--sessions", type=_int_in(MIN_SESSIONS, 250), default=DEFAULT_SESSIONS,
-                   help=f"most recent past sessions to learn from (default {DEFAULT_SESSIONS})")
+                   help=f"most recent past sessions (crypto: UTC days) to learn from (default {DEFAULT_SESSIONS})")
     p.add_argument("--block", type=_int_in(1, 24), default=DEFAULT_BLOCK,
                    help=f"bars copied from one past session at a time (default {DEFAULT_BLOCK} = 15 min)")
     p.add_argument("--seed", type=int, help="random seed (default: derived from symbol + date)")
@@ -966,8 +1089,10 @@ def finished_trigger_note(plan: Mapping[str, Any], sym: str, entry: float, today
     day = str(sig.get("date") or "")
     if not (sig.get("session_over") or sig.get("replay") or (day and day < today)):
         return None
-    note = sig.get("note") or f"trigger is from the finished {day} session - re-plan from the next open"
-    when = f" at {sig['triggered_at']} ET" if sig.get("triggered_at") else ""
+    note = sig.get("note") or (
+        f"trigger is from the finished {day} {_tz()} session - re-plan from the current price"
+        if tc.market().every_day else f"trigger is from the finished {day} session - re-plan from the next open")
+    when = f" at {sig['triggered_at']} {_tz()}" if sig.get("triggered_at") else ""
     what = f"{sig.get('label') or sig.get('setup') or 'entry'}{when}"
     return f"the saved {sym} entry {tc.fmt_price(entry)} is an entry-skill trigger ({what}): {note}"
 
@@ -1007,6 +1132,7 @@ def time_machine_section(res: Mapping[str, Any]) -> Dict[str, Any]:
         "verdict": res["verdict"],
         "history": {k: hist[k] for k in ("sessions", "target", "stop", "open")},
         "as_of": res["as_of"],
+        **({"fees": dict(res["fees"])} if res.get("fees") else {}),   # crypto: paper fees in R
     }
 
 
@@ -1025,9 +1151,26 @@ def save(res: Mapping[str, Any], existing: Optional[Mapping[str, Any]]) -> List[
     return dropped
 
 
+def plan_time_stop(plan: Mapping[str, Any]) -> Tuple[int, str]:
+    """(minutes, source) where a crypto plan's replays end: the saved exit plan's time stop when it
+    is a valid time, else the market's default (23:55 UTC)."""
+    xp = plan.get("exit_plan")
+    raw = xp.get("time_stop") if isinstance(xp, MappingABC) else None
+    if isinstance(raw, str):
+        try:
+            m = tc.parse_hhmm(raw)
+        except ValueError:
+            m = -1
+        if tc.MARKET_OPEN + BAR_MINUTES <= m <= tc.MARKET_CLOSE:
+            return m, "the saved exit plan"
+    return tc.parse_hhmm(tc.market().time_stop), "the default"
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     sym = parse_symbol(args.symbol)
+    tc.use_market_for(sym)               # crypto (BTC-USD): UTC days, 24/7, Coinbase prices
+    crypto = _crypto()
     now = tc.now_et()
     now_ts = now.timestamp()
     today = now.strftime("%Y-%m-%d")
@@ -1044,37 +1187,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     warnings: List[str] = list(lv["warnings"])
     notes: List[str] = list(lv["notes"])
 
+    # Crypto: one UTC day more than the library needs (today, and the window's partial first day).
+    range_ = f"{max(60, args.sessions + 1)}d" if crypto else "60d"
     try:
-        raw, meta = tc.fetch_bars(sym, "5m", "60d")
+        raw, meta = tc.fetch_bars(sym, "5m", range_)
     except tc.FetchError as e:
         if _not_found(e):
+            if crypto:
+                raise ValueError(f"Coinbase has no product {sym} - check the symbol (e.g. BTC-USD)") from e
             raise ValueError(f"Yahoo Finance has no data for {sym} - check the symbol") from e
         raise
     groups = tc.group_sessions(raw)
     today_bars = [b for b in groups.get(today, []) if b.ts <= now_ts]
-    st = choose_start(now, args.at, today_bars, session_end_minute(meta, today))
+    horizon_end = None
+    if crypto:   # a 24/7 market never closes: the trade lives until its time stop
+        horizon_end, ts_source = plan_time_stop(plan)
+        notes.append(f"crypto never closes: the replays run to the {tc.hhmm(horizon_end)} UTC time stop "
+                     f"({ts_source})")
+    st = choose_start(now, args.at, today_bars, session_end_minute(meta, today), horizon_end)
     warnings += st["warnings"]
     notes += st["notes"]
 
     days = [d for d in groups if d < today or (d == today and st["include_today"])]
     usable = [d for d in days if len(slot_bars(groups[d])) >= MIN_SESSION_BARS]
     if len(usable) < MIN_SESSIONS:
-        raise ValueError(f"only {len(usable)} past session(s) of 5-minute data for {sym} - need at least "
+        what = "UTC day(s) of 5-minute candles" if crypto else "session(s) of 5-minute data"
+        raise ValueError(f"only {len(usable)} past {what} for {sym} - need at least "
                          f"{MIN_SESSIONS} to replay (new listing, halted or thinly traded?)")
     use = usable[-args.sessions:]
     sessions = [groups[d] for d in use]
     thin = [d for d in days if d >= use[0] and d not in usable]
     if thin:
-        notes.append(f"skipped {len(thin)} past session(s) with under an hour of 5-minute bars ({', '.join(thin)})")
-    if len(use) < args.sessions and args.sessions == DEFAULT_SESSIONS:
+        notes.append(f"skipped {len(thin)} past {'day' if crypto else 'session'}(s) with under an hour of "
+                     f"5-minute bars ({', '.join(thin)})")
+    if len(use) < args.sessions and crypto:
+        notes.append(f"Coinbase returned {len(use)} usable past days (UTC) of 5-minute candles "
+                     f"(asked for {args.sessions}) - a recent listing?")
+    elif len(use) < args.sessions and args.sessions == DEFAULT_SESSIONS:
         notes.append(f"Yahoo returned {len(use)} usable past sessions (5-minute data only goes back ~60 days)")
     elif len(use) < args.sessions:
         notes.append(f"only {len(use)} usable past sessions available (asked for {args.sessions})")
     if len(use) < FEW_SESSIONS:
-        warnings.append(f"only {len(use)} past sessions to learn from - treat these odds as rough")
+        warnings.append(f"only {len(use)} past {'days' if crypto else 'sessions'} to learn from - treat "
+                        "these odds as rough")
     newest = datetime.strptime(use[-1], "%Y-%m-%d")
     age_days = (datetime.strptime(today, "%Y-%m-%d") - newest).days
-    if age_days > STALE_LIBRARY_DAYS:
+    if age_days > (STALE_LIBRARY_DAYS_24H if tc.market().every_day else STALE_LIBRARY_DAYS):
         warnings.append(f"the newest 5-minute data is from {use[-1]} ({age_days} days ago) - halted, delisted "
                         "or stale data?")
 
@@ -1094,6 +1252,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         with_trend["median_minutes_to_resolution"])
     trend.update({"detrended": bool(args.detrend), "alt": {
         k: alt[k] for k in ("target_first_pct", "stop_first_pct", "open_at_close_pct", "expected_r")}})
+    fee = tc.fee_pct()                   # paper fee per fill, % (crypto; 0 for stocks)
+    if fee > 0:
+        sim["fees"] = fee_summary(sim, fee)
+        alt["fees"] = fee_summary(alt, fee)
+        trend["alt"]["expected_r_after_fees"] = alt["fees"]["expected_r_after_fees"]
     trend["alt"]["verdict"] = verdict(alt)
     stop_pct = (stop / entry - 1.0) * 100.0
     target_pct = (target / entry - 1.0) * 100.0
@@ -1101,8 +1264,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                           end_slot=sim["end_slot"])
 
     if sim["end_capped"]:
-        notes.append(f"past sessions only have bars until {sim['end']} ET, so the replays stop there")
-    if sim["minutes_simulated"] <= 30:
+        notes.append(f"past {'days' if crypto else 'sessions'} only have bars until {sim['end']} {_tz()}, so the "
+                     "replays stop there")
+    if sim["minutes_simulated"] <= 30 and crypto:
+        notes.append(f"only {sim['minutes_simulated']} minutes left after {sim['start']} UTC before the "
+                     f"{sim['end']} UTC time stop - a trade still open then is valued at that price")
+    elif sim["minutes_simulated"] <= 30:
         notes.append(f"only {sim['minutes_simulated']} minutes of session left after {sim['start']} ET - "
                      f"a trade still open at {sim['end']} is valued at that close")
     if sim["ambiguous_pct"] >= AMBIGUOUS_NOTE_PCT:
@@ -1196,10 +1363,14 @@ def render(res: Mapping[str, Any]) -> str:
     # one-decimal percentages that still add up to 100.0 (saved in the plan as display_pct)
     shown = res.get("display_pct") or display_pct(c, n)
     pt, ps, po = shown["target_first"], shown["stop_first"], shown["open_at_close"]
-    when = f"from {res['start']} ET" if res["mode"] != "open" else "from the 09:30 open"
-    which = " (next session)" if res["session"] == "next" else ""
+    crypto, tz = _crypto(), _tz()
+    if res["mode"] != "open":
+        when = f"from {res['start']} {tz}"
+    else:
+        when = "from 00:00 UTC" if crypto else "from the 09:30 open"
+    which = (" (next UTC day)" if crypto else " (next session)") if res["session"] == "next" else ""
     lines = [f"TIME MACHINE · {sym} · {res['side'].upper()} {when}{which} · {n:,} replays from {sym}'s past "
-             f"{res['sessions_used']} sessions",
+             f"{_days(res['sessions_used'])}",
              f"entry {fp(res['entry'])}  target {fp(res['target'])} ({res['target_pct']:+.2f}%)  "
              f"stop {fp(res['stop'])} ({res['stop_pct']:+.2f}%)  R:R {res['rr']:.2f}"]
     amb = f" · {res['ambiguous_pct']:.1f}% both in one bar (counted as stop)" if c["ambiguous"] else ""
@@ -1209,35 +1380,45 @@ def render(res: Mapping[str, Any]) -> str:
          f"median {_mins(res['median_minutes_to_target'])}" if c["target"] else ""),
         ("HIT STOP FIRST", ps, f"±{res['stop_first_se']:.1f}",
          (f"median {_mins(res['median_minutes_to_stop'])}" if c["stop"] else "") + amb),
-        ("OPEN AT CLOSE", po, "" if avg is None else f"(avg {avg:+.2f}R)", ""),
+        ("OPEN AT TIME STOP" if crypto else "OPEN AT CLOSE", po, "" if avg is None else f"(avg {avg:+.2f}R)", ""),
     ]
     for label, pct, a, b in rows:
         lines.append(f"{label:<18} {pct:5.1f}%  {a:<12} {b}".rstrip())
     share = res["resolved_target_share_pct"]
-    lines.append(f"Expected value: {res['expected_r']:+.2f}R per trade   Break-even needs > "
-                 f"{res['breakeven_win_rate_pct']:.1f}% of resolved trades"
+    fees = res.get("fees")
+    lines.append(f"Expected value: {res['expected_r']:+.2f}R per trade{' before fees' if fees else ''}   "
+                 f"Break-even needs > {res['breakeven_win_rate_pct']:.1f}% of resolved trades"
                  + ("" if share is None else f" (replays: {share:.1f}%)"))
+    if fees:   # crypto: the paper broker charges fee_pct of notional on the entry and the exit
+        be = fees.get("breakeven_win_rate_after_fees_pct")
+        lines.extend(_wrap(f"Fees (paper, {fees['fee_pct']:g}% per fill): round trip ≈ {fees['round_trip_r']:.2f}R at "
+                           f"these levels · expected value after fees {fees['expected_r_after_fees']:+.2f}R per trade"
+                           + (f" · break-even after fees needs > {be:.1f}% of resolved trades" if be is not None
+                              else " · even the target loses money after fees"), "", "  "))
     h = res["history"]
     if h["sessions"]:
         hp = " / ".join(f"{x:.0f}%" for x in split_pct([h["target"], h["stop"], h["open"]], h["sessions"], 0))
         skipped = f", {h['skipped']} skipped: no bars then" if h["skipped"] else ""
-        lines.extend(_wrap(f"History check (same clock time, last {h['sessions']} sessions{skipped}): "
+        span = f"same UTC clock time, last {h['sessions']} days" if crypto else \
+            f"same clock time, last {h['sessions']} sessions"
+        lines.extend(_wrap(f"History check ({span}{skipped}): "
                            f"{h['target']} target / {h['stop']} stop / {h['open']} open ({hp})", "", "  "))
     else:
-        lines.append(f"History check: no past session had bars at {res['start']} ET")
+        lines.append(f"History check: no past {'day' if crypto else 'session'} had bars at {res['start']} {tz}")
     tr = res["trend"]
     a = tr["alt"]
+    past = "days" if crypto else "sessions"
     h = tr.get("horizon") or {}
     if h.get("start"):
         why = " (the median time to stop/target)" if h.get("basis") == "median_resolution" else ""
         drift_r = "" if tr.get("drift_r") is None else f" = {tr['drift_r']:+.2f}R for this {res['side']}"
         rest = ("" if h.get("end") == res["end"] else
                 f"; whole window to {res['end']}: {tr['avg_move_pct']:+.2f}% (t={tr['t_stat']:.1f})")
-        lines.extend(_wrap(f"Trend check: from {h['start']} to {h['end']}{why} the past sessions drifted "
+        lines.extend(_wrap(f"Trend check: from {h['start']} to {h['end']}{why} the past {past} drifted "
                            f"{tr['drift_pct']:+.2f}% on average{drift_r} (t={tr['horizon_t_stat']:.1f}; |t| < 2 is "
                            f"noise){rest}", "", " " * 13))
     else:
-        lines.append(f"Trend check: the past sessions drifted {tr['avg_move_pct']:+.2f}% on average from "
+        lines.append(f"Trend check: the past {past} drifted {tr['avg_move_pct']:+.2f}% on average from "
                      f"{res['start']} to {res['end']} (t={tr['t_stat']:.1f}; |t| < 2 is noise)")
     lines.append(" " * 13 + ("with the trend left in: " if tr["detrended"] else "trend removed: ")
                  + f"{a['target_first_pct']:.1f}% target / {a['stop_first_pct']:.1f}% stop / "
@@ -1255,8 +1436,8 @@ def render(res: Mapping[str, Any]) -> str:
         for note in res["notes"]:
             lines.extend(_wrap(note, "  - ", "    "))
     lines.append("")
-    lines.append(f"Replayed {res['start']}-{res['end']} ET in {res['block']}-bar blocks from sessions "
-                 f"{res['first_session']}..{res['last_session']}"
+    lines.append(f"Replayed {res['start']}-{res['end']} {tz} in {res['block']}-bar blocks from "
+                 f"{'days' if crypto else 'sessions'} {res['first_session']}..{res['last_session']}"
                  + (" with the trend removed" if res["trend"]["detrended"] else "") + f" · seed {res['seed']}")
     if res["svg"]:
         lines.append(f"Chart: {res['svg']}")

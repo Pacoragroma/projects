@@ -4,7 +4,7 @@ Claude plugins and skills. Each folder is a self-contained project with its own 
 
 | Project | What it is |
 |---|---|
-| [day-trader](day-trader/) | 11 Claude skills that work like a small day-trading desk: they scan thousands of charts, track breaking news, time every entry and exit, and replay every outcome before you risk a dollar. Paper trading only. Free, MIT, no signup, no API key. |
+| [day-trader](day-trader/) | 11 Claude skills that work like a small day-trading desk: they scan thousands of charts, track breaking news, time every entry and exit, and replay every outcome before you risk a dollar. US stocks, and crypto pairs such as BTC-USD around the clock on Coinbase's public prices. Paper trading only. Free, MIT, no signup, no API key. |
 
 ## Install day-trader
 

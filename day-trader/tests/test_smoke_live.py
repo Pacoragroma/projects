@@ -2,9 +2,10 @@
 
 The smoke test is meant for the live hosts, so here every source is faked: tc.fetch_bars via
 helpers.fake_bars and tc.http_get via helpers.fake_http (the House index zip and PTR PDF come
-from test_pelosi's builders), or urlopen itself for the blocked-proxy case. One synthetic world
-makes every check PASS; broken, stale, odd-shaped and blocked sources must turn into FAIL rows
-(exit 1) without stopping the other checks.
+from test_pelosi's builders), or urlopen itself for the blocked-proxy case. Crypto bars go
+through the real tc.coinbase_bars (its paging and candle parser) on fake_http's Coinbase routes.
+One synthetic world makes every check PASS; broken, stale, odd-shaped and blocked sources must
+turn into FAIL rows (exit 1) without stopping the other checks.
 """
 from __future__ import annotations
 
@@ -22,8 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import (ROOT, TempHomeTestCase, daily_bars, et_ts, fake_bars, fake_http,  # noqa: E402
-                     random_walk_history, tc)
+from helpers import (ROOT, TempHomeTestCase, coinbase_rows, crypto_history, daily_bars, et_ts,  # noqa: E402
+                     fake_bars, fake_http, random_walk_history, tc, utc_ts)
 import test_pelosi as tp  # noqa: E402  (synthetic House index zips and PTR PDFs)
 
 TOOL = ROOT / "tools" / "smoke_live.py"
@@ -37,11 +38,17 @@ SYM = "TSLA"
 CIK = 1318605
 SUBMISSIONS = f"data.sec.gov/submissions/CIK{CIK:010d}.json"
 PTR_DOC = "20026590"
+CSYM = "BTC-USD"
+UTC_DAY = "2026-10-30"                 # NOW is 20:30 UTC
 HOSTS = {"yahoo-5m": "query1/query2.finance.yahoo.com", "yahoo-1d": "query1/query2.finance.yahoo.com",
          "yahoo-quote": "query1/query2.finance.yahoo.com", "nasdaq-symbols": "www.nasdaqtrader.com",
          "news-rss": "feeds.finance.yahoo.com", "news-search": "query1/query2.finance.yahoo.com",
          "sec-filings": "www.sec.gov, data.sec.gov", "house-index": "disclosures-clerk.house.gov",
-         "house-ptr": "disclosures-clerk.house.gov"}
+         "house-ptr": "disclosures-clerk.house.gov", "coinbase-5m": "api.exchange.coinbase.com",
+         "coinbase-1d": "api.exchange.coinbase.com", "coinbase-ticker": "api.exchange.coinbase.com",
+         "coinbase-products": "api.exchange.coinbase.com"}
+N_CHECKS = len(HOSTS)
+COINBASE_CHECKS = ["coinbase-5m", "coinbase-1d", "coinbase-ticker", "coinbase-products"]
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +124,46 @@ def house_index(recs: Optional[List[Dict[str, str]]] = None) -> bytes:
     ])
 
 
+def crypto_five(until: str = "20:30", days: int = 3) -> List[tc.Bar]:
+    """24/7 five-minute candles through `until` UTC on UTC_DAY (the 20:25 candle is the last complete one)."""
+    return crypto_history(UTC_DAY, days, start_price=100_000.0, seed=8, until=until)
+
+
+def crypto_daily(shift_hours: int = 0) -> List[tc.Bar]:
+    """150 UTC-day candles ending today (shift_hours moves their start off 00:00 UTC)."""
+    return [tc.Bar(b.ts + shift_hours * 3600, b.open, b.high, b.low, b.close, b.volume * 288)
+            for b in crypto_history(UTC_DAY, 150, start_price=60_000.0, vol=0.02, seed=9, minutes=1440)]
+
+
+def coinbase_products(n_usd: int = 120) -> List[Dict[str, Any]]:
+    def row(pid: str, status: str = "online", disabled: bool = False) -> Dict[str, Any]:
+        base, quote_ccy = pid.split("-")
+        return {"id": pid, "base_currency": base, "quote_currency": quote_ccy, "base_increment": "0.00000001",
+                "quote_increment": "0.01", "status": status, "trading_disabled": disabled, "cancel_only": False}
+    rows = [row(p) for p in ("BTC-USD", "ETH-USD", "SOL-USD", "USDT-USD", "USDC-EUR", "ETH-BTC")]
+    rows += [row(f"C{i:03d}-USD") for i in range(n_usd)] + [row("OLD-USD", status="delisted")]
+    return rows
+
+
+def coinbase_routes(five: Optional[List[tc.Bar]] = None, daily: Optional[List[tc.Bar]] = None,
+                    price: Optional[float] = None, bid: Optional[float] = None, ask: Optional[float] = None,
+                    trade_time: str = "2026-10-30T20:29:55.123456Z", products: Any = None) -> Dict[str, Any]:
+    """Coinbase's public endpoints. Order matters: fake_http matches substrings, and every Coinbase
+    URL contains '/products', so the product list comes last."""
+    five = crypto_five() if five is None else five
+    last = five[-1].close if five else 100_000.0
+    price = round(last + 3.0, 2) if price is None else price
+    return {
+        "/candles?granularity=300&": coinbase_rows(five),
+        "/candles?granularity=86400&": coinbase_rows(crypto_daily() if daily is None else daily),
+        f"/products/{CSYM}/ticker": {"trade_id": 1, "price": str(price), "size": "0.01", "time": trade_time,
+                                     "bid": str(round(price - 0.01, 2) if bid is None else bid),
+                                     "ask": str(round(price + 0.01, 2) if ask is None else ask), "volume": "9000"},
+        f"/products/{CSYM}/stats": {"open": "98000.00", "high": "101000", "low": "97000", "last": str(price)},
+        "api.exchange.coinbase.com/products": coinbase_products() if products is None else products,
+    }
+
+
 def http_world() -> Dict[str, Any]:
     pelosi = smoke.load_skill("pelosi", "pelosi")
     routes: Dict[str, Any] = dict(symbol_files())
@@ -128,6 +175,7 @@ def http_world() -> Dict[str, Any]:
         pelosi.INDEX_URL.format(year=2026): house_index(),
         pelosi.ptr_url(2026, PTR_DOC): tp.pelosi_pdf_bytes(),
     })
+    routes.update(coinbase_routes())
     return routes
 
 
@@ -148,6 +196,13 @@ class SmokeTestCase(TempHomeTestCase):
         mocks = [fb.__enter__(), fh.__enter__(), clock.__enter__()]
         for cm in (clock, fh, fb):
             self.addCleanup(cm.__exit__, None, None, None)
+        stocks = mocks[0].side_effect
+
+        def fetch(symbol: str, interval: str = "5m", range_: str = "60d", prepost: bool = False, ttl: Any = None):
+            if tc.is_crypto_symbol(symbol):          # the real Coinbase paging and parser, on the fake routes
+                return tc.coinbase_bars(symbol, interval, range_, ttl)
+            return stocks(symbol, interval, range_, prepost, ttl)
+        mocks[0].side_effect = fetch
         return mocks[0], mocks[1]
 
     def rows(self, res: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -166,7 +221,8 @@ class AllPassTests(SmokeTestCase):
         self.assertEqual(list(rows), smoke.CHECK_NAMES)
         self.assertEqual({n: r["status"] for n, r in rows.items()}, {n: "PASS" for n in smoke.CHECK_NAMES},
                          json.dumps(res, indent=1))
-        self.assertEqual((res["ok"], res["passed"], res["failed"], res["skipped"]), (True, 9, 0, 0))
+        self.assertEqual((res["ok"], res["passed"], res["failed"], res["skipped"]), (True, N_CHECKS, 0, 0))
+        self.assertEqual((res["symbol"], res["crypto_symbol"]), (SYM, CSYM))
         self.assertEqual({n: r["host"] for n, r in rows.items()}, HOSTS)
 
         self.assertIn("3,120 bars, 40 sessions", rows["yahoo-5m"]["detail"])
@@ -180,13 +236,30 @@ class AllPassTests(SmokeTestCase):
         self.assertIn("3 filings in the 2026 index, 2 PTRs, newest filed 2026-10-29", rows["house-index"]["detail"])
         self.assertIn(f"DocID {PTR_DOC} (", rows["house-ptr"]["detail"])
         self.assertIn("6 trade(s)", rows["house-ptr"]["detail"])
+        self.assertIn("575 candles over 3 UTC days 2026-10-28..2026-10-30, last 2026-10-30 20:25 UTC",
+                      rows["coinbase-5m"]["detail"])
+        self.assertIn("150 daily candles 2026-06-03..2026-10-30 (UTC days)", rows["coinbase-1d"]["detail"])
+        self.assertIn(f"{CSYM} ", rows["coinbase-ticker"]["detail"])
+        self.assertIn(" USD at 2026-10-30 20:29 UTC · bid ", rows["coinbase-ticker"]["detail"])
+        self.assertIn("· 24h open 98,000.00", rows["coinbase-ticker"]["detail"])
+        self.assertEqual(rows["coinbase-products"]["detail"],
+                         "127 products, 123 tradable USD pairs (stablecoins left out); BTC-USD online, "
+                         "size step 0.00000001, tick 0.01")
 
-        # The skills' own code paths, one request per source (the Nasdaq list is two files).
+        # The skills' own code paths, one request per source (the Nasdaq list is two files; Coinbase
+        # pages its candles, 300 a request, and the ticker brings its 24 h stats).
         self.assertEqual(sorted((c.args[0], c.args[1], c.args[2]) for c in bars.call_args_list),
-                         [(SYM, "1d", "6mo"), (SYM, "1m", "1d"), (SYM, "5m", "60d")])
+                         [(CSYM, "1d", "6mo"), (CSYM, "5m", "2d"), (SYM, "1d", "6mo"), (SYM, "1m", "1d"),
+                          (SYM, "5m", "60d")])
         urls = [c.args[0] for c in http.call_args_list]
         self.assertEqual(len(urls), len(set(urls)), urls)
-        self.assertEqual(len(urls), 8, urls)
+        coinbase = [u for u in urls if u.startswith(tc.COINBASE_API)]
+        pages = [w[0] for rng, gran in (("2d", "5m"), ("6mo", "1d"))
+                 for w in tc.coinbase_candle_windows(CSYM, gran, rng, NOW.timestamp())]
+        self.assertEqual(sorted(coinbase), sorted(pages + [f"{tc.COINBASE_API}/products/{CSYM}/ticker",
+                                                           f"{tc.COINBASE_API}/products/{CSYM}/stats",
+                                                           f"{tc.COINBASE_API}/products"]))
+        self.assertEqual(len(urls) - len(coinbase), 8, urls)
         self.assertTrue(any(u.startswith("https://query1.finance.yahoo.com/v1/finance/search?q=TSLA") for u in urls))
         self.assertIn(f"https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/{PTR_DOC}.pdf", urls)
         self.assertFalse(any("8221999" in u for u in urls), "a paper filing is never downloaded")
@@ -198,14 +271,14 @@ class AllPassTests(SmokeTestCase):
         self.assertIn("LIVE SMOKE TEST · TSLA · 2026-10-30 16:30 ET", out)
         for name in smoke.CHECK_NAMES:
             self.assertRegex(out, rf"(?m)^{name}\s+{HOSTS[name].replace('.', '[.]')}\s+PASS\s")
-        self.assertIn("OK: 9 of 9 checks passed", out)
+        self.assertIn(f"OK: {N_CHECKS} of {N_CHECKS} checks passed", out)
         self.assertNotIn("FAIL", out)
 
         code, out = run_main("--json")
         self.assertEqual(code, 0)
         res = json.loads(out)
         self.assertTrue(res["ok"])
-        self.assertEqual([r["status"] for r in res["checks"]], ["PASS"] * 9)
+        self.assertEqual([r["status"] for r in res["checks"]], ["PASS"] * N_CHECKS)
         self.assertEqual(set(res["checks"][0]), {"name", "host", "used_by", "status", "seconds", "detail"})
 
     def test_only_runs_the_named_checks_and_ptr_brings_its_index(self):
@@ -227,7 +300,7 @@ class AllPassTests(SmokeTestCase):
         ptr = self.rows(res)["house-ptr"]
         self.assertEqual(ptr["status"], "SKIP")
         self.assertIn("no electronic PTR filed since 2026-08-31", ptr["detail"])
-        self.assertEqual((res["passed"], res["skipped"], res["failed"]), (8, 1, 0))
+        self.assertEqual((res["passed"], res["skipped"], res["failed"]), (N_CHECKS - 1, 1, 0))
 
     def test_live_env_ignores_fixtures_and_replay_clock_and_restores_them(self):
         self.world()
@@ -277,7 +350,8 @@ class FailureTests(SmokeTestCase):
         self.assertEqual({n: r["status"] for n, r in rows.items()},
                          {"yahoo-5m": "PASS", "yahoo-1d": "FAIL", "yahoo-quote": "FAIL", "nasdaq-symbols": "FAIL",
                           "news-rss": "FAIL", "news-search": "FAIL", "sec-filings": "FAIL",
-                          "house-index": "PASS", "house-ptr": "FAIL"})
+                          "house-index": "PASS", "house-ptr": "FAIL", "coinbase-5m": "PASS", "coinbase-1d": "PASS",
+                          "coinbase-ticker": "PASS", "coinbase-products": "PASS"})
         self.assertFalse(res["ok"])
         self.assertIn("older than 7 days - stale or frozen data?", rows["yahoo-1d"]["detail"])
         self.assertIn("no fixture for interval 1m", rows["yahoo-quote"]["detail"])
@@ -291,7 +365,7 @@ class FailureTests(SmokeTestCase):
         self.assertEqual(code, 1)
         self.assertRegex(text, r"(?m)^yahoo-1d\s+query1/query2[.]finance[.]yahoo[.]com\s+FAIL\s")
         self.assertRegex(text, r"(?m)^news-rss\s+feeds[.]finance[.]yahoo[.]com\s+FAIL\s")
-        self.assertIn("FAILED: 7 of 9 checks failed (2 passed).", text)
+        self.assertIn(f"FAILED: 7 of {N_CHECKS} checks failed (6 passed).", text)
         self.assertNotIn("Blocked:", text)      # these hosts answered; their data was wrong
 
     def test_a_parser_crash_is_a_fail_row(self):
@@ -341,10 +415,106 @@ class FailureTests(SmokeTestCase):
         self.assertIn("blocked by proxy for https://query1.finance.yahoo.com/v8/finance/chart/TSLA?interval=5m"
                       "&range=60d&includePrePost=false (Tunnel connection failed: 403 Forbidden) - access denied; "
                       "if you are in a sandbox, query1.finance.yahoo.com may need to be allow-listed", out)
+        self.assertIn("blocked by proxy for https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
+                      "&start=", out)
+        self.assertIn("if you are in a sandbox, api.exchange.coinbase.com may need to be allow-listed", out)
         self.assertIn("Blocked: query1/query2.finance.yahoo.com; www.nasdaqtrader.com; feeds.finance.yahoo.com; "
-                      "www.sec.gov, data.sec.gov; disclosures-clerk.house.gov - allow outbound HTTPS", out)
-        self.assertIn("FAILED: 8 of 9 checks failed, 1 skipped (0 passed).", out)
+                      "www.sec.gov, data.sec.gov; disclosures-clerk.house.gov; api.exchange.coinbase.com - allow "
+                      "outbound HTTPS", out)
+        self.assertIn(f"FAILED: {N_CHECKS - 1} of {N_CHECKS} checks failed, 1 skipped (0 passed).", out)
 
+
+# ---------------------------------------------------------------------------
+# Coinbase (crypto): 24/7 data held to 24/7 standards
+# ---------------------------------------------------------------------------
+
+class CoinbaseTests(SmokeTestCase):
+    def crypto(self, **routes: Any) -> Dict[str, Dict[str, Any]]:
+        world = http_world()
+        world.update(coinbase_routes(**routes))
+        self.world(routes=world)
+        return self.rows(smoke.run_checks(SYM, only=COINBASE_CHECKS, now=NOW))
+
+    def test_coinbase_checks_read_the_utc_clock_and_ask_for_the_product_list_once(self):
+        bars, http = self.world()
+        res = smoke.run_checks(SYM, only=COINBASE_CHECKS, now=NOW)
+        rows = self.rows(res)
+        self.assertEqual({n: r["status"] for n, r in rows.items()}, {n: "PASS" for n in COINBASE_CHECKS})
+        for name in ("coinbase-5m", "coinbase-ticker"):
+            self.assertIn(" UTC", rows[name]["detail"])
+            self.assertNotRegex(rows[name]["detail"], r"\bET\b")
+        self.assertEqual([c.args[0] for c in http.call_args_list].count(f"{tc.COINBASE_API}/products"), 1)
+        self.assertIs(tc.market(), tc.US)                         # each check's market scope is undone
+        self.assertEqual(tc.coinbase_products.__name__, "coinbase_products")   # the one-list helper is undone
+        self.assertEqual(rows["coinbase-ticker"]["used_by"], "crypto: broker, exit, risk, budget")
+
+    def test_ticker_alone_skips_the_candle_cross_check(self):
+        self.world()
+        res = smoke.run_checks(SYM, only=["coinbase-ticker"], now=NOW, crypto_symbol=CSYM)
+        self.assertEqual([r["status"] for r in res["checks"]], ["PASS"])
+
+    def test_stale_candles_and_trades_fail(self):
+        rows = self.crypto(five=crypto_five(until="15:00"), trade_time="2026-10-30T15:00:00Z")
+        self.assertEqual(rows["coinbase-5m"]["status"], "FAIL")
+        self.assertIn("5.6 h old - a 24/7 market should have one from the last 3 hours", rows["coinbase-5m"]["detail"])
+        self.assertEqual(rows["coinbase-ticker"]["status"], "FAIL")
+        self.assertIn("the last trade is from 2026-10-30 15:00 UTC, 5.5 h old", rows["coinbase-ticker"]["detail"])
+
+    def test_pages_that_ignore_start_and_end_fail(self):
+        # Every page answers with the newest 300 candles: 25 hours instead of the 2 days asked for.
+        rows = self.crypto(five=crypto_five()[-300:])
+        self.assertEqual(rows["coinbase-5m"]["status"], "FAIL")
+        self.assertIn("not 2d back - were the start/end pages honoured?", rows["coinbase-5m"]["detail"])
+
+    def test_missing_pages_and_off_grid_candles_fail(self):
+        five = crypto_five()
+        hole = (utc_ts("2026-10-29", "06:00"), utc_ts("2026-10-29", "20:00"))   # 14 h missing inside the 2 days
+        rows = self.crypto(five=[b for b in five if not hole[0] <= b.ts < hole[1]])
+        self.assertEqual(rows["coinbase-5m"]["status"], "FAIL")
+        self.assertIn("five-minute candles between the first and the last - missing pages?", rows["coinbase-5m"]["detail"])
+        shifted = [tc.Bar(b.ts + 60, b.open, b.high, b.low, b.close, b.volume) for b in five[:-1]]
+        rows = self.crypto(five=shifted)
+        self.assertEqual(rows["coinbase-5m"]["status"], "FAIL")
+        self.assertIn("off the 5-minute grid", rows["coinbase-5m"]["detail"])
+
+    def test_timestamps_in_milliseconds_fail(self):
+        five = [tc.Bar(b.ts * 1000, b.open, b.high, b.low, b.close, b.volume) for b in crypto_five()]
+        rows = self.crypto(five=five)
+        self.assertEqual(rows["coinbase-5m"]["status"], "FAIL")
+        self.assertIn("Coinbase returned no candles", rows["coinbase-5m"]["detail"])
+
+    def test_daily_candles_must_be_utc_days(self):
+        rows = self.crypto(daily=crypto_daily(shift_hours=4))     # New York days, not UTC days
+        self.assertEqual(rows["coinbase-1d"]["status"], "FAIL")
+        self.assertIn("do not start at 00:00 UTC", rows["coinbase-1d"]["detail"])
+        self.assertIn("the pack treats a crypto session as a UTC day", rows["coinbase-1d"]["detail"])
+
+    def test_ticker_that_disagrees_with_the_candles_or_has_no_market_fails(self):
+        rows = self.crypto(price=crypto_five()[-1].close * 1.10)
+        self.assertEqual(rows["coinbase-ticker"]["status"], "FAIL")
+        self.assertIn("% away from the last 5-minute close", rows["coinbase-ticker"]["detail"])
+        self.assertIn("candle columns parsed in the wrong order?", rows["coinbase-ticker"]["detail"])
+        rows = self.crypto(price=100_000.0, bid=100_010.0, ask=99_990.0, five=crypto_five()[:-1] + [
+            tc.Bar(utc_ts(UTC_DAY, "20:25"), 100_000.0, 100_010.0, 99_990.0, 100_000.0, 5.0)])
+        self.assertEqual(rows["coinbase-ticker"]["status"], "FAIL")
+        self.assertIn("no usable bid/ask (100010.0 / 99990.0)", rows["coinbase-ticker"]["detail"])
+
+    def test_bad_product_lists_fail(self):
+        products = coinbase_products()
+        products[0]["trading_disabled"] = True                    # BTC-USD
+        rows = self.crypto(products=products)
+        self.assertEqual(rows["coinbase-products"]["status"], "FAIL")
+        self.assertIn("BTC-USD is not among the tradable USD pairs", rows["coinbase-products"]["detail"])
+        rows = self.crypto(products=coinbase_products(n_usd=3))
+        self.assertIn("only 10 products listed (expected at least 100)", rows["coinbase-products"]["detail"])
+        rows = self.crypto(products={"message": "Internal server error"})
+        self.assertEqual(rows["coinbase-products"]["status"], "FAIL")
+        self.assertIn("unexpected Coinbase products response", rows["coinbase-products"]["detail"])
+        products = coinbase_products()
+        for p in products:
+            p["status"] = "Online" if p["id"] != "BTC-USD" else "offline"
+        rows = self.crypto(products=products)
+        self.assertEqual(rows["coinbase-products"]["status"], "FAIL")
 
 class CliTests(unittest.TestCase):
     def run_tool(self, *args: str) -> subprocess.CompletedProcess:
@@ -354,6 +524,8 @@ class CliTests(unittest.TestCase):
     def test_usage_errors_exit_1(self):
         for args, words in ((["--only", "yahoo-5m,bogus"], "unknown check bogus"),
                             (["--symbol", "$$$"], "is not a ticker"),
+                            (["--symbol", "BTC-USD"], "use --crypto-symbol BTC-USD for the Coinbase checks"),
+                            (["--crypto-symbol", "TSLA"], "is not a Coinbase pair (e.g. BTC-USD)"),
                             (["--frobnicate"], "unrecognized arguments")):
             p = self.run_tool(*args)
             self.assertEqual(p.returncode, 1, (args, p.stderr))
