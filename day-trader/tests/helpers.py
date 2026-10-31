@@ -13,7 +13,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 from unittest import mock
@@ -55,9 +55,13 @@ def temp_home(now: Optional[str] = None) -> Iterator[Path]:
             if not now:
                 os.environ.pop("DAYTRADER_NOW", None)
             # A developer's own demo/SEC settings must not leak into tests (patch.dict restores them).
-            for var in ("DAYTRADER_FIXTURES", "DAYTRADER_CONTACT"):
+            for var in ("DAYTRADER_FIXTURES", "DAYTRADER_CONTACT", "DAYTRADER_MARKET"):
                 os.environ.pop(var, None)
-            yield Path(d)
+            tc.set_market(tc.US)   # a test that switches to crypto must not leak into the next one
+            try:
+                yield Path(d)
+            finally:
+                tc.set_market(tc.US)
 
 
 class TempHomeTestCase(unittest.TestCase):
@@ -233,3 +237,71 @@ def run_cli(script: Path, *args: str, env: Optional[Dict[str, str]] = None, time
     e.update(env or {})
     return subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True,
                           env=e, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Crypto (Coinbase) fixtures
+# ---------------------------------------------------------------------------
+
+def utc_ts(day: str, hhmm: str) -> int:
+    """'2026-10-31', '04:40' -> unix seconds for that UTC time."""
+    return int(datetime.strptime(f"{day}T{hhmm}", "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc).timestamp())
+
+
+def crypto_history(end_day: str, days: int, start_price: float = 100_000.0, vol: float = 0.0015,
+                   seed: int = 0, minutes: int = 5, until: Optional[str] = None) -> List[tc.Bar]:
+    """`days` consecutive UTC days (weekends included) of 24/7 bars ending on end_day.
+    `until` ('HH:MM') stops the last day early, e.g. at the replay's 'now'."""
+    rng = random.Random(seed)
+    first = datetime.strptime(end_day, "%Y-%m-%d").replace(tzinfo=timezone.utc) - timedelta(days=days - 1)
+    stop = utc_ts(end_day, until) if until else int((first + timedelta(days=days)).timestamp())
+    bars: List[tc.Bar] = []
+    p = start_price
+    t = int(first.timestamp())
+    while t < stop:
+        o = p
+        c = o * math.exp(rng.gauss(0, vol))
+        h = max(o, c) * (1 + abs(rng.gauss(0, vol / 2)))
+        l = min(o, c) * (1 - abs(rng.gauss(0, vol / 2)))
+        bars.append(tc.Bar(t, round(o, 2), round(h, 2), round(l, 2), round(c, 2), round(5 + 10 * rng.random(), 4)))
+        p = c
+        t += minutes * 60
+    return bars
+
+
+def coinbase_rows(bars: Sequence[tc.Bar]) -> List[List[float]]:
+    """Bars -> Coinbase candle rows [time, low, high, open, close, volume], newest first."""
+    return [[b.ts, b.low, b.high, b.open, b.close, b.volume] for b in sorted(bars, key=lambda b: -b.ts)]
+
+
+def write_coinbase_fixtures(directory: Path, product: str, bars: Sequence[tc.Bar], interval: str = "5m",
+                            range_: str = "60d", now_ts: Optional[float] = None) -> List[Path]:
+    """Write the candle windows tc.coinbase_bars requests for (product, interval, range_) at now_ts
+    (default: the last bar's start). Each window holds the bars that fall inside it."""
+    gran = tc.COINBASE_GRANULARITY[interval]
+    now_ts = now_ts if now_ts is not None else bars[-1].ts
+    paths = []
+    for url, first, last in tc.coinbase_candle_windows(product, interval, range_, now_ts):
+        inside = [b for b in bars if first <= b.ts <= last and b.ts % gran == 0]
+        paths.append(write_fixture(directory, url, coinbase_rows(inside)))
+    return paths
+
+
+def write_coinbase_quote(directory: Path, product: str, price: float, when: str = "2026-10-31T04:40:00Z",
+                         open_24h: Optional[float] = None) -> None:
+    base = f"{tc.COINBASE_API}/products/{product}"
+    write_fixture(directory, base + "/ticker", {"trade_id": 1, "price": str(price), "size": "0.01",
+                                                "bid": str(round(price - 0.01, 2)), "ask": str(round(price + 0.01, 2)),
+                                                "volume": "1234.5", "time": when})
+    write_fixture(directory, base + "/stats", {"open": str(open_24h or price), "high": str(price), "low": str(price),
+                                               "last": str(price), "volume": "1234.5"})
+
+
+def write_coinbase_products(directory: Path, products: Sequence[str] = ("BTC-USD", "ETH-USD", "SOL-USD", "USDT-USD")) -> None:
+    rows = []
+    for pid in products:
+        base, quote = pid.split("-")
+        rows.append({"id": pid, "base_currency": base, "quote_currency": quote, "base_increment": "0.00000001",
+                     "quote_increment": "0.01", "display_name": pid.replace("-", "/"), "status": "online",
+                     "trading_disabled": False, "cancel_only": False, "post_only": False, "limit_only": False})
+    write_fixture(directory, f"{tc.COINBASE_API}/products", rows)

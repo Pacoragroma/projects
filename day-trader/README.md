@@ -214,6 +214,7 @@ below in one go (see [Development](#development)).
 | `www.sec.gov` | news, analyst | ticker to CIK map (`/files/company_tickers.json`) |
 | `data.sec.gov` | news, analyst | filings (`/submissions`) and shares outstanding (`/api/xbrl`) |
 | `disclosures-clerk.house.gov` | pelosi | Periodic Transaction Report index and PDFs |
+| `api.exchange.coinbase.com` | every price-reading skill, for crypto symbols such as `BTC-USD` | Coinbase Exchange public candles, ticker and product list (no account or API key) |
 
 `risk` only needs Yahoo when no entry price is given. `budget` only needs it for `status --mark`.
 

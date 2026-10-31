@@ -7,7 +7,8 @@ identical copy in its own scripts/ folder so each skill still works when install
 its own. Edit the canonical copy, then run `python3 tools/sync_common.py`.
 
 Data sources (all free, no API key):
-  * Yahoo Finance chart API  - daily and intraday OHLCV bars, last price
+  * Yahoo Finance chart API  - US stocks: daily and intraday OHLCV bars, last price
+  * Coinbase Exchange public market data - crypto (BTC-USD, ETH-USD, ...): candles, ticker, products
   * Nasdaq Trader symbol directory - every US-listed symbol
   * SEC EDGAR - ticker -> CIK map, company filings
   * House Clerk financial disclosures - congressional trade reports (pelosi skill)
@@ -36,6 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -112,6 +114,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "max_consecutive_losses": 3,    # tilt guard
     "min_reward_risk": 1.0,         # warn below this reward:risk
     "ticket_ttl_minutes": 15,       # unconfirmed paper tickets expire
+    "crypto_fee_pct": 0.6,          # paper fee per crypto fill, % of notional (Coinbase's entry taker tier)
     "contact_email": "",            # sent to SEC EDGAR in the User-Agent, as SEC asks
 }
 
@@ -285,7 +288,14 @@ def get_text(url: str, ttl: float = 0, **kw: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Time (US/Eastern, regular session 09:30-16:00)
+# Markets and time
+#
+# Two markets share the desk. US stocks (the default) trade 09:30-16:00 US/Eastern on weekdays,
+# priced from Yahoo Finance. Crypto (symbols like BTC-USD) trades 24/7: a "session" is a UTC
+# calendar day, prices come from Coinbase Exchange's public API, and sizes are fractional.
+# The *active* market decides what "now", "today", "the session" and HH:MM mean below; scripts
+# switch it with use_market_for(symbol). The historical names (to_et, now_et, et_hhmm,
+# in_regular_session, ...) follow the active market, so in crypto mode they are UTC.
 # ---------------------------------------------------------------------------
 
 try:  # tzdata may be missing (e.g. some Windows Pythons) - fall back to the US DST rule.
@@ -295,8 +305,91 @@ try:  # tzdata may be missing (e.g. some Windows Pythons) - fall back to the US 
 except Exception:  # pragma: no cover - depends on platform
     ET = None
 
-MARKET_OPEN = 9 * 60 + 30   # minutes after midnight ET
-MARKET_CLOSE = 16 * 60
+
+@dataclass(frozen=True)
+class Market:
+    key: str            # "us" | "crypto"
+    name: str
+    tz_label: str       # how times are labelled: "ET" | "UTC"
+    open_min: int       # session open, minutes after local midnight
+    close_min: int      # session close (exclusive)
+    every_day: bool     # trades on weekends too
+    time_stop: str      # default "flat by" time, local HH:MM
+    fractional: bool    # position sizes may be fractional
+    source: str         # where prices come from
+
+
+US = Market("us", "US stocks", "ET", 9 * 60 + 30, 16 * 60, False, "15:55", False, "Yahoo Finance")
+CRYPTO = Market("crypto", "Crypto", "UTC", 0, 24 * 60, True, "23:55", True, "Coinbase Exchange")
+MARKETS = {"us": US, "crypto": CRYPTO}
+
+CRYPTO_QUOTES = ("USD", "USDC", "USDT", "EUR", "GBP", "BTC", "ETH", "DAI")
+_CRYPTO_SYMBOL = re.compile(r"[A-Z0-9]{2,12}-(?:%s)" % "|".join(CRYPTO_QUOTES))
+
+
+def is_crypto_symbol(symbol: Optional[str]) -> bool:
+    """'BTC-USD', 'ETH-USDC', 'SOL-EUR' -> True; stock tickers (including 'BRK-B') -> False."""
+    return bool(_CRYPTO_SYMBOL.fullmatch((symbol or "").strip().upper()))
+
+
+def market_for(symbol: Optional[str] = None) -> Market:
+    """The market `symbol` trades in. With no symbol: $DAYTRADER_MARKET (us|crypto), else US."""
+    if symbol:
+        return CRYPTO if is_crypto_symbol(symbol) else US
+    forced = (os.environ.get("DAYTRADER_MARKET") or "").strip().lower()
+    if forced and forced not in MARKETS:
+        raise ValueError(f"DAYTRADER_MARKET must be 'us' or 'crypto', not {forced!r}")
+    return MARKETS.get(forced, US)
+
+
+_ACTIVE: Market = US
+MARKET_OPEN = US.open_min    # minutes after local midnight; rebound by set_market()
+MARKET_CLOSE = US.close_min
+
+
+def market() -> Market:
+    """The active market."""
+    return _ACTIVE
+
+
+def set_market(m: Any) -> Market:
+    """Make `m` (a Market or 'us'/'crypto') the active market."""
+    global _ACTIVE, MARKET_OPEN, MARKET_CLOSE
+    if isinstance(m, str):
+        if m.lower() not in MARKETS:
+            raise ValueError(f"market must be 'us' or 'crypto', not {m!r}")
+        m = MARKETS[m.lower()]
+    _ACTIVE = m
+    MARKET_OPEN, MARKET_CLOSE = m.open_min, m.close_min
+    return m
+
+
+def use_market_for(symbol: Optional[str] = None) -> Market:
+    """Activate the market of `symbol` (see market_for) and return it."""
+    return set_market(market_for(symbol))
+
+
+@contextmanager
+def market_scope(symbol_or_market: Any):
+    """Temporarily activate a market: `with market_scope("BTC-USD"): ...`."""
+    previous = _ACTIVE
+    target = symbol_or_market if isinstance(symbol_or_market, Market) else (
+        MARKETS[symbol_or_market] if symbol_or_market in MARKETS else market_for(symbol_or_market))
+    set_market(target)
+    try:
+        yield target
+    finally:
+        set_market(previous)
+
+
+try:
+    set_market(market_for(None))
+except ValueError:  # a bad $DAYTRADER_MARKET is reported when a script asks for it
+    pass
+
+
+def tz_label() -> str:
+    return _ACTIVE.tz_label
 
 
 def _us_eastern_offset(utc_dt: datetime) -> timedelta:
@@ -309,32 +402,56 @@ def _us_eastern_offset(utc_dt: datetime) -> timedelta:
     return timedelta(hours=-4) if dst_start <= utc_dt < dst_end else timedelta(hours=-5)
 
 
-def to_et(ts: float) -> datetime:
-    """Unix seconds -> aware datetime in US/Eastern."""
+def to_local(ts: float, m: Optional[Market] = None) -> datetime:
+    """Unix seconds -> aware datetime in the market's time zone (US/Eastern or UTC)."""
     utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+    if (m or _ACTIVE).tz_label == "UTC":
+        return utc
     if ET is not None:
         return utc.astimezone(ET)
     return utc.astimezone(timezone(_us_eastern_offset(utc)))
 
 
+def to_et(ts: float) -> datetime:
+    """Unix seconds -> aware datetime in the active market's zone (US/Eastern for stocks)."""
+    return to_local(ts)
+
+
+def parse_iso_utc(value: str) -> float:
+    """Unix seconds for an ISO stamp such as '2026-10-30T14:15:00.123456789Z' (naive = UTC)."""
+    text = (value or "").strip().replace(" ", "T")
+    m = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)(\.\d+)?(Z|[+-]\d{2}:?\d{2})?", text)
+    if not m:
+        raise ValueError(f"not an ISO time: {value!r}")
+    base, frac, zone = m.group(1), m.group(2) or "", m.group(3) or "Z"
+    zone = "+00:00" if zone == "Z" else (zone if ":" in zone else zone[:3] + ":" + zone[3:])
+    dt = datetime.fromisoformat(base + zone)
+    return dt.timestamp() + (float("0" + frac) if frac else 0.0)
+
+
 def parse_et(value: str) -> datetime:
-    """Parse an ISO date/time. Naive values are taken as US/Eastern wall-clock time."""
-    dt = datetime.fromisoformat(value.strip())
+    """Parse an ISO date/time. Naive values are wall-clock time in the active market's zone."""
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    dt = datetime.fromisoformat(text)
     if dt.tzinfo is None:
-        if ET is not None:
+        if _ACTIVE.tz_label == "UTC":
+            dt = dt.replace(tzinfo=timezone.utc)
+        elif ET is not None:
             dt = dt.replace(tzinfo=ET)
         else:
             guess = (dt + timedelta(hours=5)).replace(tzinfo=timezone.utc)
             dt = dt.replace(tzinfo=timezone(_us_eastern_offset(guess)))
-    return to_et(dt.timestamp())
+    return to_local(dt.timestamp())
 
 
 def now_et() -> datetime:
-    """Current time in US/Eastern. $DAYTRADER_NOW (ISO, ET) overrides it for replays/tests."""
+    """Current time in the active market's zone. $DAYTRADER_NOW (ISO) overrides it for replays."""
     override = os.environ.get("DAYTRADER_NOW")
     if override:
         return parse_et(override)
-    return to_et(time.time())
+    return to_local(time.time())
 
 
 def today_et() -> str:
@@ -346,15 +463,15 @@ def iso_now() -> str:
 
 
 def et_date(ts: float) -> str:
-    return to_et(ts).strftime("%Y-%m-%d")
+    return to_local(ts).strftime("%Y-%m-%d")
 
 
 def et_hhmm(ts: float) -> str:
-    return to_et(ts).strftime("%H:%M")
+    return to_local(ts).strftime("%H:%M")
 
 
 def minute_of_day(ts: float) -> int:
-    d = to_et(ts)
+    d = to_local(ts)
     return d.hour * 60 + d.minute
 
 
@@ -371,13 +488,15 @@ def hhmm(minutes: int) -> str:
 
 
 def in_regular_session(ts: float) -> bool:
-    return MARKET_OPEN <= minute_of_day(ts) < MARKET_CLOSE
+    return _ACTIVE.open_min <= minute_of_day(ts) < _ACTIVE.close_min
 
 
 def is_market_open(at: Optional[datetime] = None) -> bool:
-    """True during 09:30-16:00 ET on weekdays (exchange holidays are not modelled)."""
+    """US: 09:30-16:00 ET on weekdays (holidays not modelled). Crypto: always."""
     d = at or now_et()
-    return d.weekday() < 5 and MARKET_OPEN <= d.hour * 60 + d.minute < MARKET_CLOSE
+    if not _ACTIVE.every_day and d.weekday() >= 5:
+        return False
+    return _ACTIVE.open_min <= d.hour * 60 + d.minute < _ACTIVE.close_min
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +575,9 @@ def parse_yahoo_chart(payload: Dict[str, Any]) -> Tuple[List[Bar], Dict[str, Any
 
 def fetch_bars(symbol: str, interval: str = "5m", range_: str = "60d", prepost: bool = False,
                ttl: Optional[float] = None) -> Tuple[List[Bar], Dict[str, Any]]:
-    """OHLCV bars from Yahoo. Intraday intervals: 1m (last ~7d), 5m/15m (last 60d)."""
+    """OHLCV bars. Stocks from Yahoo (1m: last ~7d, 5m/15m: last 60d); crypto from Coinbase."""
+    if is_crypto_symbol(symbol):
+        return coinbase_bars(symbol, interval, range_, ttl)
     if ttl is None:
         ttl = 30 if interval.endswith("m") else 900
     params = urllib.parse.urlencode(
@@ -474,7 +595,9 @@ def fetch_bars(symbol: str, interval: str = "5m", range_: str = "60d", prepost: 
 
 
 def quote(symbol: str) -> Dict[str, Any]:
-    """Latest regular-session price and basics from the chart endpoint."""
+    """Latest price and basics (stocks: Yahoo regular session; crypto: Coinbase ticker)."""
+    if is_crypto_symbol(symbol):
+        return coinbase_quote(symbol)
     bars, meta = fetch_bars(symbol, "1m", "1d", ttl=15)
     price = meta.get("regularMarketPrice") or (bars[-1].close if bars else None)
     if price is None:
@@ -495,13 +618,205 @@ def regular_session(bars: Iterable[Bar]) -> List[Bar]:
 
 
 def group_sessions(bars: Iterable[Bar], regular_only: bool = True) -> Dict[str, List[Bar]]:
-    """{'YYYY-MM-DD': [bars...]} in date order (ET dates)."""
+    """{'YYYY-MM-DD': [bars...]} in date order (dates in the active market's zone)."""
     out: Dict[str, List[Bar]] = {}
     for b in bars:
         if regular_only and not in_regular_session(b.ts):
             continue
         out.setdefault(b.date, []).append(b)
     return dict(sorted(out.items()))
+
+
+# ---------------------------------------------------------------------------
+# Crypto prices (Coinbase Exchange public market data - no account, no API key)
+# ---------------------------------------------------------------------------
+
+COINBASE_API = "https://api.exchange.coinbase.com"
+COINBASE_GRANULARITY = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "60m": 3600, "6h": 21600, "1d": 86400}
+COINBASE_MAX_CANDLES = 300      # per request
+STABLECOINS = {"USDT", "USDC", "DAI", "PYUSD", "EURC", "GUSD", "USDP", "PAX", "BUSD", "TUSD", "FDUSD", "USDS"}
+
+
+def range_seconds(range_: str) -> int:
+    """'60d' / '5d' / '6mo' / '1y' -> seconds."""
+    m = re.fullmatch(r"\s*(\d+)\s*(d|mo|y)\s*", range_ or "")
+    if not m:
+        raise ValueError(f"unsupported range {range_!r} (use e.g. 1d, 5d, 60d, 6mo, 1y)")
+    n, unit = int(m.group(1)), m.group(2)
+    return n * {"d": 86400, "mo": 31 * 86400, "y": 366 * 86400}[unit]
+
+
+def _utc_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def coinbase_candle_windows(product: str, interval: str, range_: str,
+                            now_ts: float) -> List[Tuple[str, int, int]]:
+    """The candle requests covering `range_` up to `now_ts`: [(url, first_start, last_start)].
+
+    Windows are aligned to multiples of 300 candles from the epoch, so the URL of a window
+    that has fully closed never changes and its response can be cached for a long time.
+    """
+    gran = COINBASE_GRANULARITY.get(interval)
+    if not gran:
+        raise ValueError(f"unsupported crypto interval {interval!r} (use {', '.join(COINBASE_GRANULARITY)})")
+    end = (int(now_ts) // gran) * gran                   # start of the candle forming now
+    start = end - range_seconds(range_) + gran
+    chunk = gran * COINBASE_MAX_CANDLES
+    out = []
+    a = (start // chunk) * chunk
+    while a <= end:
+        last = min(a + chunk - gran, end)
+        url = (f"{COINBASE_API}/products/{urllib.parse.quote(product)}/candles?granularity={gran}"
+               f"&start={_utc_iso(a)}&end={_utc_iso(last)}")
+        out.append((url, a, last))
+        a += chunk
+    return out
+
+
+def parse_coinbase_candles(rows: Any) -> List[Bar]:
+    """[[time, low, high, open, close, volume], ...] (newest first) -> bars, oldest first."""
+    if not isinstance(rows, list):
+        detail = rows.get("message") if isinstance(rows, dict) else str(rows)[:120]
+        raise FetchError(f"unexpected Coinbase candles response: {detail}")
+    by_ts: Dict[int, Bar] = {}
+    for r in rows:
+        if not isinstance(r, (list, tuple)) or len(r) < 6:
+            continue
+        try:
+            t, lo, hi, op, cl, vol = (float(x) for x in r[:6])
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(x) and x > 0 for x in (lo, hi, op, cl)) or not math.isfinite(t):
+            continue
+        by_ts[int(t)] = Bar(int(t), op, max(hi, op, cl), min(lo, op, cl), cl,
+                            max(vol, 0.0) if math.isfinite(vol) else 0.0)
+    return [by_ts[k] for k in sorted(by_ts)]
+
+
+def _cache_fresh(url: str, ttl: float) -> bool:
+    if ttl <= 0 or os.environ.get("DAYTRADER_FIXTURES") or os.environ.get("DAYTRADER_NO_CACHE"):
+        return False
+    try:
+        return time.time() - (home() / "cache" / fixture_name(url)).stat().st_mtime < ttl
+    except FileNotFoundError:
+        return False
+
+
+def coinbase_bars(symbol: str, interval: str = "5m", range_: str = "60d",
+                  ttl: Optional[float] = None) -> Tuple[List[Bar], Dict[str, Any]]:
+    """Coinbase candles for a product such as BTC-USD (paginated, ~0.15 s between requests)."""
+    product = symbol.strip().upper()
+    now_ts = now_et().timestamp()
+    live_ttl = ttl if ttl is not None else (30 if interval.endswith("m") else 300)
+    gran = COINBASE_GRANULARITY.get(interval) or 0
+    windows = coinbase_candle_windows(product, interval, range_, now_ts)
+    range_start = (int(now_ts) // gran) * gran - range_seconds(range_) + gran
+    by_ts: Dict[int, Bar] = {}
+    fetched = 0
+    for url, _first, last in windows:
+        window_ttl = 7 * 86400 if last + gran <= now_ts else live_ttl   # closed windows never change
+        if fetched and not _cache_fresh(url, window_ttl) and not os.environ.get("DAYTRADER_FIXTURES"):
+            time.sleep(0.15)   # public rate limit is ~10 requests/second
+        try:
+            rows = get_json(url, window_ttl)
+        except FetchError as e:
+            raise FetchError(f"{product}: {e}") from e
+        fetched += 1
+        for b in parse_coinbase_candles(rows):
+            if range_start <= b.ts <= now_ts:   # aligned windows reach back past the range
+                by_ts[b.ts] = b
+    bars = [by_ts[k] for k in sorted(by_ts)]
+    if not bars:
+        raise FetchError(f"{product}: Coinbase returned no candles - is it a listed product (e.g. BTC-USD)?")
+    base, _, quote_ccy = product.partition("-")
+    meta = {"symbol": product, "currency": quote_ccy, "exchangeName": "Coinbase",
+            "fullExchangeName": "Coinbase Exchange", "regularMarketPrice": bars[-1].close,
+            "regularMarketTime": bars[-1].ts, "dataGranularity": interval, "market": "crypto",
+            "shortName": base}
+    return bars, meta
+
+
+def coinbase_quote(symbol: str) -> Dict[str, Any]:
+    """Last trade, bid and ask from the Coinbase ticker; previous_close = price 24 h ago."""
+    product = symbol.strip().upper()
+    base, _, quote_ccy = product.partition("-")
+    t = get_json(f"{COINBASE_API}/products/{urllib.parse.quote(product)}/ticker", ttl=10)
+    try:
+        price = float(t["price"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise FetchError(f"{product}: unexpected Coinbase ticker response") from e
+    when = None
+    try:
+        when = parse_iso_utc(t["time"]) if t.get("time") else None
+    except ValueError:
+        pass
+    prev = None
+    try:
+        prev = float(get_json(f"{COINBASE_API}/products/{urllib.parse.quote(product)}/stats", ttl=60)["open"])
+    except (FetchError, KeyError, TypeError, ValueError):
+        pass
+
+    def num(key: str) -> Optional[float]:
+        try:
+            return float(t[key])
+        except (KeyError, TypeError, ValueError):
+            return None
+    return {"symbol": product, "price": price, "previous_close": prev, "time": when,
+            "currency": quote_ccy, "exchange": "Coinbase Exchange", "name": base,
+            "bid": num("bid"), "ask": num("ask")}
+
+
+def coinbase_products(ttl: float = 86400) -> List[Dict[str, Any]]:
+    data = get_json(f"{COINBASE_API}/products", ttl)
+    if not isinstance(data, list):
+        raise FetchError("unexpected Coinbase products response")
+    return [p for p in data if isinstance(p, dict) and p.get("id")]
+
+
+def product_info(symbol: str) -> Dict[str, Any]:
+    """Coinbase product rules: base_increment (size step) and quote_increment (price tick)."""
+    product = symbol.strip().upper()
+    for p in coinbase_products():
+        if str(p["id"]).upper() == product:
+            def inc(key: str, default: float) -> float:
+                try:
+                    v = float(p.get(key))
+                    return v if v > 0 else default
+                except (TypeError, ValueError):
+                    return default
+            return {"symbol": product, "base_increment": inc("base_increment", 1e-8),
+                    "quote_increment": inc("quote_increment", 0.01),
+                    "status": p.get("status"), "trading_disabled": bool(p.get("trading_disabled")),
+                    "min_market_funds": p.get("min_market_funds")}
+    raise FetchError(f"{product} is not a Coinbase product")
+
+
+def crypto_symbols(quote: str = "USD", include_stable: bool = False, ttl: float = 86400) -> List[Dict[str, Any]]:
+    """Tradable Coinbase products quoted in `quote` (stablecoin bases dropped by default)."""
+    out = []
+    for p in coinbase_products(ttl):
+        if str(p.get("quote_currency", "")).upper() != quote.upper():
+            continue
+        if str(p.get("status", "online")).lower() != "online" or p.get("trading_disabled") or p.get("cancel_only"):
+            continue
+        base = str(p.get("base_currency", "")).upper()
+        if not include_stable and base in STABLECOINS:
+            continue
+        out.append({"symbol": str(p["id"]).upper(), "name": base, "exchange": "Coinbase", "etf": False})
+    return sorted(out, key=lambda r: r["symbol"])
+
+
+def fee_pct(m: Optional[Market] = None, settings: Optional[Dict[str, Any]] = None) -> float:
+    """Paper fee per fill in % of notional: crypto_fee_pct for crypto, 0 for US stocks."""
+    if (m or _ACTIVE).key != "crypto":
+        return 0.0
+    return float((settings or load_settings())["crypto_fee_pct"])
+
+
+def qty_step(m: Optional[Market] = None) -> float:
+    """Default size increment: whole shares for stocks, 1e-8 for crypto (use product_info for exact)."""
+    return 1e-8 if (m or _ACTIVE).fractional else 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -948,11 +1263,25 @@ def budget_check(new_risk: float = 0.0, settings: Optional[Dict[str, Any]] = Non
 # Position sizing
 # ---------------------------------------------------------------------------
 
+def _floor_step(x: float, step: float) -> float:
+    n = math.floor(x / step + 1e-9)
+    if step >= 1:
+        return float(int(n * step))
+    decimals = max(0, -int(math.floor(math.log10(step))))
+    return round(n * step, decimals)
+
+
 def position_size(entry: float, stop: float, account: Optional[float] = None,
                   risk_pct: Optional[float] = None, risk_dollars: Optional[float] = None,
                   max_position_pct: Optional[float] = None,
-                  settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Shares so that hitting the stop loses at most the risk budget, capped by max position size."""
+                  settings: Optional[Dict[str, Any]] = None, step: Optional[float] = None,
+                  fee: Optional[float] = None) -> Dict[str, Any]:
+    """Size so that hitting the stop loses at most the risk budget, capped by max position size.
+
+    `step` is the size increment (default: 1 share for stocks, 1e-8 for crypto). `fee` is the
+    paper fee per fill in % (default: the active market's); fees for the entry and the stop
+    exit count toward the loss, so a stopped-out trade still stays within budget.
+    """
     s = settings or load_settings()
     account = float(account if account is not None else s["account_size"])
     if not math.isfinite(account) or account <= 0:
@@ -966,24 +1295,34 @@ def position_size(entry: float, stop: float, account: Optional[float] = None,
     per_share = abs(float(entry) - float(stop))
     if per_share <= 0:
         raise ValueError("entry and stop must differ")
-    shares = int(math.floor(risk_dollars / per_share + 1e-9))
+    step = float(step) if step else qty_step()
+    if not math.isfinite(step) or step <= 0:
+        raise ValueError("size step must be positive")
+    fee_rate = (fee if fee is not None else fee_pct(settings=s)) / 100.0
+    loss_per_share = per_share + fee_rate * (float(entry) + float(stop))
+    shares = _floor_step(risk_dollars / loss_per_share, step)
     cap_pct = float(max_position_pct if max_position_pct is not None else s["max_position_pct"])
     if not math.isfinite(cap_pct) or cap_pct <= 0:
         raise ValueError("max position % must be positive")
     max_notional = account * cap_pct / 100.0
     capped_by = "risk"
     if shares * entry > max_notional + 1e-9:
-        shares = int(math.floor(max_notional / entry + 1e-9))
+        shares = _floor_step(max_notional / entry, step)
         capped_by = "max_position_pct"
+    if step >= 1:
+        shares = int(shares)
     return {
         "shares": shares,
-        "risk_per_share": round(per_share, 4),
+        "risk_per_share": round(per_share, 4) if per_share >= 0.01 else per_share,
         "risk_budget": round(risk_dollars, 2),
         "risk_used": round(shares * per_share, 2),
+        "fees_at_stop": round(shares * fee_rate * (float(entry) + float(stop)), 2),
         "notional": round(shares * entry, 2),
         "account": account,
         "max_notional": round(max_notional, 2),
         "capped_by": capped_by,
+        "step": step,
+        "fee_pct": round(fee_rate * 100, 4),
     }
 
 
@@ -1040,7 +1379,20 @@ def run(main: Callable[[], Optional[int]]) -> None:
 def fmt_price(x: Optional[float]) -> str:
     if x is None:
         return "-"
-    return f"{x:,.2f}" if abs(x) >= 1 else f"{x:.4f}"
+    if abs(x) >= 1:
+        return f"{x:,.2f}"
+    if x == 0 or abs(x) >= 0.001:
+        return f"{x:.4f}"
+    return f"{x:.{min(12, 3 - int(math.floor(math.log10(abs(x)))))}f}"   # 0.00001234 -> 4 significant digits
+
+
+def fmt_qty(q: Optional[float]) -> str:
+    """8 -> '8'; 0.01234567 -> '0.01234567'; 1.5 -> '1.5'."""
+    if q is None:
+        return "-"
+    if float(q).is_integer():
+        return f"{int(q):,}"
+    return f"{q:.8f}".rstrip("0").rstrip(".")
 
 
 def fmt_money(x: Optional[float], signed: bool = False) -> str:

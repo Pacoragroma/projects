@@ -8,6 +8,8 @@ from unittest import mock
 # Lets `python3 -m unittest tests.test_common` run on its own (discover adds tests/ itself).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import (ROOT, SKILLS, TempHomeTestCase, bars_from_closes, daily_bars, et_ts,  # noqa: E402
+                     crypto_history, utc_ts, write_coinbase_fixtures, write_coinbase_products,
+                     write_coinbase_quote,
                      fake_http, random_walk_history, tc, write_fixture, yahoo_chart_url,
                      yahoo_payload)
 
@@ -397,3 +399,125 @@ class VendoredCopiesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MarketTests(TempHomeTestCase):
+    def test_symbol_detection(self):
+        for sym in ("BTC-USD", "eth-usd", "SOL-USDC", "DOGE-EUR", "1INCH-USD"):
+            self.assertTrue(tc.is_crypto_symbol(sym), sym)
+        for sym in ("TSLA", "BRK-B", "BF-B", "BRK.B", "", None):
+            self.assertFalse(tc.is_crypto_symbol(sym), sym)
+        self.assertIs(tc.market_for("BTC-USD"), tc.CRYPTO)
+        self.assertIs(tc.market_for("TSLA"), tc.US)
+        with mock.patch.dict(os.environ, {"DAYTRADER_MARKET": "crypto"}):
+            self.assertIs(tc.market_for(None), tc.CRYPTO)
+            self.assertIs(tc.market_for("TSLA"), tc.US)        # a symbol always wins
+        with mock.patch.dict(os.environ, {"DAYTRADER_MARKET": "forex"}):
+            with self.assertRaises(ValueError):
+                tc.market_for(None)
+
+    def test_crypto_time_is_utc_and_always_open(self):
+        with mock.patch.dict(os.environ, {"DAYTRADER_NOW": "2026-10-31T04:40"}):   # a Saturday
+            self.assertFalse(tc.is_market_open())                                   # US: weekend
+            with tc.market_scope("BTC-USD"):
+                n = tc.now_et()
+                self.assertEqual((n.hour, n.minute, n.utcoffset().total_seconds()), (4, 40, 0))
+                self.assertTrue(tc.is_market_open())
+                self.assertEqual((tc.MARKET_OPEN, tc.MARKET_CLOSE), (0, 1440))
+                self.assertEqual(tc.tz_label(), "UTC")
+                ts = utc_ts("2026-10-31", "23:55")
+                self.assertTrue(tc.in_regular_session(ts))
+                self.assertEqual((tc.et_date(ts), tc.et_hhmm(ts)), ("2026-10-31", "23:55"))
+            self.assertIs(tc.market(), tc.US)
+            self.assertEqual(tc.MARKET_OPEN, 570)
+
+    def test_crypto_sessions_are_utc_days(self):
+        bars = crypto_history("2026-10-31", 2, until="01:00")
+        with tc.market_scope("crypto"):
+            groups = tc.group_sessions(bars)
+        self.assertEqual(list(groups), ["2026-10-30", "2026-10-31"])
+        self.assertEqual(len(groups["2026-10-30"]), 288)
+        self.assertEqual(len(groups["2026-10-31"]), 12)
+
+    def test_parse_iso_utc(self):
+        self.assertEqual(tc.parse_iso_utc("2026-10-31T04:40:00Z"), utc_ts("2026-10-31", "04:40"))
+        self.assertAlmostEqual(tc.parse_iso_utc("2026-10-31T04:40:00.123456789Z"), utc_ts("2026-10-31", "04:40") + 0.123456789, places=5)
+        self.assertEqual(tc.parse_iso_utc("2026-10-31T00:40:00-04:00"), utc_ts("2026-10-31", "04:40"))
+        with self.assertRaises(ValueError):
+            tc.parse_iso_utc("yesterday")
+
+
+class CoinbaseTests(TempHomeTestCase):
+    NOW = "2026-10-31T04:40"
+
+    def test_windows_are_aligned_and_cover_the_range(self):
+        now = utc_ts("2026-10-31", "04:42")
+        w = tc.coinbase_candle_windows("BTC-USD", "5m", "60d", now)
+        self.assertTrue(all((first // 300) % 300 == 0 for _, first, _ in w))
+        self.assertTrue(all(last - first <= 299 * 300 for _, first, last in w))
+        self.assertLessEqual(w[0][1], now - 60 * 86400 + 300)
+        self.assertEqual(w[-1][2], utc_ts("2026-10-31", "04:40"))
+        self.assertIn("granularity=300&start=", w[0][0])
+        with self.assertRaises(ValueError):
+            tc.coinbase_candle_windows("BTC-USD", "2m", "1d", now)
+
+    def test_parse_candles(self):
+        rows = [[1761885600, 99.0, 101.0, 100.0, 100.5, 3.2], [1761885300, 98.0, 100.0, 99.0, 100.0, 1.0],
+                [1761885300, 98.0, 100.0, 99.0, 100.0, 1.0], ["bad"], [1761885000, None, 1, 1, 1, 1]]
+        bars = tc.parse_coinbase_candles(rows)
+        self.assertEqual([b.ts for b in bars], [1761885300, 1761885600])
+        with self.assertRaises(tc.FetchError):
+            tc.parse_coinbase_candles({"message": "NotFound"})
+
+    def test_fetch_bars_routes_crypto_to_coinbase_with_fixtures(self):
+        tc.use_market_for("BTC-USD")
+        bars = crypto_history("2026-10-31", 61, until="04:45")
+        fx = self.home / "fx"
+        write_coinbase_fixtures(fx, "BTC-USD", bars, now_ts=utc_ts("2026-10-31", "04:40"))
+        write_coinbase_quote(fx, "BTC-USD", 101234.56)
+        with mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(fx)}):
+            got, meta = tc.fetch_bars("BTC-USD", "5m", "60d")
+            q = tc.quote("btc-usd")
+        self.assertEqual(got[-1].ts, utc_ts("2026-10-31", "04:40"))
+        self.assertEqual(len(got), 60 * 288)
+        self.assertEqual((meta["exchangeName"], meta["currency"], meta["market"]), ("Coinbase", "USD", "crypto"))
+        self.assertEqual(q["price"], 101234.56)
+        self.assertEqual(q["exchange"], "Coinbase Exchange")
+        self.assertEqual(len(tc.group_sessions(got)), 61)
+
+    def test_products_and_info(self):
+        fx = self.home / "fx"
+        write_coinbase_products(fx)
+        with mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(fx)}):
+            syms = [r["symbol"] for r in tc.crypto_symbols()]
+            info = tc.product_info("btc-usd")
+            with self.assertRaises(tc.FetchError):
+                tc.product_info("NOPE-USD")
+        self.assertEqual(syms, ["BTC-USD", "ETH-USD", "SOL-USD"])      # USDT dropped as a stablecoin
+        self.assertEqual((info["base_increment"], info["quote_increment"]), (1e-8, 0.01))
+
+
+class CryptoSizingTests(TempHomeTestCase):
+    def test_fractional_size_includes_fees(self):
+        with tc.market_scope("BTC-USD"):
+            r = tc.position_size(100_000.0, 99_500.0)          # $50 budget, $500 stop, 0.6% fee per fill
+        # loss per BTC = 500 + 0.006 * (100000 + 99500) = 1697 -> 50 / 1697 = 0.02946375...
+        self.assertAlmostEqual(r["shares"], 0.02946375, places=8)
+        self.assertLessEqual(r["risk_used"] + r["fees_at_stop"], 50.0 + 0.01)
+        self.assertEqual(r["fee_pct"], 0.6)
+        no_fee = tc.position_size(100_000.0, 99_500.0, account=100_000, risk_dollars=50, fee=0, step=0.001)
+        self.assertEqual(no_fee["shares"], 0.1)
+        capped = tc.position_size(100_000.0, 99_500.0, risk_dollars=50, fee=0, step=0.001)
+        self.assertEqual((capped["shares"], capped["capped_by"]), (0.062, "max_position_pct"))  # 25% of $25k
+
+    def test_us_sizing_unchanged(self):
+        r = tc.position_size(364.18, 358.32)
+        self.assertEqual((r["shares"], r["fee_pct"]), (8, 0.0))
+        self.assertIsInstance(r["shares"], int)
+
+    def test_formatters(self):
+        self.assertEqual(tc.fmt_qty(8), "8")
+        self.assertEqual(tc.fmt_qty(0.02946375), "0.02946375")
+        self.assertEqual(tc.fmt_price(0.00001234), "0.00001234")
+        self.assertEqual(tc.fmt_price(0.5), "0.5000")
+        self.assertEqual(tc.fmt_price(101234.5), "101,234.50")
