@@ -183,18 +183,26 @@ python3 $SK/alerts/scripts/alerts.py remove ALR-ID|--symbol SYM|--fired|--all
   1. Read the fire time.
   2. Re-check live with `entry.py SYM --setup level --level X`.
   3. Only then take the pair through §3. A stale or wick-only touch is a watch, not a trade.
-- **The watcher** is a shell loop. Start it only if none is running: `pgrep -f 'alerts.py check
-  --json'`. Launch it with the Bash tool's `run_in_background: true` and **`timeout: 7200000`**;
-  the default 30-minute limit would kill it. 115 loops of about 60 s fit in the 2-hour maximum.
+- **The watcher** is a shell loop that writes its process id to `$OUT/watcher.pid`. Start one only
+  if none is running, and check the file, **not `pgrep -f`**. `pgrep -f 'alerts.py check --json'`
+  also matches the shell that runs the check, so it always says a watcher is running.
+
+  ```bash
+  P=$OUT/watcher.pid; [ -f $P ] && kill -0 "$(cat $P)" 2>/dev/null && echo "watcher running" || echo "no watcher"
+  ```
+
+  Launch it with the Bash tool's `run_in_background: true` and **`timeout: 7200000`**; the
+  default 30-minute limit would kill it. 115 loops of about 60 s fit in the 2-hour maximum.
   Restart it once after a fire (for the remaining alerts) or after its window ends; the 2-hourly
   crypto job also restarts it.
 
   ```bash
+  OUT=<this session's scratchpad>/desk; mkdir -p $OUT; P=$OUT/watcher.pid; echo $$ > $P
   cd /home/user/projects/day-trader && for i in $(seq 1 115); do
     out=$(python3 skills/alerts/scripts/alerts.py check --json 2>/dev/null)
     n=$(printf '%s' "$out" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('fired') or []))" 2>/dev/null || echo 0)
-    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then echo "ALERT FIRED $(date -u +%H:%M) UTC"; printf '%s' "$out"; exit 0; fi
-    sleep 60; done; echo "watcher window ended, no alert"
+    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then echo "ALERT FIRED $(date -u +%H:%M) UTC"; printf '%s' "$out"; rm -f $P; exit 0; fi
+    sleep 60; done; rm -f $P; echo "watcher window ended, no alert"
   ```
 
 ## 6. Scheduled jobs, and taking them over after a session transfer

@@ -174,7 +174,7 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
   | Found | Fix |
   |---|---|
   | The pass-to-ticket path failed: the throwaway home's plan never reached the real desk, so the budget check and the ticket exited 1 | `risk.py size --save`, then copy the plan to `~/.day-trader/plans/`. Verified live in throwaway homes, and fixed in both stored task prompts |
-  | The alert watcher would die after 30 minutes (the default background limit) | Start it with `timeout: 7200000`, guarded by `pgrep` |
+  | The alert watcher would die after 30 minutes (the default background limit) | Start it with `timeout: 7200000`. A PID file shows whether one is already running (`pgrep -f` matched the shell running the check, so it always said yes) |
   | The old session would keep acting after the handoff | Wait until it is idle, disable its tasks by id, then tell it "Handoff done" and ask the owner about archiving it |
   | Relative output paths would put desk files (with the ledger) in the public repo | Absolute scratchpad paths everywhere, plus a `.gitignore` backstop |
   | No way to build the backup | `tools/desk_backup.py` and `tools/desk_restore.py`. The restore refuses to roll back a newer desk |
