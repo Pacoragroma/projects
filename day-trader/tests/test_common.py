@@ -9,7 +9,8 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import (ROOT, SKILLS, TempHomeTestCase, bars_from_closes, daily_bars, et_ts,  # noqa: E402
                      crypto_history, utc_ts, write_coinbase_fixtures, write_coinbase_products,
-                     write_coinbase_quote,
+                     write_coinbase_quote, write_binance_fixtures, write_binance_products,
+                     write_binance_quote,
                      fake_http, random_walk_history, tc, write_fixture, yahoo_chart_url,
                      yahoo_payload)
 
@@ -521,3 +522,148 @@ class CryptoSizingTests(TempHomeTestCase):
         self.assertEqual(tc.fmt_price(0.00001234), "0.00001234")
         self.assertEqual(tc.fmt_price(0.5), "0.5000")
         self.assertEqual(tc.fmt_price(101234.5), "101,234.50")
+
+
+class BinanceTests(TempHomeTestCase):
+    NOW = "2026-10-31T04:40"
+
+    def setUp(self):
+        super().setUp()
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "binance"
+
+    def test_symbols(self):
+        for sym in ("BTCUSDT", "ETHUSDC", "BTCFDUSD", "BTC-USDT"):
+            self.assertTrue(tc.is_crypto_symbol(sym), sym)
+        self.assertFalse(tc.is_crypto_symbol("USDT"))
+        self.assertEqual(tc.crypto_pair("btcusdt"), ("BTC", "USDT"))
+        self.assertEqual(tc.crypto_pair("USDCUSDT"), ("USDC", "USDT"))
+        self.assertEqual(tc.binance_symbol("BTC-USD"), "BTCUSDT")      # Binance's few USD pairs are thin
+        self.assertEqual(tc.binance_symbol("eth-usdc"), "ETHUSDC")
+        self.assertEqual(tc.coinbase_product("BTCUSDT"), "BTC-USDT")
+
+    def test_exchange_setting_and_fees(self):
+        self.assertEqual((tc.crypto_exchange(), tc.exchange_name()), ("binance", "Binance"))
+        self.assertEqual((tc.CRYPTO.source, tc.US.source), ("Binance", "Yahoo Finance"))
+        with tc.market_scope("crypto"):
+            self.assertEqual(tc.fee_pct(), 0.1)
+        os.environ.pop("DAYTRADER_CRYPTO_EXCHANGE")
+        self.assertEqual(tc.load_settings()["crypto_exchange"], "binance")   # the default
+        tc.save_settings({"crypto_exchange": "Coinbase"})
+        s = tc.load_settings()
+        self.assertEqual((s["crypto_exchange"], s["crypto_fee_pct"]), ("coinbase", 0.6))
+        tc.save_settings({"crypto_fee_pct": 0.25})                           # an explicit fee wins
+        self.assertEqual(tc.load_settings()["crypto_fee_pct"], 0.25)
+        with self.assertRaises(ValueError):
+            tc.save_settings({"crypto_exchange": "kraken"})
+        with mock.patch.dict(os.environ, {"DAYTRADER_CRYPTO_EXCHANGE": "ftx"}):
+            with self.assertRaises(ValueError):
+                tc.crypto_exchange()
+
+    def test_windows(self):
+        now = utc_ts("2026-10-31", "04:42")
+        w = tc.binance_candle_windows("BTC-USDT", "5m", "60d", now)
+        self.assertIn(len(w), (18, 19))      # 17,280 candles; alignment can split them over one more window
+        self.assertTrue(all((first // 300) % 1000 == 0 for _, first, _ in w))
+        self.assertTrue(all(last - first <= 999 * 300 for _, first, last in w))
+        self.assertEqual(w[-1][2], utc_ts("2026-10-31", "04:40"))
+        self.assertIn("klines?symbol=BTCUSDT&interval=5m&startTime=", w[0][0])
+
+    def test_parse_klines(self):
+        rows = [[1793404800000, "77368.76", "77420.00", "77320.00", "77326.00", "30.46", 1793405099999, "0", 1, "0", "0", "0"],
+                [1793405100000, "77326.00", "77330.00", "77300.00", "77310.00", "1.0"], ["bad"], [1793405400000, None, 1, 1, 1, 1]]
+        bars = tc.parse_binance_klines(rows)
+        self.assertEqual([b.ts for b in bars], [1793404800, 1793405100])
+        self.assertEqual((bars[0].open, bars[0].high, bars[0].low, bars[0].close), (77368.76, 77420.0, 77320.0, 77326.0))
+        with self.assertRaises(tc.FetchError):
+            tc.parse_binance_klines({"code": -1121, "msg": "Invalid symbol."})
+
+    def test_fetch_quote_and_products_with_fixtures(self):
+        tc.use_market_for("BTC-USDT")
+        bars = crypto_history("2026-10-31", 61, start_price=77_000, until="04:45")
+        fx = self.home / "fx"
+        now = utc_ts("2026-10-31", "04:40")
+        write_binance_fixtures(fx, "BTC-USDT", bars, now_ts=now)
+        write_binance_quote(fx, "BTC-USDT", 77211.64, when_ts=now, open_24h=78183.98)
+        write_binance_products(fx)
+        with mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(fx)}):
+            got, meta = tc.fetch_bars("BTCUSDT", "5m", "60d")
+            q = tc.quote("BTC-USDT")
+            info = tc.product_info("BTC-USDT")
+            syms = [r["symbol"] for r in tc.crypto_symbols()]
+            with self.assertRaises(tc.FetchError):
+                tc.fetch_bars("DOGE-USDT", "5m", "1d")
+        self.assertEqual((len(got), got[-1].ts), (60 * 288, now))
+        self.assertEqual((meta["exchangeName"], meta["symbol"], meta["currency"]), ("Binance", "BTCUSDT", "USDT"))
+        self.assertEqual((q["price"], q["previous_close"], q["exchange"], q["bid"]), (77211.64, 78183.98, "Binance", 77211.63))
+        self.assertEqual((info["base_increment"], info["quote_increment"], info["status"]), (1e-5, 0.01, "online"))
+        self.assertEqual(syms, ["BTC-USDT", "ETH-USDT", "SOL-USDT"])   # stablecoin and leveraged token dropped
+
+    def test_unknown_pair_message(self):
+        with fake_http({"klines": tc.FetchError("HTTP 400 for https://data-api.binance.vision/... ")}):
+            with self.assertRaises(tc.FetchError) as cm:
+                tc.binance_bars("NOPE-USDT", "5m", "1d")
+        self.assertIn("Binance has no spot pair NOPEUSDT", str(cm.exception))
+
+    def test_sizing_uses_binance_fee(self):
+        with tc.market_scope("BTC-USDT"):
+            r = tc.position_size(77_000.0, 76_500.0, step=1e-5)
+        # loss per BTC = 500 + 0.001 * (77000 + 76500) = 653.5 -> 50 / 653.5 = 0.0765... -> 0.07651 (step 1e-5)
+        self.assertEqual((r["shares"], r["fee_pct"]), (0.07651, 0.1))
+
+
+class SharedLibFixesFromBinanceReviewTests(TempHomeTestCase):
+    NOW = "2026-10-31T09:40"
+
+    def test_one_letter_and_non_latin_coins_are_crypto(self):
+        for sym in ("A-USDT", "T-USDT", "币安人生-USDT", "BROCCOLI714USDT", "币安人生USDT"):
+            self.assertTrue(tc.is_crypto_symbol(sym), sym)
+        self.assertEqual(tc.crypto_pair("BROCCOLI714USDT"), ("BROCCOLI714", "USDT"))
+        self.assertEqual(tc.binance_symbol("A-USDT"), "AUSDT")
+        for sym in ("BRK-B", "TSLA", "A"):
+            self.assertFalse(tc.is_crypto_symbol(sym), sym)
+
+    def test_one_plan_per_pair_whatever_the_spelling(self):
+        tc.save_plan({"symbol": "BTCUSDT", "side": "long", "entry": 100, "stop": 99, "target": 102})
+        self.assertEqual(tc.load_plan("BTC-USDT")["target"], 102)
+        self.assertEqual(tc.canonical_symbol("btcusdt"), "BTC-USDT")
+        self.assertEqual(tc.canonical_symbol("tsla"), "TSLA")
+        tc.save_plan({"symbol": "币安人生-USDT", "side": "long", "entry": 1, "stop": 0.9, "target": 1.2})
+        tc.save_plan({"symbol": "牛来-USDT", "side": "long", "entry": 2, "stop": 1.9, "target": 2.2})
+        self.assertEqual(tc.load_plan("币安人生-USDT")["entry"], 1)    # no collision on non-Latin names
+        self.assertEqual(tc.load_plan("牛来-USDT")["entry"], 2)
+
+    def test_leveraged_filter_keeps_real_coins_and_new_stablecoins_drop(self):
+        rows = [{"symbol": b + "USDT", "status": "TRADING", "baseAsset": b, "quoteAsset": "USDT", "isSpotTradingAllowed": True}
+                for b in ("BTC", "BTCUP", "JUP", "SYRUP", "USD1", "RLUSD", "A")]
+        with fake_http({"exchangeInfo?permissions=SPOT": {"symbols": rows}}):
+            syms = [r["symbol"] for r in tc.binance_crypto_symbols(ttl=0)]
+        self.assertEqual(syms, ["A-USDT", "BTC-USDT", "JUP-USDT", "SYRUP-USDT"])   # BTCUP dropped: its root BTC is listed
+
+    def test_bad_exchange_setting_does_not_break_stock_runs(self):
+        with mock.patch.dict(os.environ, {"DAYTRADER_CRYPTO_EXCHANGE": "kraken"}):
+            s = tc.load_settings()                       # stocks keep working
+            self.assertEqual(s["account_size"], 25000.0)
+            with self.assertRaises(ValueError):          # a crypto command still says what is wrong
+                tc.crypto_exchange()
+
+    def test_fee_can_follow_the_exchange_again(self):
+        os.environ.pop("DAYTRADER_CRYPTO_EXCHANGE", None)
+        tc.save_settings({"crypto_fee_pct": 0.25})
+        self.assertEqual(tc.load_settings()["crypto_fee_pct"], 0.25)
+        tc.save_settings({"crypto_fee_pct": None})
+        self.assertEqual(tc.load_settings()["crypto_fee_pct"], 0.1)          # Binance's default again
+        tc.save_settings({"crypto_exchange": "coinbase"})
+        self.assertEqual(tc.load_settings()["crypto_fee_pct"], 0.6)
+
+    def test_binance_windows_fetch_in_parallel_and_keep_order(self):
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "binance"
+        tc.use_market_for("BTC-USDT")
+        bars = crypto_history("2026-10-31", 61, start_price=77_000, until="09:45")
+        fx = self.home / "fx"
+        now = utc_ts("2026-10-31", "09:40")
+        write_binance_fixtures(fx, "BTC-USDT", bars, now_ts=now)
+        with mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(fx)}):
+            got, _ = tc.fetch_bars("BTC-USDT", "5m", "60d")
+        self.assertEqual(len(got), 60 * 288)
+        self.assertEqual([b.ts for b in got], sorted(b.ts for b in got))
+        self.assertEqual(got[-1].ts, now)

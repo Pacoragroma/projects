@@ -449,6 +449,7 @@ class CliInputTests(unittest.TestCase):
         self.assertIn("DAYTRADER_CONTACT", text)        # what to suggest when SEC answers 403
         cmds = re.findall(r"python3 scripts/news\.py ([^\n#`]*)", text)
         self.assertGreaterEqual(len(cmds), 8)
+        self.assertTrue(any(c.split()[0] == "BTC-USDT" for c in cmds))      # the primary crypto example
         for c in cmds:
             with self.subTest(cmd=c):
                 a = news.build_parser().parse_intermixed_args(shlex.split(c))
@@ -931,6 +932,106 @@ class CryptoNewsCliTests(TempHomeTestCase):
         self.assertEqual([i["title"] for i in data["items"]], ["Bitcoin tops $104,000 as ETF inflows jump"])
         self.assertTrue(data["as_of"].endswith("+00:00"))
         self.assertEqual(j.stderr, "")
+        self.assertNotIn("yahoo_symbols", data)                              # BTC-USD is Yahoo's own spelling
+        self.assertNotIn("Yahoo symbols", out)
+
+
+# ---------------------------------------------------------------------------
+# Binance-style pairs (BTC-USDT, BTCUSDT): Yahoo is asked for the coin, BTC-USD
+# ---------------------------------------------------------------------------
+
+class BinanceSymbolTests(TempHomeTestCase):
+    NOW = CNOW
+
+    def setUp(self):
+        super().setUp()
+        tc.set_market(tc.CRYPTO)
+        self.now = tc.now_et()
+
+    def test_yahoo_is_asked_for_the_coin(self):
+        for sym in ("BTC-USDT", "BTCUSDT", "btc-usdc".upper(), "BTC-EUR", "BTC-USD"):
+            self.assertEqual(news.yahoo_news_symbol(sym), "BTC-USD", sym)
+        self.assertEqual(news.yahoo_news_symbol("ETH-BTC"), "ETH-USD")       # news about the coin, ETH
+        self.assertEqual((news.yahoo_news_symbol("BRK.B"), news.yahoo_news_symbol("TSLA")), ("BRK-B", "TSLA"))
+        self.assertEqual(news.rss_url("BTC-USDT"), news.rss_url("BTC-USD"))
+        self.assertEqual(news.search_url("BTCUSDT"), news.search_url("BTC-USD"))
+        self.assertIn("headline?s=BTC-USD&", news.rss_url("BTCUSDT"))
+
+    def test_related_tickers_match_by_coin(self):
+        items = news.parse_search(SEARCH_BTC, "BTC-USDT")                  # Yahoo tags the story BTC-USD
+        self.assertEqual([(i["title"], i["symbols"]) for i in items],
+                         [("Bitcoin tops $104,000 as ETF inflows jump", ["BTC-USDT"])])   # TSLA story dropped
+        self.assertTrue(news._same_ticker("BTC-USD", "BTCUSDT"))
+        self.assertFalse(news._same_ticker("ETH-USD", "BTC-USDT"))
+
+    def test_spellings_of_one_coin_are_one_ticker_with_one_memory(self):
+        self.assertEqual(news.parse_symbols(["btc-usdt,BTCUSDT", "BTC-USD", "eth-usdt", "1000SATS-USDT"]),
+                         ["BTC-USDT", "ETH-USDT", "1000SATS-USDT"])
+        self.assertEqual(news.parse_symbols(["TSLA", "BRK.B", "BRK-B"]), ["TSLA", "BRK.B"])   # stocks as before
+        with fake_http({"headline?s=BTC-USD": RSS_BTC, "search?q=BTC-USD": SEARCH_BTC}):
+            raw, _ = news.gather(["BTC-USDT"], self.now - timedelta(hours=24), self.now)
+        feed = news.build_feed(raw, self.now, self.now - timedelta(hours=24), seen={"symbols": {}})
+        seen = news.mark_seen({"symbols": {}}, feed["items"])
+        self.assertEqual(list(seen["symbols"]), ["BTC-USD"])                 # remembered per coin
+        with fake_http({"headline?s=BTC-USD": RSS_BTC, "search?q=BTC-USD": SEARCH_BTC}):
+            raw, _ = news.gather(["BTCUSDT"], self.now - timedelta(hours=24), self.now)
+        again = news.build_feed(raw, self.now, self.now - timedelta(hours=24), seen=seen)
+        self.assertEqual((again["items"], again["skipped"]["seen"]), ([], 2))
+        stock = news.mark_seen({"symbols": {}}, [item("Tesla beats", ts("2026-10-30", "10:00"), symbol="BRK.B")])
+        self.assertEqual(list(stock["symbols"]), ["BRK.B"])                  # stock keys unchanged
+
+    def test_mixed_run_names_the_yahoo_symbol_and_asks_sec_for_the_stock(self):
+        tc.set_market(tc.US)
+        now = tc.parse_et("2026-10-30T10:15")
+        routes = {"headline?s=BTC-USD": RSS_BTC, "search?q=BTC-USD": SEARCH_BTC,
+                  "headline?s=TSLA": RSS_TSLA, "search?q=TSLA": SEARCH_TSLA,
+                  "company_tickers.json": SEC_TICKERS, "CIK0001318605.json": SEC_SUBS}
+        with fake_http(routes) as m:
+            raw, rows = news.gather(["TSLA", "BTCUSDT"], now - timedelta(hours=24), now)
+        sec = {tuple(r["symbols"]): r["status"] for r in rows if r["source"] == "sec-edgar"}
+        self.assertEqual(sec, {("TSLA",): "ok", ("BTCUSDT",): "n/a"})
+        self.assertFalse([c for c in m.call_args_list if "BTCUSDT" in c.args[0]])   # never asked by the pair
+        self.assertIn("BTCUSDT", {s for i in raw for s in i["symbols"]})
+
+
+class BinanceSymbolCliTests(TempHomeTestCase):
+    """news.py BTC-USDT on Binance (the default exchange): the fixtures exist for BTC-USD only."""
+    NOW = CNOW
+
+    def setUp(self):
+        super().setUp()
+        self.fx = self.home / "fx"
+        write_fixture(self.fx, news.rss_url("BTC-USD"), RSS_BTC)
+        write_fixture(self.fx, news.search_url("BTC-USD"), SEARCH_BTC)
+        self.env = {"DAYTRADER_HOME": str(self.home / "state"), "DAYTRADER_FIXTURES": str(self.fx),
+                    "DAYTRADER_NOW": CNOW, "DAYTRADER_CRYPTO_EXCHANGE": "binance"}
+
+    def test_btc_usdt_text_json_and_new_only_across_spellings(self):
+        r = run_cli(SCRIPT, "BTC-USDT", env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = r.stdout
+        self.assertIn("NEWS · BTC-USDT · last 24h", out)
+        self.assertIn("2 headlines, 2 high impact · as of Sat Oct 31 04:40 UTC", out)
+        self.assertIn("HIGH  03:50 UTC", out)
+        self.assertIn("BTC-USDT  Bloomberg", out)
+        self.assertIn("Sources: Yahoo RSS ok · Yahoo search ok · SEC EDGAR n/a\n"
+                      "Yahoo symbols (crypto news covers the coin): BTC-USDT -> BTC-USD", out)
+        self.assertNotIn("! ", out)
+        self.assertNotIn("Coinbase", out + r.stderr)
+        j = run_cli(SCRIPT, "BTCUSDT", "--json", env=self.env)
+        self.assertEqual(j.returncode, 0, j.stderr)
+        data = json.loads(j.stdout)
+        self.assertEqual((data["symbols"], data["market"], data["tz"], data["warnings"]),
+                         (["BTCUSDT"], "crypto", "UTC", []))
+        self.assertEqual(data["yahoo_symbols"], {"BTCUSDT": "BTC-USD"})
+        self.assertEqual([i["symbol"] for i in data["items"]], ["BTCUSDT", "BTCUSDT"])
+        sec = next(s for s in data["sources"] if s["source"] == "sec-edgar")
+        self.assertEqual(sec["not_applicable"], ["BTCUSDT"])
+        first = run_cli(SCRIPT, "BTC-USDT", "--new-only", env=self.env)
+        self.assertIn("2 headlines", first.stdout)
+        second = run_cli(SCRIPT, "BTCUSDT", "--new-only", env=self.env)          # same coin, other spelling
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("No new headlines for BTCUSDT in the last 24h (2 already seen).", second.stdout)
 
 
 if __name__ == "__main__":

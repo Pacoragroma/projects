@@ -152,10 +152,19 @@ class PluginManifestTests(unittest.TestCase):
         for key in ("version", "description", "license", "keywords"):
             self.assertEqual(entry[key], plugin[key], key)
         self.assertRegex(plugin["version"], r"^\d+\.\d+\.\d+$")
-        self.assertEqual(plugin["version"], "1.1.0")
-        for words in ("11 Claude skills", "crypto", "Paper trading only."):
+        self.assertEqual(plugin["version"], "1.2.0")
+        for words in ("11 Claude skills", "crypto", "BTC-USDT", "Binance", "Coinbase", "Paper trading only."):
             self.assertIn(words, plugin["description"])
-        self.assertIn("crypto", plugin["keywords"])
+        self.assertLess(plugin["description"].index("Binance"), plugin["description"].index("Coinbase"))  # the default first
+        for words in ("crypto", "binance", "coinbase"):
+            self.assertIn(words, plugin["keywords"])
+
+    def test_root_readme_names_binance_as_the_crypto_default(self):
+        row = next(ln for ln in (ROOT.parent / "README.md").read_text(encoding="utf-8").splitlines()
+                   if ln.startswith("| [day-trader]"))
+        for words in ("BTC-USDT", "Binance's public prices (or Coinbase's)", "Paper trading only."):
+            self.assertIn(words, row)
+
 
 class PackReadmeTests(unittest.TestCase):
     """Keep README.md honest as the skills change."""

@@ -5,13 +5,13 @@ description: >-
   shows trend (20/50-day SMAs, 20-day slope), key levels (prior day high/low/close, 20-day and
   6-month high/low, VWAP), daily ATR in $ and %, average dollar volume, relative volume vs the
   same time of day, the gap, and SEC context: shares outstanding, recent 8-K items, 10-Q/10-K,
-  possible dilution and insider Form 4s. Crypto pairs (BTC-USD): Coinbase data, UTC days, no SEC.
+  possible dilution and insider Form 4s. Crypto pairs (BTC-USDT): UTC days, no SEC.
   The review grades closed paper trades: win rate, average win/loss in $ and R, profit factor,
   expectancy, max drawdown, and breakdowns by setup, side, entry hour, exit, market and Time
   Machine verdict, with takeaways. Use for "brief me on TSLA", "key levels for NVDA?", "is AAPL
   trending?", "is volume heavy today?", "any recent filings or dilution?", "review my trades",
   "how am I doing overall / this month?", "what's my win rate?", "which setups work for me?".
-  Free Yahoo Finance, Coinbase and SEC EDGAR data, no API key. Not financial advice.
+  Free Yahoo Finance, Binance (or Coinbase) and SEC EDGAR data, no API key. Not financial advice.
 ---
 # Analyst
 
@@ -33,13 +33,14 @@ python3 scripts/analyst.py review                        # closed paper trades, 
 python3 scripts/analyst.py review --days 90 --symbol TSLA
 python3 scripts/analyst.py review --days 3650            # "overall": the whole journal (max 10 years)
 python3 scripts/analyst.py review --json
-python3 scripts/analyst.py brief BTC-USD                 # crypto pair: Coinbase, UTC day, no SEC
+python3 scripts/analyst.py brief BTC-USDT                # crypto pair: Binance, UTC day, no SEC
 python3 scripts/analyst.py review --market crypto        # only crypto trades (or --market us)
 ```
 
 * `brief SYMBOL`: one ticker per run. `--filing-days N` (1-365, default 30) sets the SEC window.
 * `review`: `--days N` = today and the previous N-1 calendar days, by close date (default 30).
-  `--symbol` keeps one ticker, `--market us|crypto` one market. "This month" = `--days` set to
+  `--symbol` keeps one ticker (a crypto pair in either spelling: `BTC-USDT` = `BTCUSDT`),
+  `--market us|crypto` one market. "This month" = `--days` set to
   today's day of the month (e.g. `--days 30` on Oct 30); "overall" = `--days 3650`.
 * `--json` on either command gives the machine-readable result for chaining. Exit codes: 0 ok,
   1 bad input or a broken state file, 2 a data source is unreachable.
@@ -76,12 +77,17 @@ EDGAR are optional. If they fail, the brief still prints and says what is missin
   * filings in the window: 8-K/6-K items by name (2.02 = earnings), 10-Q/10-K/20-F, possible
     dilution (S-1, S-3, F-1, F-3, 424B*, 8-K item 3.02), 13D/13G holders, and counts of
     Form 4 (insider trades) and Form 144 (planned insider sales).
-* **Crypto pairs** (`BTC-USD`, `ETH-USD`, ...): Coinbase Exchange candles (daily 6 months, 5-minute
-  21 days), no API key. Crypto trades 24/7, so "today" and "prior day" are UTC days (levels read
+* **Crypto pairs** (`BTC-USDT`, `ETH-USDT`, ...; `BTC-USD` and `BTCUSDT` work too): candles from
+  **Binance by default (or Coinbase)** (daily 6 months, 5-minute 21 days), public data, no account,
+  no API key. The `crypto_exchange` setting or `$DAYTRADER_CRYPTO_EXCHANGE` picks the exchange; the
+  header ends `· Binance prices` (or `· Coinbase prices`). Binance's few USD pairs are thin, so there
+  `BTC-USD` is priced from `BTCUSDT` (a note says so; USDT trades close to, not exactly at, $1).
+  Crypto trades 24/7, so "today" and "prior day" are UTC days (levels read
   `prior UTC day high/low/close` and `VWAP (UTC day)`), the header says `24/7 (UTC day)`, relative
   volume compares against the same UTC clock time on up to 20 prior days, there is no gap (a UTC
-  day opens where the last one closed), liquidity is in coins, and SEC is `n/a` - not asked, not
-  a failure.
+  day opens where the last one closed), liquidity is in coins (dollar volume is USDT volume on
+  Binance), sub-cent coins keep 4 significant digits (`0.00001040`), and SEC is `n/a` - not asked,
+  not a failure. A pair the exchange does not list is bad input (exit 1).
 
 **review.** Reads closed trades from `ledger.json` (the broker skill writes it) in
 `$DAYTRADER_HOME`.
@@ -124,8 +130,8 @@ twenty paper trades cannot show an edge.
 * "Possible dilution" means a registration or prospectus was filed, not that shares were sold.
   Say "worth checking", not "they are diluting".
 * **Brief JSON keys:**
-  * price data: `symbol, name, as_of, market (open/closed/...), market_type (us|crypto), tz, price,
-    session{...}, prior_day{...}`;
+  * price data: `symbol, name, as_of, market (open/closed/...), market_type (us|crypto), tz,
+    exchange (crypto only: binance|coinbase), price, session{...}, prior_day{...}`;
   * analysis: `trend{label, sma20, sma50, slope_20d_pct_per_day, ...}`,
     `levels[{name, price, from_last_pct, from_last_atr}]`,
     `volatility{atr14, atr14_pct}`, `liquidity{avg_dollar_volume_20d, avg_volume_20d}`,
@@ -167,7 +173,8 @@ twenty paper trades cannot show an edge.
 * Be honest about sample size in reviews. Under ~30 trades, patterns are hints, and the script
   says so. Do not present a takeaway as proven.
 * If the script exits with code 2 ("data error: ..."), tell the user which host failed. It is
-  in the message: `query1`/`query2.finance.yahoo.com` (crypto: `api.exchange.coinbase.com`) for bars, and `www.sec.gov` /
+  in the message: `query1`/`query2.finance.yahoo.com` (crypto: `data-api.binance.vision` on Binance,
+  `api.exchange.coinbase.com` on Coinbase) for bars, and `www.sec.gov` /
   `data.sec.gov` failures show in the SEC section of an otherwise working brief. In sandboxes the host
   may need to be allow-listed. Never invent prices, headlines, or odds to fill the gap. Use
   `--no-sec` if only SEC is blocked. Exit code 1 means bad input or a broken state file: show

@@ -7,9 +7,11 @@ Sources (free, no API key), merged and de-duplicated:
   * SEC EDGAR 8-K / 8-K/A / 6-K filings  www.sec.gov + data.sec.gov
 One source failing only adds a warning; all of them failing exits 2 ("data error: ...").
 
-Crypto pairs (BTC-USD, ETH-USD, ...) use the same Yahoo feeds for the symbol; SEC EDGAR is not
-applicable to them, so it is not asked (shown as "n/a", never as a failure). A run of crypto
-symbols only shows times in UTC (crypto days are UTC days); any run with a stock uses ET.
+Crypto pairs (BTC-USDT, ETH-USDT, BTCUSDT, BTC-USD, ...) use the same Yahoo feeds, asked for the
+coin in Yahoo's spelling (BTC-USD for BTC-USDT or BTCUSDT: news is about the coin, whichever
+exchange or quote currency prices it); SEC EDGAR is not applicable to them, so it is not asked
+(shown as "n/a", never as a failure). A run of crypto symbols only shows times in UTC (crypto days
+are UTC days); any run with a stock uses ET.
 
 Usage examples:
   python3 scripts/news.py TSLA
@@ -17,7 +19,7 @@ Usage examples:
   python3 scripts/news.py TSLA --new-only        # only headlines you have not been shown yet
   python3 scripts/news.py TSLA --since 09:30     # since the open today (ET)
   python3 scripts/news.py AAPL --since 2026-10-29 --limit 50 --json
-  python3 scripts/news.py BTC-USD ETH-USD --since 12h  # crypto: Yahoo only, times in UTC
+  python3 scripts/news.py BTC-USDT ETH-USDT --since 12h  # crypto: Yahoo only, times in UTC
 """
 from __future__ import annotations
 
@@ -362,8 +364,17 @@ def _local(tag: Any) -> str:
     return tag.rsplit("}", 1)[-1].lower() if isinstance(tag, str) else ""
 
 
+def yahoo_news_symbol(symbol: str) -> str:
+    """The symbol Yahoo's news feeds know: a stock in Yahoo's spelling (BRK.B -> BRK-B); a crypto
+    pair as its coin in dollars, the way Yahoo lists it (BTC-USDT, BTCUSDT, BTC-EUR -> BTC-USD).
+    Crypto news is about the coin, whatever exchange or quote currency prices it."""
+    if tc.is_crypto_symbol(symbol):
+        return f"{tc.crypto_pair(symbol)[0]}-USD"
+    return tc.yahoo_symbol(symbol)
+
+
 def _same_ticker(a: str, b: str) -> bool:
-    return tc.yahoo_symbol(a) == tc.yahoo_symbol(b)
+    return yahoo_news_symbol(a) == yahoo_news_symbol(b)
 
 
 def _new_item(symbol: str, source: str, title: str, link: str, ts: Optional[float], publisher: str = "",
@@ -601,10 +612,16 @@ def clean_seen(data: Any) -> Dict[str, Any]:
     return {"symbols": out}
 
 
+def seen_key(symbol: str) -> str:
+    """Where --new-only remembers a symbol's items: the ticker as given; a crypto pair under its
+    Yahoo news symbol, so BTC-USDT, BTCUSDT and BTC-USD (one feed) share one memory."""
+    return yahoo_news_symbol(symbol) if tc.is_crypto_symbol(symbol) else symbol
+
+
 def is_seen(item: Dict[str, Any], seen: Dict[str, Any]) -> bool:
     store = seen.get("symbols") or {}
     keys = item.get("_keys") or set()
-    return any(k in set(store.get(sym) or []) for sym in item["symbols"] for k in keys)
+    return any(k in set(store.get(seen_key(sym)) or []) for sym in item["symbols"] for k in keys)
 
 
 def mark_seen(seen: Dict[str, Any], items: Iterable[Dict[str, Any]], cap: int = SEEN_CAP) -> Dict[str, Any]:
@@ -612,10 +629,11 @@ def mark_seen(seen: Dict[str, Any], items: Iterable[Dict[str, Any]], cap: int = 
     store = seen.setdefault("symbols", {})
     for it in items:
         for sym in it["symbols"]:
-            lst = [k for k in (store.get(sym) or []) if isinstance(k, str)]
+            key = seen_key(sym)
+            lst = [k for k in (store.get(key) or []) if isinstance(k, str)]
             have = set(lst)
             lst.extend(k for k in sorted(it.get("_keys") or ()) if k not in have)
-            store[sym] = lst[-cap:]
+            store[key] = lst[-cap:]
     return seen
 
 
@@ -690,7 +708,7 @@ def public_item(it: Dict[str, Any], now: datetime) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _q(symbol: str) -> str:
-    return urllib.parse.quote(tc.yahoo_symbol(symbol), safe="")
+    return urllib.parse.quote(yahoo_news_symbol(symbol), safe="")
 
 
 def rss_url(symbol: str) -> str:
@@ -917,6 +935,9 @@ def render(res: Dict[str, Any]) -> str:
             st = "ok"
         status.append(f"{SOURCE_LABELS[s['source']]} {st}")
     lines.append("Sources: " + " · ".join(status))
+    if res.get("yahoo_symbols"):
+        lines.append("Yahoo symbols (crypto news covers the coin): "
+                     + ", ".join(f"{s} -> {y}" for s, y in res["yahoo_symbols"].items()))
     for w in res["warnings"]:
         lines.append(f"! {w}")
     lines.append("Tags are keyword guesses and HIGH = big topic or under 60 min old - read the story "
@@ -941,8 +962,9 @@ def parse_symbols(values: Sequence[str]) -> List[str]:
                 continue
             if not _SYMBOL_RX.fullmatch(s):
                 raise ValueError(f"not a ticker symbol: {s!r}")
-            if tc.yahoo_symbol(s) not in seen:
-                seen.add(tc.yahoo_symbol(s))
+            key = yahoo_news_symbol(s)       # BTC-USDT and BTCUSDT read one feed: keep the first
+            if key not in seen:
+                seen.add(key)
                 out.append(s)
     if not out:
         raise ValueError("give at least one ticker, e.g. news.py TSLA")
@@ -961,10 +983,10 @@ def parse_tags(value: str) -> List[str]:
 
 def build_parser():
     p = tc.make_parser("Breaking headlines that could move your tickers: Yahoo Finance news + SEC 8-K/6-K "
-                       "filings (stocks only; crypto pairs like BTC-USD get Yahoo news), merged, de-duplicated, "
-                       "tagged and newest first.")
+                       "filings (stocks only; crypto pairs like BTC-USDT get Yahoo's news for the coin, "
+                       "BTC-USD), merged, de-duplicated, tagged and newest first.")
     p.add_argument("symbols", nargs="+", metavar="SYMBOL",
-                   help="one or more tickers or crypto pairs (TSLA NVDA, TSLA,NVDA or BTC-USD)")
+                   help="one or more tickers or crypto pairs (TSLA NVDA, TSLA,NVDA or BTC-USDT)")
     p.add_argument("--since", default="24h",
                    help="how far back: 90m, 24h (default), 2d, 1w, today, a clock time today like 09:30, "
                         "or a date/time like 2026-10-29 or 2026-10-29T08:00 (ET; UTC for crypto-only runs)")
@@ -1015,6 +1037,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "skipped": feed["skipped"], "sources": sources, "warnings": warnings,
         "disclaimer": "Headlines and keyword tags only - not trading signals. Not financial advice.",
     }
+    # Crypto pairs Yahoo knows under another symbol (BTC-USDT -> BTC-USD): say whose news this is.
+    asked = {s: yahoo_news_symbol(s) for s in symbols if tc.is_crypto_symbol(s) and yahoo_news_symbol(s) != s}
+    if asked:
+        res["yahoo_symbols"] = asked
     if args.json:
         for w in warnings:
             print(f"warning: {w}", file=sys.stderr)

@@ -57,6 +57,8 @@ def temp_home(now: Optional[str] = None) -> Iterator[Path]:
             # A developer's own demo/SEC settings must not leak into tests (patch.dict restores them).
             for var in ("DAYTRADER_FIXTURES", "DAYTRADER_CONTACT", "DAYTRADER_MARKET"):
                 os.environ.pop(var, None)
+            # The crypto tests written against Coinbase stay on Coinbase; Binance tests opt in.
+            os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "coinbase"
             tc.set_market(tc.US)   # a test that switches to crypto must not leak into the next one
             try:
                 yield Path(d)
@@ -305,3 +307,52 @@ def write_coinbase_products(directory: Path, products: Sequence[str] = ("BTC-USD
                      "quote_increment": "0.01", "display_name": pid.replace("-", "/"), "status": "online",
                      "trading_disabled": False, "cancel_only": False, "post_only": False, "limit_only": False})
     write_fixture(directory, f"{tc.COINBASE_API}/products", rows)
+
+
+# ---------------------------------------------------------------------------
+# Crypto (Binance) fixtures - use with DAYTRADER_CRYPTO_EXCHANGE=binance
+# ---------------------------------------------------------------------------
+
+def binance_rows(bars: Sequence[tc.Bar], minutes: int = 5) -> List[List[Any]]:
+    """Bars -> Binance kline rows [open_ms, "o", "h", "l", "c", "v", close_ms, ...], oldest first."""
+    return [[b.ts * 1000, f"{b.open:.8f}", f"{b.high:.8f}", f"{b.low:.8f}", f"{b.close:.8f}", f"{b.volume:.8f}",
+             (b.ts + minutes * 60) * 1000 - 1, "0", 1, "0", "0", "0"] for b in sorted(bars, key=lambda b: b.ts)]
+
+
+def write_binance_fixtures(directory: Path, symbol: str, bars: Sequence[tc.Bar], interval: str = "5m",
+                           range_: str = "60d", now_ts: Optional[float] = None) -> List[Path]:
+    """Write the kline windows tc.binance_bars requests for (symbol, interval, range_) at now_ts."""
+    gran = tc.COINBASE_GRANULARITY[interval]
+    now_ts = now_ts if now_ts is not None else bars[-1].ts
+    paths = []
+    for url, first, last in tc.binance_candle_windows(symbol, interval, range_, now_ts):
+        inside = [b for b in bars if first <= b.ts <= last and b.ts % gran == 0]
+        paths.append(write_fixture(directory, url, binance_rows(inside, gran // 60)))
+    return paths
+
+
+def write_binance_quote(directory: Path, symbol: str, price: float, when_ts: Optional[float] = None,
+                        open_24h: Optional[float] = None) -> None:
+    pair = tc.binance_symbol(symbol)
+    write_fixture(directory, f"{tc.BINANCE_API}/ticker/24hr?symbol={pair}", {
+        "symbol": pair, "lastPrice": f"{price:.8f}", "bidPrice": f"{price - 0.01:.8f}",
+        "askPrice": f"{price + 0.01:.8f}", "openPrice": f"{(open_24h or price):.8f}",
+        "closeTime": int((when_ts or utc_ts("2026-10-31", "04:40")) * 1000)})
+
+
+def _binance_symbol_row(pair: str, base: str, quote: str, step: str = "0.00001000", tick: str = "0.01000000") -> Dict[str, Any]:
+    return {"symbol": pair, "status": "TRADING", "baseAsset": base, "quoteAsset": quote, "isSpotTradingAllowed": True,
+            "filters": [{"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "1000000", "tickSize": tick},
+                        {"filterType": "LOT_SIZE", "minQty": step, "maxQty": "9000", "stepSize": step},
+                        {"filterType": "NOTIONAL", "minNotional": "5.00000000"}]}
+
+
+def write_binance_products(directory: Path, pairs: Sequence[str] = ("BTC-USDT", "ETH-USDT", "SOL-USDT", "USDC-USDT", "BTCUP-USDT")) -> None:
+    """exchangeInfo for the universe scan plus a per-pair exchangeInfo for each pair."""
+    rows = []
+    for pair in pairs:
+        base, quote = pair.split("-")
+        row = _binance_symbol_row(base + quote, base, quote)
+        rows.append(row)
+        write_fixture(directory, f"{tc.BINANCE_API}/exchangeInfo?symbol={base + quote}", {"symbols": [row]})
+    write_fixture(directory, f"{tc.BINANCE_API}/exchangeInfo?permissions=SPOT&symbolStatus=TRADING", {"symbols": rows})

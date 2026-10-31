@@ -6,10 +6,11 @@ account), caps it by the max position size and buying power, and checks it befor
 broker for a ticket: reward:risk, a stop that is inside the noise, 0 shares, margin / buying
 power, today's loss budget (from the paper ledger), and a pattern-day-trader heads-up.
 
-Crypto (BTC-USD, ETH-USD, ... - Coinbase prices, 24/7, the UTC day) is sized in fractions, floored
-to the product's size step, and the paper fees of the entry and the stop exit (crypto_fee_pct)
-count toward the loss: "BUY 0.02946375 BTC-USD". The card says what the fees cost in R. Spot
-crypto has no margin and no PDT rule: leverage stays 1x unless you pass --leverage.
+Crypto (BTC-USDT, ETH-USDT, BTC-USD, ... - Binance prices by default, or Coinbase with the
+crypto_exchange setting; 24/7, the UTC day) is sized in fractions, floored to the pair's size step,
+and the paper fees of the entry and the stop exit (crypto_fee_pct; unset = the exchange's
+entry-tier taker fee) count toward the loss: "BUY 0.02274 BTC-USDT". The card says what the fees
+cost in R. Spot crypto has no margin and no PDT rule: leverage stays 1x unless you pass --leverage.
 
 Usage:
   python3 scripts/risk.py size --entry 364.18 --stop 358.32                  # BUY 8 shares
@@ -22,8 +23,9 @@ Usage:
   python3 scripts/risk.py config                                             # show settings
   python3 scripts/risk.py show                                               # settings + open risk today
   python3 scripts/risk.py --json size --symbol TSLA                          # --json works anywhere
-  python3 scripts/risk.py size --symbol BTC-USD --entry 100000 --stop 99500 --target 101000
-  python3 scripts/risk.py config --crypto-fee-pct 0.4                        # your Coinbase fee tier
+  python3 scripts/risk.py size --symbol BTC-USDT --entry 100000 --stop 98000 --target 104000
+  python3 scripts/risk.py config --crypto-exchange coinbase                  # crypto prices: binance | coinbase
+  python3 scripts/risk.py config --crypto-fee-pct 0.075                      # your own fee tier
 
 Exit codes: 0 ok, 1 bad input or state (including `size --save` that could not save),
 2 data source unreachable (only `size` without an entry anywhere fetches the current price).
@@ -81,10 +83,60 @@ def _floor_step(x: float, step: float) -> float:
 
 
 def unit_word(symbol: Optional[str]) -> str:
-    """'shares' for stocks; the base currency for crypto ('BTC' for BTC-USD), 'units' without a symbol."""
+    """'shares' for stocks; the base currency for crypto ('BTC' for BTC-USDT or BTCUSDT), 'units'
+    without a symbol."""
     if symbol and tc.is_crypto_symbol(symbol):
-        return symbol.upper().split("-")[0]
+        return tc.crypto_pair(symbol)[0]
     return "units" if tc.market().fractional and not symbol else "shares"
+
+
+# ---------------------------------------------------------------------------
+# Crypto exchange (Binance by default, or Coinbase): names, fees, pair rules
+# ---------------------------------------------------------------------------
+
+def exchange_name(exchange: Optional[str] = None) -> str:
+    """'Binance' / 'Coinbase': `exchange`, else the configured crypto price source."""
+    return tc.CRYPTO_EXCHANGES[exchange]["name"] if exchange else tc.exchange_name()
+
+
+def exchange_fee_pct(exchange: Optional[str] = None) -> float:
+    """The exchange's entry-tier taker fee in % (Binance 0.1, Coinbase 0.6): the crypto_fee_pct
+    tc.load_settings() uses when the user has not set their own."""
+    return float(tc.CRYPTO_EXCHANGES[exchange or tc.crypto_exchange()]["fee_pct"])
+
+
+def default_settings() -> Dict[str, Any]:
+    """tc.DEFAULT_SETTINGS with the crypto fee of the configured exchange (not one fixed number),
+    as tc.load_settings() fills it in when no fee is saved."""
+    ex = tc.crypto_exchange()
+    return dict(tc.DEFAULT_SETTINGS, crypto_exchange=ex, crypto_fee_pct=exchange_fee_pct(ex))
+
+
+def rules_name(exchange: Optional[str] = None) -> str:
+    """What the exchange calls a pair's size step and price tick: 'Binance pair rules' (symbol
+    filters) or 'Coinbase product rules'."""
+    ex = exchange or tc.crypto_exchange()
+    return f"{exchange_name(ex)} {'product' if ex == 'coinbase' else 'pair'} rules"
+
+
+def quote_currency(symbol: str, exchange: Optional[str] = None) -> str:
+    """The currency a pair is priced in on the exchange: BTC-USD is a USDT pair on Binance."""
+    quote = tc.crypto_pair(symbol)[1]
+    return "USDT" if quote == "USD" and (exchange or tc.crypto_exchange()) == "binance" else quote
+
+
+def min_order_text(amount: float, symbol: str, exchange: Optional[str] = None) -> str:
+    """An exchange's minimum order value in the pair's quote currency: '$1.00' or '5 USDT'."""
+    quote = quote_currency(symbol, exchange)
+    return tc.fmt_money(amount) if quote == "USD" else f"{amount:g} {quote}"
+
+
+def usd_pair_note(symbol: str, exchange: Optional[str] = None) -> Optional[str]:
+    """Binance's few USD pairs are thin: a -USD symbol is priced from its USDT pair there - say so."""
+    if (exchange or tc.crypto_exchange()) != "binance" or tc.crypto_pair(symbol)[1] != "USD":
+        return None
+    return (f"{symbol} is priced from Binance's {tc.binance_symbol(symbol)} pair (Binance's few USD pairs are thin; "
+            "USDT trades close to, not exactly at, $1)")
 
 
 def size_text(q: Any, fractional: bool) -> str:
@@ -240,11 +292,12 @@ def size_position(side: str, entry: float, stop: float, target: Optional[float] 
     """Whole shares so a stop-out loses at most the risk budget, capped by max position and
     buying power (account x leverage). Uses tc.position_size for the first two caps.
 
-    Crypto (`market`, default the active one): a fractional size floored to `step` (the product's
+    Crypto (`market`, default the active one): a fractional size floored to `step` (the pair's
     size increment, default 1e-8), and the paper fees of the entry and the stop exit count toward
     the loss, so `max_loss` = risk_used + fees_at_stop stays within the budget. R is still the stop
-    distance; `fees_r` says what the round trip costs in R."""
-    s = dict(tc.DEFAULT_SETTINGS) if settings is None else settings
+    distance; `fees_r` says what the round trip costs in R. Without `settings` the defaults apply,
+    with the configured exchange's fee (Binance 0.1%, Coinbase 0.6% per fill)."""
+    s = default_settings() if settings is None else settings
     m = market or tc.market()
     frac = m.fractional
     step = float(step) if step else tc.qty_step(m)
@@ -321,7 +374,8 @@ def size_position(side: str, entry: float, stop: float, target: Optional[float] 
         "rr": None, "reward_per_share": None, "reward_at_target": None, "breakeven_win_rate_pct": None,
     }
     if frac:
-        out.update(step=step, fee_pct=round(fee, 6), fees_at_stop=round(fees_at_stop, 2),
+        out.update(exchange=s.get("crypto_exchange") or tc.crypto_exchange(),
+                   step=step, fee_pct=round(fee, 6), fees_at_stop=round(fees_at_stop, 2),
                    loss_per_unit=round(loss_per, 8), fees_r=round(rate * (entry + stop) / per_share, 4),
                    fees_at_target=None, rr_after_fees=None)
     if target is not None:
@@ -641,7 +695,8 @@ def sizing_section(sz: Dict[str, Any], budget: Dict[str, Any], warnings: List[st
             "risk_used", "notional", "account", "max_position_pct", "leverage", "capped_by", "rr")
     sec = {k: sz[k] for k in keys}
     if sz.get("market") == "crypto":     # what the broker and the budget need to count the fees
-        sec.update({k: sz[k] for k in ("market", "step", "fee_pct", "fees_at_stop", "max_loss", "fees_r")})
+        sec.update({k: sz[k] for k in ("market", "exchange", "step", "fee_pct", "fees_at_stop", "max_loss",
+                                       "fees_r")})        # exchange: whose size step and fee these are
     sec.update(budget_ok=budget["ok"], warnings=list(warnings), as_of=as_of)
     return sec
 
@@ -738,9 +793,13 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--risk-pct", type=_percent, help="risk per trade, %% of the account (e.g. 0.2)")
     c.add_argument("--max-position-pct", type=_percent, help="max position, %% of the account (e.g. 25)")
     c.add_argument("--min-rr", type=_nonneg, help="warn when reward:risk is below this (0 = off)")
+    tiers = ", ".join(f"{x['name']} {x['fee_pct']:g}" for x in tc.CRYPTO_EXCHANGES.values())
     c.add_argument("--crypto-fee-pct", type=_nonneg,
-                   help=f"paper fee per crypto fill, %% of notional (default {tc.DEFAULT_SETTINGS['crypto_fee_pct']:g}; "
-                        f"at most {MAX_FEE_PCT:g})")
+                   help=f"paper fee per crypto fill, %% of notional (default: the crypto exchange's entry-tier "
+                        f"taker fee - {tiers}; at most {MAX_FEE_PCT:g})")
+    c.add_argument("--crypto-exchange", type=str.lower, choices=tuple(tc.CRYPTO_EXCHANGES),
+                   help=f"where crypto prices come from (default {tc.DEFAULT_SETTINGS['crypto_exchange']}): "
+                        "public market data, no account or API key")
     tc.add_json_flag(c)
 
     sh = _exit1_on_usage_error(sub.add_parser(
@@ -802,6 +861,7 @@ def cmd_size(args: argparse.Namespace) -> int:
     sym = parse_symbol(raw_sym) if raw_sym else None
     market = tc.use_market_for(sym)      # crypto: the UTC day, fractional sizes, paper fees
     crypto = market.key == "crypto"
+    ex = tc.crypto_exchange() if crypto else None     # whose prices, pair rules and fee (Binance by default)
     unit = unit_word(sym)
     if args.save and not sym:
         raise ValueError("--save needs --symbol (the sizing is stored in that ticker's plan)")
@@ -837,17 +897,20 @@ def cmd_size(args: argparse.Namespace) -> int:
         if isinstance(qt, (int, float)):
             qd = tc.to_et(qt)
             when = f" at {qd.strftime('%H:%M' if qd.date() == now.date() else '%Y-%m-%d %H:%M')} {tc.tz_label()}"
-        notes.append(f"entry = last price {tc.fmt_price(last_price)}{when} ({'Coinbase' if crypto else 'Yahoo'}); "
+        notes.append(f"entry = last price {tc.fmt_price(last_price)}{when} ({exchange_name(ex) if crypto else 'Yahoo'}); "
                      "a market order fills wherever price is when it executes")
 
-    step = tick = None
-    if crypto and sym:          # Coinbase's size step and price tick (public, cached a day; best effort)
+    step = tick = min_funds = None
+    if crypto and sym:          # the exchange's size step and price tick (public, cached a day; best effort)
         try:
             info = tc.product_info(sym)
-            step, tick = info["base_increment"], info["quote_increment"]
+            step, tick, min_funds = info["base_increment"], info["quote_increment"], _num(info.get("min_market_funds"))
         except tc.FetchError as e:
-            notes.append(f"Coinbase product rules unavailable ({e}): size step {tc.fmt_qty(tc.qty_step())} "
+            notes.append(f"{rules_name(ex)} unavailable ({e}): size step {tc.fmt_qty(tc.qty_step())} "
                          "assumed, prices not checked against the tick")
+        usd = usd_pair_note(sym, ex)
+        if usd:
+            notes.append(usd)
     lv = resolve_levels(plan, args.entry, args.stop, args.target, args.side, last_price)
     notes = lv["notes"] + notes
     sz = size_position(lv["side"], lv["entry"], lv["stop"], lv["target"], settings,
@@ -865,6 +928,10 @@ def cmd_size(args: argparse.Namespace) -> int:
     used_plan = "plan" in lv["sources"].values()
     plan_date = str(plan.get("updated_at") or plan.get("created_at") or "")[:10] if plan and used_plan else None
     warnings = risk_checks(sz, settings, budget, items, plan_date or None, now.strftime("%Y-%m-%d"), unit)
+    if crypto and min_funds and 0 < sz["notional"] < min_funds:
+        warnings.append(f"notional {tc.fmt_money(sz['notional'])} is below {exchange_name(ex)}'s "
+                        f"{min_order_text(min_funds, sym, ex)} minimum order for {sym} - a real order this small "  # type: ignore[arg-type]
+                        "would be rejected")
 
     if used_plan:
         notes.insert(0, "levels from the saved plan: " + ", ".join(
@@ -875,8 +942,8 @@ def cmd_size(args: argparse.Namespace) -> int:
     if sz["target"] is None and not any("saved target" in n for n in notes):
         notes.append("no target: add --target to check reward:risk")
     if lv["side"] == "short" and crypto:
-        notes.append("spot crypto cannot be sold short on Coinbase (that needs margin or derivatives); the "
-                     "paper broker simulates the short like a stock short")
+        notes.append(f"spot crypto cannot be sold short on {exchange_name(ex)} (that needs margin or derivatives); "
+                     "the paper broker simulates the short like a stock short")
     elif lv["side"] == "short":
         notes.append("short selling needs a margin account and shares available to borrow "
                      "(hard-to-borrow fees may apply)")
@@ -914,7 +981,7 @@ def cmd_size(args: argparse.Namespace) -> int:
     })
     code = 0
     if crypto:
-        res.update(unit=unit, tick=tick)
+        res.update(unit=unit, tick=tick, min_order=min_funds)
     if args.save:
         if sz["shares"] == 0:
             res["save_error"] = f"not saved: the size is 0 {unit}"
@@ -947,11 +1014,35 @@ def save_sizing(sym: str, lv: Dict[str, Any], section: Dict[str, Any],
     return dropped
 
 
+def saved_exchange() -> Optional[str]:
+    """The crypto exchange settings.json names (None when it names none: the default applies)."""
+    stored = tc.load_json("settings.json", {})
+    value = stored.get("crypto_exchange") if isinstance(stored, dict) else None
+    return str(value).strip().lower() if value else None
+
+
 def settings_view(s: Dict[str, Any]) -> Dict[str, Any]:
-    return {"settings": {k: s[k] for k in NUMERIC_SETTINGS + INT_SETTINGS},
+    ex = s.get("crypto_exchange") or tc.crypto_exchange()
+    view = {k: s[k] for k in NUMERIC_SETTINGS + INT_SETTINGS}
+    view["crypto_exchange"] = ex
+    return {"settings": view,
             "risk_per_trade_dollars": round(s["account_size"] * s["risk_per_trade_pct"] / 100.0, 2),
             "max_position_dollars": round(s["account_size"] * s["max_position_pct"] / 100.0, 2),
+            # crypto prices: the exchange in use, its entry-tier fee, and the choice saved in settings.json
+            "crypto": {"exchange": ex, "name": exchange_name(ex), "fee_pct": s["crypto_fee_pct"],
+                       "exchange_fee_pct": exchange_fee_pct(ex), "saved_exchange": saved_exchange()},
             "warnings": settings_warnings(s)}
+
+
+def crypto_relevant(v: Dict[str, Any]) -> bool:
+    """Whether the settings card shows the crypto row: a crypto view or change, a fee that is not the
+    exchange's own, or a non-default exchange saved by the user. A stock-only card stays as it was."""
+    c = v.get("crypto") or {}
+    if {"crypto_fee_pct", "crypto_exchange"} & set(v.get("changed") or ()) or v.get("market") == "crypto":
+        return True
+    if c and abs(float(c["fee_pct"]) - float(c["exchange_fee_pct"])) > 1e-9:
+        return True
+    return (c.get("saved_exchange") or tc.DEFAULT_SETTINGS["crypto_exchange"]) != tc.DEFAULT_SETTINGS["crypto_exchange"]
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -970,15 +1061,40 @@ def cmd_config(args: argparse.Namespace) -> int:
         updates["min_reward_risk"] = args.min_rr
     if args.crypto_fee_pct is not None:
         if args.crypto_fee_pct > MAX_FEE_PCT:
-            raise ValueError(f"--crypto-fee-pct is the fee per fill in percent (0.6 = 0.6%); above "
+            raise ValueError(f"--crypto-fee-pct is the fee per fill in percent (0.1 = 0.1%); above "
                              f"{MAX_FEE_PCT:g} is not a real fee tier")
         updates["crypto_fee_pct"] = args.crypto_fee_pct
+    if args.crypto_exchange is not None:
+        updates["crypto_exchange"] = args.crypto_exchange
     s = clean_settings(tc.save_settings(updates) if updates else tc.load_settings())
     res = settings_view(s)
     res["changed"] = sorted(updates)
     res["settings_file"] = str(tc.home() / "settings.json")
+    res["notes"] = exchange_notes(updates, s)
     tc.emit(res, args.json, render_config)
     return 0
+
+
+def exchange_notes(updates: Dict[str, Any], s: Dict[str, Any]) -> List[str]:
+    """What else a --crypto-exchange change means: an environment override that still wins, and a
+    fee of the user's own that does not follow the exchange."""
+    if "crypto_exchange" not in updates:
+        return []
+    env = (os.environ.get("DAYTRADER_CRYPTO_EXCHANGE") or "").strip().lower()
+    if env and env != updates["crypto_exchange"]:
+        return [f"$DAYTRADER_CRYPTO_EXCHANGE={env} overrides the saved setting while it is set: crypto prices "
+                f"still come from {exchange_name(env) if env in tc.CRYPTO_EXCHANGES else env} here"]
+    ex = s["crypto_exchange"]
+    name, fee = exchange_name(ex), exchange_fee_pct(ex)
+    stored = tc.load_json("settings.json", {})
+    own_fee = "crypto_fee_pct" not in updates and isinstance(stored, dict) and "crypto_fee_pct" in stored
+    notes = [f"new crypto sizes and tickets use {name} prices and pair rules"
+             + ("" if own_fee or "crypto_fee_pct" in updates else f", and its {fee:g}% entry-tier taker fee")
+             + "; paper trades already open keep the exchange that priced them"]
+    if own_fee:
+        notes.append(f"your own crypto_fee_pct of {s['crypto_fee_pct']:g}% stays; {name}'s entry-tier taker fee is "
+                     f"{fee:g}% (risk.py config --crypto-fee-pct {fee:g})")
+    return notes
 
 
 def cmd_show(args: argparse.Namespace) -> int:
@@ -1101,7 +1217,7 @@ def render_size(r: Dict[str, Any]) -> str:
     card = f"{r['order']} @ {tc.fmt_price(r['entry'])} · STOP {tc.fmt_price(r['stop'])}"
     if r["target"] is not None:
         card += f" · TARGET {tc.fmt_price(r['target'])}"
-    card += " · PAPER" + (" · Coinbase prices" if crypto else "")
+    card += " · PAPER" + (f" · {exchange_name(r.get('exchange'))} prices" if crypto else "")
     if not r["shares"]:
         card = (f"0 {unit.upper() if crypto else 'SHARES'} - no trade at entry {tc.fmt_price(r['entry'])} / stop "
                 f"{tc.fmt_price(r['stop'])} with this risk (see the first ! line)")
@@ -1172,19 +1288,28 @@ def _settings_lines(v: Dict[str, Any]) -> List[str]:
         _row("daily limits", f"max loss {tc.fmt_money(s['daily_max_loss'])} · max open risk "
                              f"{tc.fmt_money(s['max_open_risk'])} · {s['max_trades_per_day']} trades · "
                              f"stop after {s['max_consecutive_losses']} losses in a row"),
-    ] + ([_row("crypto fees", f"{s['crypto_fee_pct']:g}% per fill (paper; Coinbase prices)")]
-         if "crypto_fee_pct" in (v.get("changed") or ()) or v.get("market") == "crypto"
-         or s.get("crypto_fee_pct") != tc.DEFAULT_SETTINGS["crypto_fee_pct"] else [])
+    ] + ([_row("crypto fees", crypto_fee_text(v))] if crypto_relevant(v) else [])
+
+
+def crypto_fee_text(v: Dict[str, Any]) -> str:
+    """'0.1% per fill (paper; Binance prices)', plus the exchange's own fee when yours differs."""
+    c, fee = v["crypto"], float(v["settings"]["crypto_fee_pct"])
+    text = f"{fee:g}% per fill (paper; {c['name']} prices)"
+    if abs(fee - float(c["exchange_fee_pct"])) > 1e-9:
+        text += f" · {c['name']}'s entry-tier taker fee is {float(c['exchange_fee_pct']):g}%"
+    return text
 
 
 def render_config(r: Dict[str, Any]) -> str:
     lines = ["RISK SETTINGS"]
     lines += _settings_lines(r)
     lines += [f"! {w}" for w in r["warnings"]]
+    lines += [f"- {n}" for n in r.get("notes") or []]
     if r["changed"]:
         lines.append(f"Saved {', '.join(r['changed'])} to {r['settings_file']}.")
     else:
-        lines.append("Change with: risk.py config --account N --risk-pct X --max-position-pct X --min-rr X "
+        crypto = (" --crypto-fee-pct X --crypto-exchange " + "|".join(tc.CRYPTO_EXCHANGES)) if crypto_relevant(r) else ""
+        lines.append(f"Change with: risk.py config --account N --risk-pct X --max-position-pct X --min-rr X{crypto} "
                      "(daily limits: budget skill).")
     return "\n".join(lines)
 

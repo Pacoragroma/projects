@@ -17,11 +17,12 @@ Usage:
   python3 scripts/entry.py TSLA --level 365 --side long            # --level implies --setup level
   python3 scripts/entry.py NVDA --setup pdh --watch --interval 60 --max-minutes 90 --save
   python3 scripts/entry.py AMD --date 2026-10-29 --json           # replay a past session
-  python3 scripts/entry.py BTC-USD --or-start 04:00 --save        # crypto: UTC day, no opening bell
+  python3 scripts/entry.py BTC-USDT --or-start 04:00 --save       # crypto: UTC day, no opening bell
 
-Crypto (a Coinbase product such as BTC-USD) trades 24/7: times are UTC, a session is a UTC day
-(VWAP and PDH/PDL use UTC days), the ORB starts at 00:00 UTC unless --or-start moves it, and the
-default cutoff is 2 hours after the opening-range start.
+Crypto (a pair such as BTC-USDT; BTC-USD works too) trades 24/7: times are UTC, a session is a UTC
+day (VWAP and PDH/PDL use UTC days), the ORB starts at 00:00 UTC unless --or-start moves it, and the
+default cutoff is 2 hours after the opening-range start. Prices come from Binance's public market
+data by default, or Coinbase's (the crypto_exchange setting, or $DAYTRADER_CRYPTO_EXCHANGE).
 
 Exit codes: 0 ok (WAITING, TRIGGERED or EXPIRED), 1 bad input, 2 data source unreachable,
 130 watch stopped with Ctrl-C.
@@ -110,7 +111,7 @@ def normalize_bars(bars: Sequence[tc.Bar]) -> List[tc.Bar]:
     """Snap bars to the 5-minute grid, merge duplicates, round prices to 4 decimals, oldest first.
 
     Yahoo can stamp the bar still forming with the last trade time (e.g. 10:22:37) instead of
-    its start (10:20); snapping keeps "is this bar complete?" honest. Coinbase prices are exact
+    its start (10:20); snapping keeps "is this bar complete?" honest. Crypto exchanges quote exact
     decimals (and sub-cent coins need more than 4), so crypto prices are not rounded.
     """
     out: Dict[int, tc.Bar] = {}
@@ -486,7 +487,7 @@ def find_trigger(session_bars: Sequence[tc.Bar], setup: str = "orb", side: Optio
         stop = float(_px(stop))
         entry_px = float(_px(entry))
         # Sub-penny prints can round entry and stop to the same price: keep the stop one tick away
-        # (crypto: the product's quote_increment when the caller knows it).
+        # (crypto: the pair's price tick from the exchange's rules when the caller knows it).
         tick = float(p.get("tick") or fallback_tick(entry_px))
         if s == "long" and stop >= entry_px:
             stop = float(_px(entry_px - tick))
@@ -683,8 +684,14 @@ def _as_of_hhmm(res: Dict[str, Any]) -> str:
 
 
 def _unit(symbol: str) -> str:
-    """What one unit of size is: a share, or one coin of a crypto product ('BTC' for BTC-USD)."""
-    return symbol.split("-")[0] if _crypto() else "share"
+    """What one unit of size is: a share, or one coin of a crypto pair ('BTC' for BTC-USDT, BTCUSDT
+    or BTC-USD)."""
+    if not _crypto():
+        return "share"
+    try:
+        return tc.crypto_pair(symbol)[0]
+    except ValueError:
+        return symbol.split("-")[0]
 
 
 def _vol(v: float) -> str:
@@ -821,7 +828,8 @@ def render(res: Dict[str, Any]) -> str:
 def build_parser() -> argparse.ArgumentParser:
     p = tc.make_parser("Watch a 5-minute setup (opening-range breakout, VWAP reclaim, price level, "
                        "previous-day high/low break) and report the moment it triggers.")
-    p.add_argument("symbol", help="ticker, e.g. TSLA, or a Coinbase product such as BTC-USD")
+    p.add_argument("symbol", help="ticker, e.g. TSLA, or a crypto pair such as BTC-USDT (Binance prices by "
+                   "default, or Coinbase)")
     p.add_argument("--setup", type=str.lower, choices=SETUPS,
                    help="orb (default), vwap, level, pdh, pdl; --level alone implies level")
     p.add_argument("--side", type=str.lower, choices=("long", "short", "both"),
@@ -891,21 +899,42 @@ def fetch(symbol: str, range_: str, ttl: Optional[float] = None) -> Tuple[List[t
         bars, meta = tc.fetch_bars(symbol, "5m", range_, ttl=ttl)
     except tc.FetchError as e:
         msg = str(e)
-        if _crypto() and "HTTP 404" in msg:
-            raise ValueError(f"{symbol}: Coinbase has no such product (crypto symbols look like BTC-USD)") from e
+        # An unknown pair is bad input: Coinbase answers 404, Binance 400 ("has no spot pair").
+        if _crypto() and ("HTTP 404" in msg or "has no spot pair" in msg):
+            raise ValueError(f"{symbol}: {tc.exchange_name()} has no such pair (crypto pairs look like BTC-USDT "
+                             "or BTC-USD)") from e
         if "HTTP 404" in msg or "Yahoo: Not Found" in msg:
             raise ValueError(f"{symbol}: Yahoo has no chart for this symbol (unknown or delisted ticker?)") from e
         raise
     if not bars:
         if _crypto():
-            raise ValueError(f"{symbol}: Coinbase returned no 5-minute candles (delisted or not trading?)")
+            raise ValueError(f"{symbol}: {tc.exchange_name()} returned no 5-minute candles (delisted or not trading?)")
         raise ValueError(f"{symbol}: Yahoo returned no 5-minute bars (thinly traded or not a US listing?)")
     return bars, meta
 
 
+def price_source_note(symbol: str, meta: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Crypto: a note when the exchange prices `symbol` from a pair in another currency (Binance
+    has few, thin USD pairs, so BTC-USD comes from BTCUSDT). None for stocks and pairs priced as typed."""
+    m = meta or {}
+    if not _crypto() or not m.get("symbol") or not m.get("currency"):
+        return None
+    try:
+        quote = tc.crypto_pair(symbol)[1]
+    except ValueError:
+        return None
+    ccy = str(m["currency"]).upper()
+    if ccy == quote:
+        return None
+    name = tc.exchange_name()
+    return (f"{symbol} is priced from {name}'s {m['symbol']} pair, quoted in {ccy} "
+            f"({name}'s few {quote} pairs are thin)")
+
+
 def price_tick(symbol: str) -> Optional[float]:
-    """Crypto: the product's price increment (Coinbase quote_increment), None if unreachable -
-    find_trigger then falls back to fallback_tick. Stocks: None (cents; $0.0001 below $1)."""
+    """Crypto: the pair's price tick (tc.product_info's quote_increment: Binance tickSize, Coinbase
+    quote_increment), None if unreachable - find_trigger then falls back to fallback_tick.
+    Stocks: None (cents; $0.0001 below $1)."""
     if not _crypto():
         return None
     try:
@@ -918,11 +947,15 @@ def check_once(opts: Dict[str, Any], ttl: Optional[float] = None) -> Dict[str, A
     bars, meta = fetch(opts["symbol"], opts["range"], ttl)
     params = opts["params"]
     if _crypto():
-        if "tick" not in opts:                 # once per run (the product list is cached for a day)
+        if "tick" not in opts:                 # once per run (the pair rules are cached for a day)
             opts["tick"] = price_tick(opts["symbol"])
         params = dict(params, tick=opts["tick"])
-    return evaluate(opts["symbol"], bars, meta, tc.now_et(), opts["setup"], opts["side"],
-                    params, opts["date"])
+    res = evaluate(opts["symbol"], bars, meta, tc.now_et(), opts["setup"], opts["side"],
+                   params, opts["date"])
+    note = price_source_note(opts["symbol"], meta)
+    if note:
+        res["notes"].append(note)
+    return res
 
 
 def save_result(res: Dict[str, Any]) -> None:
@@ -1000,7 +1033,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if e.code == 2:
             return 1
         raise
-    tc.use_market_for(args.symbol)       # crypto (BTC-USD): UTC days, 24/7, Coinbase prices
+    tc.use_market_for(args.symbol)       # crypto (BTC-USDT): UTC days, 24/7, Binance or Coinbase prices
     opts = options_from_args(args, tc.now_et())
     if args.watch:
         return watch(opts, args.json, args.save)

@@ -13,8 +13,9 @@ from contextlib import redirect_stderr, redirect_stdout
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import helpers  # noqa: E402
-from helpers import (SKILLS, TempHomeTestCase, bars_from_closes, fake_bars, tc, write_coinbase_quote,  # noqa: E402
-                     write_fixture, yahoo_chart_url, yahoo_payload)
+from helpers import (SKILLS, TempHomeTestCase, bars_from_closes, fake_bars, tc, utc_ts,  # noqa: E402
+                     write_binance_quote, write_coinbase_quote, write_fixture, yahoo_chart_url, yahoo_payload)
+from unittest import mock  # noqa: E402
 
 bud = helpers.load_skill_module("budget", "budget")
 SCRIPT = helpers.skill_script("budget", "budget.py")
@@ -856,6 +857,76 @@ class CryptoBudgetTests(TempHomeTestCase):
         self.assertEqual((j["date"], j["marks"]["prices"], j["marks"]["unrealized_total"]),
                          ("2026-10-31", {"BTC-USD": 102000.0}, -4.54))
         self.assertEqual(j["open_risk"]["total"], 34.36)
+
+
+class BinanceBudgetTests(TempHomeTestCase):
+    """Crypto on Binance (the default): its 0.1% fee, BTC-USDT / BTCUSDT pairs, its size step, and --mark
+    asking each trade's own exchange - never the other one."""
+    NOW = "2026-10-31T02:00:00Z"
+
+    def setUp(self):
+        super().setUp()
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "binance"      # temp_home restores the environment
+
+    def json_of(self, *argv):
+        code, out, err = run_main(*argv, "--json")
+        return code, json.loads(out)
+
+    def test_check_counts_binance_fees_and_names_the_coin(self):
+        code, j = self.json_of("check", "--symbol", "BTC-USDT", "--entry", "101250", "--stop", "99000", "--qty", "0.01")
+        # $22.50 of price risk + 0.1% x (101250 + 99000) x 0.01 = $2.00 of fees at the stop
+        self.assertEqual((code, j["verdict"], j["fee_pct"], j["fees_at_stop"], j["unit"], j["date"]),
+                         (0, "OK", 0.1, 2.0, "BTC", "2026-10-31"))
+        self.assertAlmostEqual(j["new_risk"], 24.5025, places=6)
+        self.assertTrue(any("includes $2.00 of paper fees at the stop (0.1% per fill" in n for n in j["notes"]), j["notes"])
+        code, j = self.json_of("check", "--symbol", "BTCUSDT", "--risk", "10")              # the compact pair works too
+        self.assertEqual((j["verdict"], j["unit"], j["market"]), ("OK", "BTC", "crypto"))
+
+    def test_check_fits_the_size_to_this_exchanges_step(self):
+        sizing = {"shares": 0.02274, "side": "long", "entry": 100000.0, "stop": 98000.0, "market": "crypto",
+                  "exchange": "binance", "step": 1e-05, "fee_pct": 0.1}
+        tc.save_plan({"symbol": "BTC-USDT", "side": "long", "entry": 100000.0, "stop": 98000.0, "sizing": sizing})
+        tc.save_ledger(ledger(btc(symbol="BTC-USDT", status="closed", pnl=-140.0, exit_price=99000.0, fee_pct=0.1,
+                                  exchange="binance", closed_at="2026-10-31T01:30:00+00:00")))
+        code, j = self.json_of("check", "--symbol", "BTC-USDT", "--qty", "0.1")
+        # $10 left today / $2,198 per BTC (stop distance + 0.1% fees) = 0.00454959 -> 0.00454 on Binance's step
+        self.assertEqual((code, j["verdict"], j["max_shares_now"]), (bud.EXIT_BLOCKED, "BLOCKED", 0.00454))
+        tc.save_plan({"symbol": "BTC-USDT", "side": "long", "entry": 100000.0, "stop": 98000.0,
+                      "sizing": dict(sizing, exchange="coinbase", step=1e-8)})
+        code, j = self.json_of("check", "--symbol", "BTC-USDT", "--qty", "0.1")       # another exchange's step: not used
+        self.assertEqual(j["max_shares_now"], 0.00454959)
+
+    def test_mark_prices_each_trade_on_its_own_exchange(self):
+        fx = self.home / "fx"
+        write_binance_quote(fx, "BTC-USDT", 101500.0, when_ts=utc_ts("2026-10-31", "01:59"))   # the BTCUSDT ticker
+        write_coinbase_quote(fx, "BTC-USD", 102000.0, when="2026-10-31T01:59:00Z")
+        tc.save_ledger(ledger(btc("TRADE-20261031-001", symbol="BTC-USDT", fee_pct=0.1, exchange="binance")))
+        with mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(fx)}):
+            code, j = self.json_of("status", "--market", "crypto", "--mark")
+        # gross (101500 - 101234.56) x 0.01 = 2.65 - 0.1% x (101234.56 + 101500) x 0.01 = 2.03 of fees
+        self.assertEqual((j["marks"]["prices"], j["marks"]["unrealized_total"]), ({"BTC-USDT": 101500.0}, 0.63))
+        self.assertEqual(j["positions"][0]["exchange"], "binance")
+        # the same pair open on both exchanges: each is marked on its own (a row from before the field: Coinbase)
+        tc.save_ledger(ledger(btc("TRADE-20261031-001", fee_pct=0.1, exchange="binance"), btc("TRADE-20261031-002")))
+        with mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(fx)}):
+            code, j = self.json_of("status", "--market", "crypto", "--mark")
+        self.assertEqual(j["marks"]["prices"], {"BTC-USD (Binance)": 101500.0, "BTC-USD (Coinbase)": 102000.0})
+        self.assertEqual({m["id"]: (m["exchange"], m["last"], m["unrealized"]) for m in j["marks"]["positions"]},
+                         {"TRADE-20261031-001": ("binance", 101500.0, 0.63),
+                          "TRADE-20261031-002": ("coinbase", 102000.0, -4.54)})
+        self.assertEqual(os.environ["DAYTRADER_CRYPTO_EXCHANGE"], "binance")          # the override is put back
+        tc.save_ledger(ledger(btc(exchange="kraken")))
+        with mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(fx)}), self.assertRaises(tc.FetchError) as cm:
+            run_main("status", "--market", "crypto", "--mark")
+        self.assertIn("ledger.json names exchange 'kraken'", str(cm.exception))
+        code, j = self.json_of("status", "--market", "crypto")                         # the budget itself still counts it
+        self.assertEqual(j["open_risk"]["total"], 34.36)
+
+    def test_mark_help_names_both_exchanges(self):
+        sub = [a for a in bud.build_parser()._actions if isinstance(a, bud.argparse._SubParsersAction)][0]
+        helps = {o: a.help for a in sub.choices["status"]._actions for o in a.option_strings}
+        self.assertIn("crypto from the exchange that priced each trade, Binance or Coinbase", helps["--mark"])
+        self.assertNotIn("Coinbase for crypto", helps["--mark"])
 
 
 class SkillDocTests(unittest.TestCase):

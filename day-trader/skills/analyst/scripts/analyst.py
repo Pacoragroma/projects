@@ -7,8 +7,10 @@ brief   Trend (price vs the 20/50-day SMAs, 20-day regression slope), key levels
         available, else vs the 20-day average), today's gap, and SEC context (company, shares
         outstanding, the last 30 days of filings: 8-K items, 10-Q/10-K, possible dilution,
         insider Form 4s). Daily bars are required; 5-minute bars and SEC data are optional.
-        Crypto pairs (BTC-USD): Coinbase candles, a "day" is a UTC day (levels = the prior UTC
-        day), no gap (24/7 trading) and SEC is not applicable (not asked).
+        Crypto pairs (BTC-USDT; BTC-USD and BTCUSDT work too): candles from Binance's public market
+        data by default, or Coinbase's (the crypto_exchange setting, or $DAYTRADER_CRYPTO_EXCHANGE);
+        a "day" is a UTC day (levels = the prior UTC day), no gap (24/7 trading) and SEC is not
+        applicable (not asked).
 review  Analytics of the closed paper trades in ledger.json (written by the broker skill):
         win rate, average win/loss in $ and R, profit factor, expectancy, max drawdown,
         best/worst trade, breakdowns by setup, side, entry hour, time-of-day window, exit
@@ -22,7 +24,7 @@ Usage:
   python3 scripts/analyst.py brief NVDA --filing-days 90 --json
   python3 scripts/analyst.py review                            # closed trades, last 30 days
   python3 scripts/analyst.py review --days 90 --symbol TSLA --json
-  python3 scripts/analyst.py brief BTC-USD                     # crypto: Coinbase, UTC days, no SEC
+  python3 scripts/analyst.py brief BTC-USDT                    # crypto: Binance, UTC days, no SEC
   python3 scripts/analyst.py review --market crypto            # only crypto trades
 
 Exit codes: 0 ok, 1 bad input or state, 2 data source unreachable.
@@ -43,7 +45,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple  # noqa:
 
 DAILY_RANGE = "6mo"
 INTRADAY_RANGE = "1mo"           # ~21 sessions of 5m bars: a 20-session time-of-day baseline
-CRYPTO_INTRADAY_RANGE = "21d"    # 20 past UTC days + today (Coinbase: 300 candles per request)
+CRYPTO_INTRADAY_RANGE = "21d"    # 20 past UTC days + today (Binance: 1,000 candles per request, Coinbase 300)
 BAR_SECONDS = 300
 RVOL_SESSIONS = 20
 MIN_RVOL_SESSIONS = 3
@@ -92,18 +94,29 @@ def _mean(xs: Sequence[float]) -> Optional[float]:
     return sum(xs) / len(xs) if xs else None
 
 
+def _places(ref: Optional[float], crypto: Optional[bool] = None) -> int:
+    """Decimals for a price (or a difference next to price `ref`): 2 at $1 and up, else 4; a sub-cent
+    crypto coin keeps 4 significant digits (0.00001234), as tc.fmt_price shows it. `crypto`
+    defaults to the active market."""
+    if ref is None or abs(ref) >= 1:
+        return 2
+    if ref and (tc.market().fractional if crypto is None else crypto):
+        return max(4, 3 - int(math.floor(math.log10(abs(ref)))))
+    return 4
+
+
 def _rpx(x: Optional[float]) -> Optional[float]:
-    """Round a price for JSON: cents at $1 and up, 4 decimals below."""
+    """Round a price for JSON: cents at $1 and up, 4 decimals below (sub-cent coins: see _places)."""
     if x is None:
         return None
-    return round(x, 2 if abs(x) >= 1 else 4)
+    return round(x, _places(x))
 
 
 def _rdiff(x: Optional[float], ref: Optional[float]) -> Optional[float]:
     """Round a price difference at the tick of the price it belongs to."""
     if x is None:
         return None
-    v = round(x, 2 if ref is None or abs(ref) >= 1 else 4)
+    v = round(x, _places(ref))
     return 0.0 if v == 0 else v
 
 
@@ -130,9 +143,10 @@ def _pct_from(price: Optional[float], ref: Optional[float]) -> Optional[float]:
     return (price / ref - 1.0) * 100.0
 
 
-def fmt_diff(x: float, ref: Optional[float]) -> str:
+def fmt_diff(x: float, ref: Optional[float], crypto: Optional[bool] = None) -> str:
     """Signed price difference at the price's tick: +1.13 (or +0.0123 under $1)."""
-    return f"{x:+,.2f}" if ref is None or abs(ref) >= 1 else f"{x:+.4f}"
+    places = _places(ref, crypto)
+    return f"{x:+,.2f}" if places == 2 else f"{x:+.{places}f}"
 
 
 def fmt_r(x: Optional[float]) -> str:
@@ -168,6 +182,40 @@ def market_phase(now: datetime) -> str:
     return "open"
 
 
+def coin(symbol: str) -> str:
+    """The base coin of a crypto pair: 'BTC' for BTC-USDT, BTCUSDT or BTC-USD."""
+    try:
+        return tc.crypto_pair(symbol)[0]
+    except ValueError:
+        return symbol.split("-")[0]
+
+
+def same_symbol(a: Any, b: str) -> bool:
+    """Is ledger symbol `a` the ticker `b`? A crypto pair matches its other spelling (BTCUSDT =
+    BTC-USDT); a stock only itself."""
+    a, b = str(a or "").strip().upper(), str(b or "").strip().upper()
+    if a == b:
+        return True
+    return tc.is_crypto_symbol(a) and tc.is_crypto_symbol(b) and tc.crypto_pair(a) == tc.crypto_pair(b)
+
+
+def price_source_note(symbol: str, meta: Dict[str, Any]) -> Optional[str]:
+    """Crypto: a note when the exchange prices `symbol` from a pair in another currency (Binance has
+    few, thin USD pairs, so BTC-USD comes from BTCUSDT). None for stocks and pairs priced as typed."""
+    if not tc.market().fractional or not meta.get("symbol") or not meta.get("currency"):
+        return None
+    try:
+        quote = tc.crypto_pair(symbol)[1]
+    except ValueError:
+        return None
+    ccy = str(meta["currency"]).upper()
+    if ccy == quote:
+        return None
+    name = tc.exchange_name()
+    return (f"{symbol} is priced from {name}'s {meta['symbol']} pair, quoted in {ccy} "
+            f"({name}'s few {quote} pairs are thin)")
+
+
 def trade_market(t: Dict[str, Any]) -> tc.Market:
     """A ledger row's market: from its symbol (BTC-USD -> crypto), else its `market` field, else US."""
     sym = str(t.get("symbol") or "").strip()
@@ -189,7 +237,8 @@ def clean_daily(bars: Sequence[tc.Bar], today: str, now_minute: int) -> List[tc.
 
     Today's bar is dropped before 09:30 ET (it would be pre-market noise or, in a replay, the
     future). A bar stamped in the evening ET is a UTC-midnight stamp: it belongs to the next date.
-    Crypto: Coinbase stamps each daily candle at 00:00 UTC, the UTC day it covers.
+    Crypto: the exchange (Binance or Coinbase) stamps each daily candle at 00:00 UTC, the UTC day
+    it covers.
     """
     by_date: Dict[str, tc.Bar] = {}
     for b in sorted(bars, key=lambda x: x.ts):
@@ -319,7 +368,8 @@ def time_of_day_rvol(today_bars: Sequence[tc.Bar], past: Dict[str, List[tc.Bar]]
                      now_minute: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Today's volume through the last completed 5m slot vs the average of past sessions through
     the same clock time. Returns (result, reason-if-none). Crypto has no half days or early
-    closes; a quiet stretch there just means no trades (Coinbase sends no empty candles)."""
+    closes; a quiet stretch there just means no trades (an exchange may send no candle for a
+    5-minute slot without trades, as Coinbase does)."""
     always_open = tc.market().every_day
     cutoff = min((now_minute // 5) * 5, tc.MARKET_CLOSE)
     if today_bars and not always_open:
@@ -536,7 +586,7 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
     meta = meta or {}
     mkt = tc.market()
     crypto, tz = mkt.every_day, mkt.tz_label
-    src = "Coinbase" if crypto else "Yahoo"
+    src = tc.exchange_name() if crypto else "Yahoo"   # crypto: Binance (default) or Coinbase
     today = now.strftime("%Y-%m-%d")
     now_ts = now.timestamp()
     now_minute = now.hour * 60 + now.minute
@@ -565,6 +615,9 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
     sessions5 = tc.group_sessions(intraday)
     today_bars = sessions5.get(today, [])
     past5 = {d: s for d, s in sessions5.items() if d < today}
+    priced_from = price_source_note(symbol, meta) if crypto else None
+    if priced_from:
+        notes.append(priced_from)
     if intraday_error:
         notes.append(f"5-minute bars unavailable ({intraday_error}); relative volume uses daily volume")
 
@@ -592,7 +645,7 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
             notes.append(f"replay at {now.strftime('%H:%M')} {tz}: today's first 5-minute bar is not finished yet - "
                          "showing the last completed session")
         elif phase == "open":
-            warnings.append("no bars for today's UTC day yet (delayed data or a halted product?)" if crypto else
+            warnings.append("no bars for today's UTC day yet (delayed data or a halted pair?)" if crypto else
                             "market hours but no bars for today yet (holiday, halt or delayed data?)")
         if (now.date() - datetime.strptime(session.date, "%Y-%m-%d").date()).days > STALE_DAILY_DAYS:
             warnings.append(f"latest daily bar is from {session.date} - stale data (halted or delisted?)")
@@ -605,7 +658,7 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
     if is_today and phase == "open" and today_bars:
         quiet = now_minute - (tc.minute_of_day(today_bars[-1].ts) + 5)
         if quiet >= QUIET_MINUTES:
-            why = "no trades, a halted product or delayed data?" if crypto else "halt, early close or delayed data?"
+            why = "no trades, a halted pair or delayed data?" if crypto else "halt, early close or delayed data?"
             warnings.append(f"no 5-minute bars since {tc.hhmm(tc.minute_of_day(today_bars[-1].ts) + 5)} {tz} "
                             f"({why})")
 
@@ -621,7 +674,7 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
     w20 = hist[-20:]
     liquidity = {"avg_dollar_volume_20d": round(sum(b.close * b.volume for b in w20) / len(w20)) if w20 else None,
                  "avg_volume_20d": round(sum(b.volume for b in w20) / len(w20)) if w20 else None,
-                 "sessions": len(w20), "unit": (symbol.split("-")[0] if crypto else "shares")}
+                 "sessions": len(w20), "unit": (coin(symbol) if crypto else "shares")}
 
     rvol: Optional[Dict[str, Any]] = None
     too_early = is_today and phase == "open" and now_minute < tc.MARKET_OPEN + 5
@@ -683,6 +736,7 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
     return {
         "symbol": symbol, "name": name, "as_of": now.isoformat(timespec="seconds"), "market": phase,
         "market_type": mkt.key, "tz": tz,
+        **({"exchange": tc.crypto_exchange()} if crypto else {}),   # whose prices: binance | coinbase
         "price": _rpx(last),
         "session": session_view,
         "prior_day": ({"date": hist[-1].date, "high": _rpx(hist[-1].high), "low": _rpx(hist[-1].low),
@@ -707,10 +761,18 @@ def build_brief(symbol: str, daily_raw: Sequence[tc.Bar], intraday_raw: Sequence
 
 def gather_brief(symbol: str, now: datetime, with_sec: bool = True,
                  filing_days: int = FILING_DAYS) -> Dict[str, Any]:
-    """Fetch (daily required; 5m and SEC optional) and build the brief. Crypto: Coinbase candles
-    and no SEC request (the active market must be the symbol's: tc.use_market_for)."""
+    """Fetch (daily required; 5m and SEC optional) and build the brief. Crypto: candles from the
+    configured exchange (Binance by default, or Coinbase) and no SEC request (the active market
+    must be the symbol's: tc.use_market_for). A pair the exchange does not list is bad input."""
     crypto = tc.is_crypto_symbol(symbol)
-    daily, meta = tc.fetch_bars(symbol, "1d", DAILY_RANGE)
+    try:
+        daily, meta = tc.fetch_bars(symbol, "1d", DAILY_RANGE)
+    except tc.FetchError as e:
+        # An unknown pair: Binance answers 400 ("has no spot pair"), Coinbase 404.
+        if crypto and ("has no spot pair" in str(e) or "HTTP 404" in str(e)):
+            raise ValueError(f"{symbol}: {tc.exchange_name()} has no such pair (crypto pairs look like "
+                             "BTC-USDT or BTC-USD)") from e
+        raise
     intraday: List[tc.Bar] = []
     intraday_error = None
     try:
@@ -741,10 +803,12 @@ def render_brief(b: Dict[str, Any]) -> str:
     stamp = now.strftime("%a %Y-%m-%d %H:%M") if now else b["as_of"]
     name = f" · {b['name']}" if b.get("name") else ""
     words = CRYPTO_WORDS if crypto else MARKET_WORDS.get(b["market"], b["market"])
-    lines = [f"BRIEF · {b['symbol']}{name} · {stamp} {mkt.tz_label} · {words}"]
+    source = tc.CRYPTO_EXCHANGES.get(b.get("exchange") or "", {}).get("name") if crypto else None
+    lines = [f"BRIEF · {b['symbol']}{name} · {stamp} {mkt.tz_label} · {words}"
+             + (f" · {source} prices" if source else "")]
     chg = ""
     if s["change"] is not None:
-        chg = (f"  {fmt_diff(s['change'], s['last'])} ({s['change_pct']:+.2f}%) vs prior close "
+        chg = (f"  {fmt_diff(s['change'], s['last'], crypto)} ({s['change_pct']:+.2f}%) vs prior close "
                f"{tc.fmt_price(s['prev_close'])}")
     rng = f"range {tc.fmt_price(s['low'])}-{tc.fmt_price(s['high'])}"
     if s["is_today"]:
@@ -791,7 +855,7 @@ def render_brief(b: Dict[str, Any]) -> str:
         if g["direction"] == "flat":
             txt = f"{when}flat ({g['gap_pct']:+.2f}% vs prior close {tc.fmt_price(g['prior_close'])})"
         else:
-            gap = fmt_diff(g["gap"], g["prior_close"])
+            gap = fmt_diff(g["gap"], g["prior_close"], crypto)
             txt = (f"{when}{g['direction']} {g['gap_pct']:+.2f}% ({gap}{atr_txt}) from "
                    f"{tc.fmt_price(g['prior_close'])}")
         if g["filled"] is True:
@@ -803,15 +867,16 @@ def render_brief(b: Dict[str, Any]) -> str:
     at_last = [lv["name"] for lv in b["levels"] if lv["price"] == b["price"]]
     others = [lv for lv in b["levels"] if lv["price"] != b["price"]]
     width = max([len(lv["name"]) for lv in others] + [10])
-    lines.append("KEY LEVELS".ljust(16 + width) + "from last")
-    last_row = f"> {tc.fmt_price(b['price']):>10}  " + " = ".join(["LAST"] + at_last)
+    pw = max([len(tc.fmt_price(x)) for x in [b["price"]] + [lv["price"] for lv in others]] + [10])   # sub-cent coins
+    lines.append("KEY LEVELS".ljust(pw + 6 + width) + "from last")
+    last_row = f"> {tc.fmt_price(b['price']):>{pw}}  " + " = ".join(["LAST"] + at_last)
     placed = False
     for lv in others:
         if not placed and lv["price"] < b["price"]:
             lines.append(last_row)
             placed = True
         atr_txt = f"  {lv['from_last_atr']:+.2f} ATR" if lv["from_last_atr"] is not None else ""
-        lines.append(f"  {tc.fmt_price(lv['price']):>10}  {lv['name']:<{width}}  "
+        lines.append(f"  {tc.fmt_price(lv['price']):>{pw}}  {lv['name']:<{width}}  "
                      f"{lv['from_last_pct']:+6.1f}%{atr_txt}")
     if not placed:
         lines.append(last_row)
@@ -993,7 +1058,7 @@ def journal_rows(ledger: Dict[str, Any], since: str, until: str, symbol: Optiona
         if not isinstance(t, dict):
             counts["skipped"] += 1
             continue
-        if symbol and str(t.get("symbol") or "").upper() != symbol:
+        if symbol and not same_symbol(t.get("symbol"), symbol):   # BTCUSDT = BTC-USDT
             continue
         if market and trade_market(t).key != market:
             continue
@@ -1424,7 +1489,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = tc.make_parser("Analyst: pre-trade ticker brief and post-trade review of the paper journal.")
     sub = p.add_subparsers(dest="command", metavar="{brief,review}")
     b = sub.add_parser("brief", help="trend, key levels, ATR, liquidity, relative volume, gap and SEC context")
-    b.add_argument("symbol", type=_symbol, help="ticker, e.g. TSLA, or a crypto pair, e.g. BTC-USD")
+    b.add_argument("symbol", type=_symbol, help="ticker, e.g. TSLA, or a crypto pair, e.g. BTC-USDT (Binance "
+                   "prices by default, or Coinbase)")
     b.add_argument("--no-sec", action="store_true", help="skip SEC EDGAR (Yahoo data only)")
     b.add_argument("--filing-days", type=_int_range(1, 365), default=FILING_DAYS,
                    help=f"SEC filings window in calendar days (default {FILING_DAYS})")

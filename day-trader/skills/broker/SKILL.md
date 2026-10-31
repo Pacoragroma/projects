@@ -6,12 +6,12 @@ description: >-
   given levels or the saved trade plan, refuses it when today's loss budget says no, and opens a
   simulated position only after the user replies yes. Then applies the stop, the target and the
   time stop from 5-minute bars, fills resting limit orders, closes trades by hand, and lists
-  positions with live P&L, tickets and trade history. US stocks, and crypto 24/7 on Coinbase prices
-  (fractional sizes, paper fees). Use when the user says "place the trade", "buy 8 TSLA at 364.18",
-  "paper trade BTC", "buy 0.01 BTC-USD", "send the order", "short NVDA here", "yes, confirm it",
-  "cancel that ticket", "close my TSLA trade", "did my stop hit?", "what are my positions?", "show
-  my paper trades". There is no live mode: nothing can place a real order. Free public prices,
-  no API key or exchange account. Not financial advice.
+  positions with live P&L, tickets and trade history. US stocks, and crypto 24/7 (Binance by
+  default, or Coinbase; fractional sizes, paper fees). Use when the user says "place the trade",
+  "buy 8 TSLA at 364.18", "paper trade BTC", "buy 0.01 BTC-USDT", "send the order", "short NVDA
+  here", "yes, confirm it", "cancel that ticket", "close my TSLA trade", "did my stop hit?", "what
+  are my positions?", "show my paper trades". There is no live mode: nothing can place a real
+  order. Free public prices, no API key or exchange account. Not financial advice.
 ---
 # Paper Broker
 
@@ -29,7 +29,7 @@ python3 scripts/broker.py ticket --symbol TSLA --qty 8 --entry 364.18 --stop 358
 python3 scripts/broker.py ticket --symbol TSLA                 # levels, size and time stop from the saved plan
 python3 scripts/broker.py ticket --symbol TSLA --qty 8 --type market --stop 358.32 --target 370.04
 python3 scripts/broker.py ticket --symbol NVDA --qty 20 --side short --entry 120.50 --stop 121.70 --target 118.10
-python3 scripts/broker.py ticket --symbol BTC-USD --qty 0.01 --entry 101250 --stop 99000 --target 104000
+python3 scripts/broker.py ticket --symbol BTC-USDT --qty 0.01 --entry 101250 --stop 99000 --target 104000
 python3 scripts/broker.py confirm TKT-20261030-001             # shows the ticket, confirms nothing (exit 1)
 python3 scripts/broker.py confirm TKT-20261030-001 --yes       # ONLY after the user's yes, in a later message
 python3 scripts/broker.py sync                                 # apply stops/targets/time stop, fill working orders
@@ -55,7 +55,7 @@ price through the stop, unknown flag), 2 data source down (`data error: ...`), 3
 daily budget. Ledger schema and JSON fields: `reference.md`.
 
 ## How it works
-* **ticket** validates the levels (`tc.validate_levels`; stocks in cents, crypto on the product's
+* **ticket** validates the levels (`tc.validate_levels`; stocks in cents, crypto on the pair's
   price tick), refuses notional above 4x the paper account, and runs the daily budget check
   (`tc.budget_check`) with the ticket's risk `|entry - stop| x qty` (crypto: plus the fees at the
   stop). Today's working limit orders count as open risk and as trades. Blocked: exit 3, no ticket.
@@ -67,12 +67,12 @@ daily budget. Ledger schema and JSON fields: `reference.md`.
   checks and prints the full card as a **PREVIEW**: exit 0, `status: "preview"`, no ticket id,
   nothing saved, nothing to confirm. It ends "MARKET CLOSED — preview only. Re-run ticket after
   09:30 ET to get a ticket you can confirm." A budget block still exits 3.
-* **Crypto** (`BTC-USD`, `ETH-USD`, ...): Coinbase Exchange public prices, 24/7, the UTC day.
-  Weekends are open; only the 23:55 UTC time stop applies (after it: "PAST THE 23:55 UTC TIME STOP
-  — preview only. Re-run ticket after 00:00 UTC ..."). Sizes are fractional (the product's size
-  step). Every paper fill pays `crypto_fee_pct` (default 0.6%) of its notional: trades store
-  `fees` and `gross_pnl`, and `pnl` / `r_multiple` are **net of fees**. Card: `PAPER · REAL MONEY:
-  OFF · Coinbase prices`. Spot crypto cannot be shorted on Coinbase; a paper short is simulated.
+* **Crypto** (`BTC-USDT`, ...; `BTC-USD` works too): Binance prices by default (or Coinbase: `risk.py
+  config --crypto-exchange`), 24/7, the UTC day. Weekends are open; only the 23:55 UTC time stop
+  applies (after it: "PAST THE 23:55 UTC TIME STOP — preview only. Re-run ticket after 00:00 UTC ...").
+  Fractional sizes (the pair's step); every fill pays `crypto_fee_pct` (unset = the exchange's taker
+  fee: Binance 0.1%, Coinbase 0.6%); `pnl` / `r_multiple` are **net of fees**. Card: `PAPER · REAL MONEY:
+  OFF · Binance prices`. A ticket's `exchange` prices it for life (fill, sync, close). No spot shorting: a paper short is simulated.
 * **confirm --yes** is the only path that opens a position. It refuses expired, cancelled and
   used tickets, and a yes less than 10 seconds after the ticket. It needs the session (stocks
   09:30 ET to the time stop) and today's quote. It syncs open trades first (stops already hit
@@ -144,7 +144,7 @@ daily budget. Ledger schema and JSON fields: `reference.md`.
   offer both as files to download; when they upload them later, copy them back there first.
 * Not financial advice. Paper results and fills are simulations, not guarantees (`tc.DISCLAIMER`).
 * If a command exits 2 ("data error: ..."), tell the user which host failed. It is in the
-  message: `query1`/`query2.finance.yahoo.com` for stocks, `api.exchange.coinbase.com` for crypto.
-  In sandboxes the host may need to be allow-listed. Never invent prices, headlines, or odds to
-  fill the gap. A limit `ticket`, `tickets`, `history` and `cancel` work offline. `confirm`,
+  message: `query1`/`query2.finance.yahoo.com` for stocks, `data-api.binance.vision` (Binance) or
+  `api.exchange.coinbase.com` (Coinbase) for crypto. In sandboxes the host may need to be
+  allow-listed. Never invent prices, headlines, or odds to fill the gap. A limit `ticket`, `tickets`, `history` and `cancel` work offline. `confirm`,
   `sync` and `close` without `--price` need prices.

@@ -1,4 +1,10 @@
-"""End-to-end crypto desk flow: "Paper trade BTC" - plan, test and paper-fill BTC-USD on a Saturday.
+"""End-to-end crypto desk flow on Coinbase: "Paper trade BTC" - plan, test and paper-fill BTC-USD on a Saturday.
+
+This is the Coinbase variant. Binance is the pack's default crypto price source and has its own
+run of this desk in tests/test_binance_desk_flow.py (BTC-USDT, 0.1% fees); here every step is
+pinned to Coinbase with DAYTRADER_CRYPTO_EXCHANGE=coinbase, set explicitly in every subprocess's
+environment (helpers.temp_home's Coinbase default is not relied on). The tape, the fixture
+publishing and the README parsing below are shared with the Binance file, which imports this one.
 
 The same desk as tests/test_desk_flow.py, on a 24/7 market. Every skill runs as a real subprocess
 (helpers.run_cli), offline, against Coinbase Exchange fixtures in $DAYTRADER_FIXTURES, with one
@@ -19,15 +25,16 @@ search feeds for BTC-USD; SEC EDGAR has no fixtures and must not be asked at all
 
 Today's UTC day: a 4-week base under 100,600 on the daily chart, an opening range 00:00-00:15 UTC
 (high 101,200, low 99,000), then the 00:35 bar closes at 101,250 above it -> an ORB long at 00:40,
-stop 99,000 (the OR low), 1R target 103,500. The default $50 budget buys 0.01448645 BTC: the
-price risk plus both fills' paper fees (0.6% each) at the stop. After the 00:47 paper fill the tape
+stop 99,000 (the OR low), 1R target 103,500. The $50 budget buys 0.01448645 BTC: the price risk
+plus both fills' paper fees (Coinbase's 0.6% each) at the stop. After the 00:47 paper fill the tape
 either rallies through the target (01:20 bar) or slides through the stop (01:05 bar), and the P&L
 is booked net of fees. AnchoredRangeTest runs the same tape twelve hours later, where the default
 00:00 UTC range has long expired and `entry --or-start 12:00` anchors the ORB instead.
 
-CryptoReadmeSampleTest runs the README's crypto desk-run commands in text mode on the same data and
-checks that every line of the README's crypto sample block is really printed. To regenerate that
-block: python3 tests/test_crypto_desk_flow.py --print-run
+CoinbaseReadmeTest switches a fresh desk to Coinbase with the README's own command
+(`risk.py config --crypto-exchange coinbase`, no environment override), runs the README's crypto
+desk-run commands with BTC-USD in text mode, and checks that every line of the README's Coinbase
+block is really printed. To regenerate that block: python3 tests/test_crypto_desk_flow.py --print-run
 """
 from __future__ import annotations
 
@@ -41,19 +48,23 @@ import sys
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import (TempHomeTestCase, crypto_history, run_cli, skill_script, tc, utc_ts,  # noqa: E402
                      write_coinbase_fixtures, write_coinbase_products, write_coinbase_quote, write_fixture)
-import test_desk_flow as us_desk  # noqa: E402  (the US desk flow and its README parsing)
 
 README = Path(__file__).resolve().parent.parent / "README.md"
-CRYPTO_SECTION = "## Crypto (24/7, Coinbase prices)"
+CRYPTO_SECTION = "## Crypto (24/7, Binance or Coinbase prices)"
 RUN_HEADING = "### A crypto desk run"
-SAMPLE_INTRO = "On the pack's synthetic crypto test data"   # the sentence right before the sample block
+SAMPLE_INTRO = "On the pack's synthetic crypto test data"   # the sentence right before the Binance sample block
+COINBASE_INTRO = "The same night on Coinbase"                # ... and right before the Coinbase block
+SWITCH_TO_COINBASE = "python3 skills/risk/scripts/risk.py config --crypto-exchange coinbase"
+README_PAIR = "BTC-USDT"    # the README's desk run is on Binance, the default; Coinbase runs it with BTC-USD
+EXCHANGE_ENV = "DAYTRADER_CRYPTO_EXCHANGE"
 
 SYM = "BTC-USD"
+NEWS_SYM = "BTC-USD"        # Yahoo's name for the coin, whichever exchange and pair price it
 DAY = "2026-10-31"          # a Saturday: US stocks are closed, crypto trades
 PREV = "2026-10-30"
 OPEN_PX = 100_000.00
@@ -91,7 +102,7 @@ SLIDE = [  # the 01:05 bar trades through 99,000
 
 ENTRY, STOP, TARGET = 101_250.00, 99_000.00, 103_500.00
 RISK_PER_COIN = ENTRY - STOP                       # 2,250.00
-FEE = 0.006                                        # the default crypto_fee_pct: 0.6% of notional per fill
+FEE = 0.006                                        # Coinbase's crypto_fee_pct default: 0.6% of notional per fill
 QTY = 0.01448645                                   # $50 / (2,250 + 0.6% x (101,250 + 99,000)), floored to 1e-8
 PRICE_RISK = round(QTY * RISK_PER_COIN, 2)         # 32.59
 FEES_AT_STOP = round(QTY * FEE * (ENTRY + STOP), 2)  # 17.41 - counted as risk everywhere
@@ -99,7 +110,7 @@ MAX_LOSS = 50.00                                   # the default budget: 0.2% of
 VERDICTS = ("ODDS LEAN YOUR WAY", "ODDS LEAN AGAINST YOU", "CLOSE TO A COIN FLIP")
 PAPER_LINE = "Paper trading only - nothing here can place a real order."
 SAYS_PAPER = {"scanner", "entry", "exit", "time-machine", "risk", "budget", "broker", "analyst"}   # the order chain
-NOT_PAPER = re.compile(r"REAL MONEY: ON|live (?:order|trading|mode)|(?:sent|routed|submitted) to Coinbase"
+NOT_PAPER = re.compile(r"REAL MONEY: ON|live (?:order|trading|mode)|(?:sent|routed|submitted) to (?:Coinbase|Binance)"
                        r"|order (?:was )?placed", re.IGNORECASE)
 
 RSS = """<?xml version="1.0" encoding="UTF-8"?>
@@ -116,10 +127,10 @@ RSS = """<?xml version="1.0" encoding="UTF-8"?>
 SEARCH = {"news": [
     {"uuid": "c1", "title": "Bitcoin climbs past $101,000 as ETF inflows jump", "publisher": "Bloomberg",
      "link": "https://finance.yahoo.com/news/bitcoin-climbs-past-101000-etf-inflows-003000111.html",
-     "providerPublishTime": utc_ts(DAY, "00:30"), "relatedTickers": [SYM]},
+     "providerPublishTime": utc_ts(DAY, "00:30"), "relatedTickers": [NEWS_SYM]},
     {"uuid": "c2", "title": "Crypto exchange wins approval for a new derivatives desk", "publisher": "Reuters",
      "link": "https://www.reuters.com/markets/crypto-exchange-approval-2026-10-30/",
-     "providerPublishTime": utc_ts(PREV, "22:10"), "relatedTickers": [SYM, "ETH-USD"]},
+     "providerPublishTime": utc_ts(PREV, "22:10"), "relatedTickers": [NEWS_SYM, "ETH-USD"]},
 ]}
 
 
@@ -184,21 +195,33 @@ HISTORY_1D = _history_daily()
 
 class CryptoDeskTestCase(TempHomeTestCase):
     """One shared $DAYTRADER_HOME and fixture folder; every skill runs as a real subprocess.
-    HOURS shifts the whole tape (and every clock time below) later into the UTC day."""
+    HOURS shifts the whole tape (and every clock time below) later into the UTC day.
+
+    EXCHANGE is the crypto price source every step runs on. It is set explicitly as
+    $DAYTRADER_CRYPTO_EXCHANGE, in this process and in every subprocess's environment; None removes
+    the variable, so the steps follow the saved crypto_exchange setting (or the pack's default).
+    The write_* hooks publish that exchange's responses: Coinbase here, Binance in
+    tests/test_binance_desk_flow.py."""
 
     HOURS = 0
+    EXCHANGE: Optional[str] = "coinbase"
+    SYM = SYM
 
     def setUp(self) -> None:
         super().setUp()
+        if self.EXCHANGE:
+            os.environ[EXCHANGE_ENV] = self.EXCHANGE          # temp_home restores the environment
+        else:
+            os.environ.pop(EXCHANGE_ENV, None)
         self.fixtures = self.home / "fixtures"
         self.state = self.home / "desk"
         self.fixtures.mkdir()
         self.state.mkdir()
         self.outputs: List[Tuple[str, str]] = []   # (skill, stdout) of every step, for the paper checks
-        write_coinbase_products(self.fixtures)
-        write_fixture(self.fixtures, f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={SYM}"
+        self.write_products()
+        write_fixture(self.fixtures, f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={NEWS_SYM}"
                                      "&region=US&lang=en-US", RSS)
-        write_fixture(self.fixtures, f"https://{tc.YAHOO_HOSTS[0]}/v1/finance/search?q={SYM}"
+        write_fixture(self.fixtures, f"https://{tc.YAHOO_HOSTS[0]}/v1/finance/search?q={NEWS_SYM}"
                                      "&quotesCount=0&newsCount=20", SEARCH)
 
     def at(self, t: str) -> str:
@@ -210,17 +233,29 @@ class CryptoDeskTestCase(TempHomeTestCase):
     # -- fixtures --------------------------------------------------------------------------
 
     def publish(self, now: str, session: Sequence[tc.Bar], price: float) -> None:
-        """Write the Coinbase responses as the live API would answer at `now` (finished bars only)."""
+        """Write the exchange's responses as its live API would answer at `now` (finished bars only)."""
         h, m, *s = self.at(now).split(":")
         now_ts = utc_ts(DAY, f"{h}:{m}") + (int(s[0]) if s else 0)
         today = [b for b in session if b.ts + 300 <= now_ts]
         for rng in ("2d", "5d", "60d"):
-            write_coinbase_fixtures(self.fixtures, SYM, HISTORY_5M + today, "5m", rng, now_ts)
+            self.write_candles(HISTORY_5M + today, "5m", rng, now_ts)
         day_bar = tc.Bar(utc_ts(DAY, "00:00"), today[0].open, max(b.high for b in today),
                          min(b.low for b in today), today[-1].close, sum(b.volume for b in today))
-        write_coinbase_fixtures(self.fixtures, SYM, HISTORY_1D + [day_bar], "1d", "6mo", now_ts)
+        self.write_candles(HISTORY_1D + [day_bar], "1d", "6mo", now_ts)
+        self.write_quote(price, now_ts)
+
+    # The exchange's endpoints (Coinbase here): the product list, the candle windows tc requests
+    # for (interval, range) at now_ts, and the last trade with its 24 h open.
+
+    def write_products(self) -> None:
+        write_coinbase_products(self.fixtures)
+
+    def write_candles(self, bars: Sequence[tc.Bar], interval: str, range_: str, now_ts: int) -> None:
+        write_coinbase_fixtures(self.fixtures, self.SYM, bars, interval, range_, now_ts)
+
+    def write_quote(self, price: float, now_ts: int) -> None:
         stamp = datetime.fromtimestamp(now_ts - 5, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        write_coinbase_quote(self.fixtures, SYM, price, when=stamp, open_24h=HISTORY_5M[-288].open)
+        write_coinbase_quote(self.fixtures, self.SYM, price, when=stamp, open_24h=HISTORY_5M[-288].open)
 
     # -- running the skills ----------------------------------------------------------------
 
@@ -228,6 +263,8 @@ class CryptoDeskTestCase(TempHomeTestCase):
         """`now` is a UTC time today, before the HOURS shift (00:41 or 00:41:30)."""
         env = {"DAYTRADER_HOME": str(self.state), "DAYTRADER_FIXTURES": str(self.fixtures),
                "DAYTRADER_NOW": f"{DAY}T{self.at(now)}Z"}
+        if self.EXCHANGE:
+            env[EXCHANGE_ENV] = self.EXCHANGE
         p = run_cli(skill_script(skill, script), *args, env=env, timeout=90)
         where = (f"{script} {' '.join(args)} @ {self.at(now)} UTC: exit {p.returncode}\nstderr: {p.stderr}\n"
                  f"stdout: {p.stdout[:3000]}")
@@ -240,7 +277,7 @@ class CryptoDeskTestCase(TempHomeTestCase):
         return json.loads(self.run_text(skill, script, *args, "--json", now=now, expect=expect))
 
     def plan(self) -> Dict[str, Any]:
-        return json.loads((self.state / "plans" / f"{SYM}.json").read_text(encoding="utf-8"))
+        return json.loads((self.state / "plans" / f"{self.SYM}.json").read_text(encoding="utf-8"))
 
     def ledger(self) -> Dict[str, Any]:
         return json.loads((self.state / "ledger.json").read_text(encoding="utf-8"))
@@ -346,9 +383,10 @@ class CryptoDeskTestCase(TempHomeTestCase):
         self.assertEqual((rk["risk_used"], rk["fees_at_stop"], rk["max_loss"]), (PRICE_RISK, FEES_AT_STOP, MAX_LOSS))
         self.assertAlmostEqual(rk["loss_per_unit"], RISK_PER_COIN + FEE * (ENTRY + STOP), places=2)    # 3,451.50
         self.assertEqual((rk["step"], rk["tick"], rk["leverage"]), (1e-08, 0.01, 1))
+        self.assertEqual((rk["exchange"], rk["fee_pct"]), ("coinbase", 0.6))     # Coinbase's size step and fee
         self.assertEqual(rk["sources"], {"entry": "plan", "stop": "plan", "side": "plan", "target": "plan"})
         self.assertTrue(rk["budget"]["ok"])
-        self.assertEqual(self.plan()["sizing"]["shares"], QTY)
+        self.assertEqual((self.plan()["sizing"]["shares"], self.plan()["sizing"]["exchange"]), (QTY, "coinbase"))
 
         # Budget: the UTC day, with the fees at the stop counted as risk.
         chk = self.run_skill("budget", "budget.py", "check", "--symbol", SYM, now="00:44:30")
@@ -367,8 +405,8 @@ class CryptoDeskTestCase(TempHomeTestCase):
                          ("crypto", "long", QTY, ENTRY, STOP, TARGET))
         self.assertEqual((t["levels_source"], t["qty_source"], t["setup"], t["time_stop"]),
                          ("plan", "plan sizing", "orb", "23:55"))
-        self.assertEqual((t["risk"], t["fees_at_stop"], t["max_loss"], t["fee_pct"]),
-                         (PRICE_RISK, FEES_AT_STOP, MAX_LOSS, 0.6))
+        self.assertEqual((t["risk"], t["fees_at_stop"], t["max_loss"], t["fee_pct"], t["exchange"]),
+                         (PRICE_RISK, FEES_AT_STOP, MAX_LOSS, 0.6, "coinbase"))
         self.assertTrue(t["created_at"].endswith("+00:00"))
         self.assertEqual(t["time_machine"]["display_pct"], tm["display_pct"])
         for words in (f"BUY {QTY} {SYM}", "PAPER · REAL MONEY: OFF · Coinbase prices", "WAITING FOR YOUR YES", t["id"]):
@@ -393,6 +431,7 @@ class CryptoDeskTestCase(TempHomeTestCase):
         self.assertEqual(trade["opened_at"], f"{DAY}T{self.at('00:47')}:00+00:00")
         self.assertAlmostEqual(trade["entry_fee"], FEE * ENTRY * QTY, delta=0.005)                  # $8.80
         self.assertEqual(trade["fees"], trade["entry_fee"])
+        self.assertEqual(trade["exchange"], "coinbase")                # priced, synced and closed on Coinbase only
 
         # Budget sees the open position as committed risk, fees at the stop included.
         st = self.run_skill("budget", "budget.py", "status", "--market", "crypto", now="00:48")
@@ -422,7 +461,7 @@ class CryptoDeskTestCase(TempHomeTestCase):
         self.assertAlmostEqual(tr["fees"], tr["entry_fee"] + tr["exit_fee"], places=2)
         self.assertAlmostEqual(tr["pnl"], tr["gross_pnl"] - tr["fees"], places=2)
         self.assertAlmostEqual(tr["r_multiple"], tr["pnl"] / PRICE_RISK, delta=0.006)
-        self.assertEqual((tr["market"], tr["mode"], tr["fee_pct"]), ("crypto", "paper", 0.6))
+        self.assertEqual((tr["market"], tr["mode"], tr["fee_pct"], tr["exchange"]), ("crypto", "paper", 0.6, "coinbase"))
 
 
 class CryptoDeskFlowTest(CryptoDeskTestCase):
@@ -543,14 +582,15 @@ class AnchoredRangeTest(CryptoDeskTestCase):
         self.assert_paper_only()
 
 
-# The README's crypto desk-run commands, in order, and the UTC time each one runs at.
+# The README's crypto desk-run commands, in order, and the UTC time each one runs at. The README runs them
+# on Binance, the default, with BTC-USDT; CoinbaseReadmeTest runs the same commands with BTC-USD.
 DESK_STEPS = [("scanner", "scan.py", "00:41"), ("news", "news.py", "00:41"), ("entry", "entry.py", "00:41:30"),
               ("exit", "exit_plan.py", "00:42"), ("time-machine", "time_machine.py", "00:43"),
               ("risk", "risk.py", "00:44"), ("budget", "budget.py", "00:44:30"),
               ("broker", "broker.py", "00:45:10"), ("broker", "broker.py", "00:47"),
               ("broker", "broker.py", "01:31"), ("budget", "budget.py", "01:32"),
               ("analyst", "analyst.py", "01:33")]
-QUOTES = {"00:41": ENTRY, "00:45:10": ENTRY, "00:47": ENTRY, "01:31": 103_400.00}   # Coinbase last price
+QUOTES = {"00:41": ENTRY, "00:45:10": ENTRY, "00:47": ENTRY, "01:31": 103_400.00}   # the exchange's last price
 
 
 def readme_block(after: str, lang: str) -> List[str]:
@@ -558,6 +598,14 @@ def readme_block(after: str, lang: str) -> List[str]:
     text = README.read_text(encoding="utf-8")
     start = text.index(f"```{lang}\n", text.index(after)) + len(lang) + 4
     return [ln for ln in text[start:text.index("```", start)].splitlines() if ln.strip()]
+
+
+def readme_section(heading: str = CRYPTO_SECTION) -> str:
+    """README.md from `heading` up to the next '## ' heading."""
+    text = README.read_text(encoding="utf-8")
+    start = text.index(heading)
+    end = text.find("\n## ", start + 1)
+    return text[start:] if end < 0 else text[start:end]
 
 
 def readme_commands() -> List[Tuple[str, str, List[str]]]:
@@ -573,78 +621,67 @@ def readme_commands() -> List[Tuple[str, str, List[str]]]:
     return out
 
 
-class CryptoReadmeSampleTest(CryptoDeskTestCase):
-    """The README's crypto desk-run commands work as written, and its sample output is real output."""
+def run_readme_night(case: CryptoDeskTestCase, pair: str = README_PAIR) -> List[Tuple[str, str]]:
+    """Run the README's crypto desk-run commands in text mode on the night that hits the target, with
+    `pair` in place of the README's BTC-USDT; returns (header, stdout) for each step."""
+    session = case.session(RALLY)
+    commands = readme_commands()
+    case.assertEqual([(skill, script) for skill, script, _ in commands],
+                     [(skill, script) for skill, script, _ in DESK_STEPS])
+    out = []
+    for (skill, script, args), (_, _, now) in zip(commands, DESK_STEPS):
+        args = [pair if a == README_PAIR else a for a in args]
+        if now in QUOTES:
+            case.publish(now, session, QUOTES[now])
+        out.append((f"$ {skill}/scripts/{script} {' '.join(args)}   # {DAY} (Saturday) {now} UTC",
+                    case.run_text(skill, script, *args, now=now)))
+    return out
 
-    def night(self) -> List[Tuple[str, str]]:
-        """Run the README's commands in text mode on the night that hits the target."""
-        session = self.session(RALLY)
-        commands = readme_commands()
-        self.assertEqual([(skill, script) for skill, script, _ in commands],
-                         [(skill, script) for skill, script, _ in DESK_STEPS])
-        out = []
-        for (skill, script, args), (_, _, now) in zip(commands, DESK_STEPS):
-            if now in QUOTES:
-                self.publish(now, session, QUOTES[now])
-            out.append((f"$ {skill}/scripts/{script} {' '.join(args)}   # {DAY} (Saturday) {now} UTC",
-                        self.run_text(skill, script, *args, now=now)))
-        return out
 
-    def test_readme_crypto_sample_lines_are_printed_by_the_readme_commands(self):
-        printed = {ln.strip() for _, text in self.night() for ln in text.splitlines()}
-        sample = readme_block(SAMPLE_INTRO, "text")
-        self.assertGreaterEqual(len(sample), 12)
-        missing = [ln for ln in sample if ln.strip() not in printed]
-        self.assertEqual(missing, [], "README crypto sample lines that no step printed (regenerate with "
+class CoinbaseReadmeTest(CryptoDeskTestCase):
+    """The README's switch to Coinbase works as written, and its Coinbase lines are real output: a fresh
+    desk with no $DAYTRADER_CRYPTO_EXCHANGE runs the README's own `risk.py config --crypto-exchange
+    coinbase`, then the README's crypto desk-run commands with BTC-USD, on Coinbase fixtures."""
+
+    EXCHANGE = None     # the saved setting decides, as it does for a user who ran the README's command
+
+    def coinbase_night(self) -> List[Tuple[str, str]]:
+        self.assertIn(SWITCH_TO_COINBASE, readme_section())
+        words = SWITCH_TO_COINBASE.split()
+        _, skill, _, script = words[1].split("/")
+        switched = self.run_text(skill, script, *words[2:], now="00:40")
+        self.outputs[-1] = ("settings", switched)     # a settings card, not a trade: no paper line to print
+        self.assertIn("crypto fees   0.6% per fill (paper; Coinbase prices)", switched)
+        self.assertEqual(json.loads((self.state / "settings.json").read_text(encoding="utf-8")),
+                         {"crypto_exchange": "coinbase"})
+        return ([(f"$ {skill}/scripts/{script} {' '.join(words[2:])}   # {DAY} (Saturday) 00:40 UTC", switched)]
+                + run_readme_night(self, SYM))
+
+    def test_readme_coinbase_lines_are_printed_after_the_readme_switch(self):
+        printed = {ln.strip() for _, text in self.coinbase_night() for ln in text.splitlines()}
+        block = readme_block(COINBASE_INTRO, "text")
+        self.assertGreaterEqual(len(block), 5)
+        missing = [ln for ln in block if ln.strip() not in printed]
+        self.assertEqual(missing, [], "README Coinbase lines that no step printed (regenerate with "
                                       "python3 tests/test_crypto_desk_flow.py --print-run)")
-        for words in ("BTC-USD", "breakout", "ORB(15)", "UTC", "THE PLAN", "Fees", "TIME MACHINE",
-                      "BUY 0.01448645 BTC-USD", "BUDGET CHECK", "WAITING FOR YOUR YES", "net of", "REAL MONEY: OFF"):
-            self.assertTrue(any(words in ln for ln in sample), words)
-        self.assertFalse([ln for ln in sample if re.search(r"\bET\b", ln)])
+        for words in (SYM, "0.6% per fill", "Coinbase prices", f"BUY {tc.fmt_qty(QTY)} {SYM}", "net of"):
+            self.assertTrue(any(words in ln for ln in block), words)
+        self.assertFalse([ln for ln in block if "Binance" in ln or README_PAIR in ln])
+        # After the switch every step prices on Coinbase: nothing it printed names Binance.
+        self.assertEqual([skill for skill, out in self.outputs if "Binance" in out], [])
+        led = json.loads((self.state / "ledger.json").read_text(encoding="utf-8"))
+        self.assertEqual(([k["exchange"] for k in led["tickets"]], [t["exchange"] for t in led["trades"]]),
+                         (["coinbase"], ["coinbase"]))
+        self.assertEqual((led["trades"][0]["exit_reason"], led["trades"][0]["fee_pct"]), ("target", 0.6))
         self.assert_paper_only()
-
-    def test_readme_crypto_section_is_honest_and_its_commands_are_real(self):
-        text = README.read_text(encoding="utf-8")
-        section = text[text.index(CRYPTO_SECTION):text.index("\n## ", text.index(CRYPTO_SECTION) + 1)]
-        for words in ("UTC day", "23:55 UTC", "--or-start", "crypto_fee_pct", "0.6%", "--crypto-fee-pct",
-                      "--market crypto", "fractional", "synthetic", "api.exchange.coinbase.com",
-                      "no exchange account", "5-minute candles", "slippage", "estimate"):
-            self.assertIn(words, section, words)
-        # Every python3 command in the section (code blocks and inline code) parses with the scripts' own
-        # argparse: no usage error, whatever the (empty) offline data then makes of it.
-        commands = re.findall(r"python3 (skills/[\w-]+/scripts/\w+\.py)([^\n#`]*)", section)
-        self.assertGreaterEqual(len(commands), 14)
-        for path, rest in commands:
-            _, skill, _, script = path.split("/")
-            args = shlex.split(rest)
-            p = run_cli(skill_script(skill, script), *args, *([] if "--json" in args else ["--json"]),
-                        env={"DAYTRADER_HOME": str(self.state), "DAYTRADER_FIXTURES": str(self.fixtures),
-                             "DAYTRADER_NOW": f"{DAY}T00:41Z"}, timeout=90)
-            self.assertNotIn("usage:", p.stderr, f"{path} {rest}")
-            self.assertNotIn("Traceback", p.stderr, f"{path} {rest}")
-
-
-class UsDeskFlowUnchangedTest(unittest.TestCase):
-    """The crypto section sits after the US desk flow, so the US README checks still read the US blocks."""
-
-    def test_us_readme_blocks_are_still_the_tsla_run(self):
-        self.assertEqual([(s, sc) for s, sc, _ in us_desk.readme_commands()],
-                         [(s, sc) for s, sc, _ in us_desk.DESK_STEPS])
-        self.assertTrue(all(us_desk.SYM in args for _, _, args in us_desk.readme_commands()))
-        us_sample = us_desk.readme_block(us_desk.SAMPLE_INTRO, "text")
-        self.assertTrue(any("TSLA" in ln for ln in us_sample))
-        self.assertFalse([ln for ln in us_sample if SYM in ln or "UTC" in ln])
-        text = README.read_text(encoding="utf-8")
-        self.assertLess(text.index("## The desk flow"), text.index(CRYPTO_SECTION))
-        self.assertLess(text.index(us_desk.SAMPLE_INTRO), text.index(SAMPLE_INTRO))
 
 
 def print_run() -> None:
-    """Print every step's text output, to regenerate the README's crypto sample block."""
-    case = CryptoReadmeSampleTest("test_readme_crypto_sample_lines_are_printed_by_the_readme_commands")
+    """Print every step's text output, to regenerate the README's Coinbase block."""
+    case = CoinbaseReadmeTest("test_readme_coinbase_lines_are_printed_after_the_readme_switch")
     case.setUp()
     try:
-        for header, text in case.night():
+        for header, text in case.coinbase_night():
             print(header)
             print(text)
     finally:

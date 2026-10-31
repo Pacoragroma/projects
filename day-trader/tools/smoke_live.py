@@ -7,8 +7,9 @@ that the real hosts still answer and that the skills still understand what they 
 
     python3 tools/smoke_live.py                    # PASS/FAIL table, one row per check
     python3 tools/smoke_live.py --symbol NVDA      # the ticker for the per-symbol checks
-    python3 tools/smoke_live.py --crypto-symbol ETH-USD   # the pair for the Coinbase checks
-    python3 tools/smoke_live.py --only yahoo-5m,sec-filings
+    python3 tools/smoke_live.py --binance-symbol ETH-USDT  # the pair for the Binance checks
+    python3 tools/smoke_live.py --crypto-symbol ETH-USD    # the pair for the Coinbase checks
+    python3 tools/smoke_live.py --only yahoo-5m,binance-5m,sec-filings
     python3 tools/smoke_live.py --json
 
 Checks (each through the same function the skills call; the download cache is bypassed):
@@ -22,22 +23,38 @@ Checks (each through the same function the skills call; the download cache is by
   house-index     pelosi.load_index([this year])        pelosi
   house-ptr       pelosi.parse_ptr_pdf(newest PTR)      pelosi (skipped when no electronic PTR was
                                                         filed in the last 60 days)
-  coinbase-5m     tc.fetch_bars(PAIR, "5m", "2d")       crypto: entry, exit, time-machine, broker,
-                                                        alerts, analyst (paged, 300 candles a request)
-  coinbase-1d     tc.fetch_bars(PAIR, "1d", "6mo")      crypto: scanner, analyst
-  coinbase-ticker tc.quote(PAIR)                        crypto: broker, exit, risk, budget
-  coinbase-products tc.product_info / crypto_symbols    crypto: scanner universe, size step and price
-                                                        tick (entry, exit, risk, broker)
+  binance-5m      tc.fetch_bars(PAIR, "5m", "2d")       crypto (Binance, the default): entry, exit,
+                                                        time-machine, broker, alerts, analyst (klines,
+                                                        paged 1,000 a request)
+  binance-1d      tc.fetch_bars(PAIR, "1d", "6mo")      crypto (Binance): scanner, analyst
+  binance-ticker  tc.quote(PAIR)                        crypto (Binance): broker, exit, risk, budget
+  binance-products tc.product_info / crypto_symbols     crypto (Binance): scanner universe (USDT pairs),
+                                                        size step, price tick, minimum order
+  coinbase-5m     tc.fetch_bars(PAIR, "5m", "2d")       crypto (Coinbase, when chosen): the same skills
+                                                        (paged, 300 candles a request)
+  coinbase-1d     tc.fetch_bars(PAIR, "1d", "6mo")      crypto (Coinbase): scanner, analyst
+  coinbase-ticker tc.quote(PAIR)                        crypto (Coinbase): broker, exit, risk, budget
+  coinbase-products tc.product_info / crypto_symbols    crypto (Coinbase): scanner universe, size step
+                                                        and price tick (entry, exit, risk, broker)
+
+Each binance-* check runs with crypto prices pinned to Binance and each coinbase-* check to
+Coinbase, whatever the crypto_exchange setting says, through tc's own $DAYTRADER_CRYPTO_EXCHANGE
+override - so both exchanges are checked through the same tc.fetch_bars / tc.quote /
+tc.product_info dispatch the skills use.
 
 Each check asserts that the parse produced sane data (bars at the right spacing, prices > 0,
-recent timestamps, plausible counts), not just that the host answered. The Coinbase checks also
+recent timestamps, plausible counts), not just that the host answered. The crypto checks also
 hold a 24/7 market to 24/7 standards: candles on the 5-minute grid with no paging gaps, UTC-day
-daily candles, a last trade from the last few hours. One failure never stops the others. Exit code: 0 when every check that ran passed (a SKIP has nothing to test and does
-not fail the run), 1 when any check failed or the arguments were bad.
+daily candles, a last trade from the last few hours. One failure never stops the others. Exit
+code: 0 when every check that ran passed (a SKIP has nothing to test and does not fail the run),
+1 when any check failed or the arguments were bad.
 
 SEC asks automated clients for a contact email: set DAYTRADER_CONTACT=you@example.com (or the
-contact_email setting) if sec-filings fails with HTTP 403. $DAYTRADER_FIXTURES and
-$DAYTRADER_NOW are ignored here: this test is about the live hosts and the real clock.
+contact_email setting) if sec-filings fails with HTTP 403. HTTP 451 is Binance's answer where it
+does not serve the location (api.binance.com gives it to US addresses; the pack reads the
+market-data host data-api.binance.vision instead); if a binance-* check ever gets one, its row
+says so and points the desk at Coinbase's prices. $DAYTRADER_FIXTURES and $DAYTRADER_NOW are
+ignored here: this test is about the live hosts and the real clock.
 """
 from __future__ import annotations
 
@@ -64,7 +81,8 @@ if str(SHARED) not in sys.path:
 import trader_common as tc  # noqa: E402  (the canonical copy; every skill's copy is identical)
 
 DEFAULT_SYMBOL = "TSLA"
-DEFAULT_CRYPTO_SYMBOL = "BTC-USD"
+DEFAULT_BINANCE_SYMBOL = "BTC-USDT"
+DEFAULT_CRYPTO_SYMBOL = "BTC-USD"     # the Coinbase pair
 MAX_AGE_DAYS = 7          # newest bar / quote: covers a long weekend plus a holiday
 MAX_NEWS_AGE_DAYS = 30    # newest headline
 MAX_FILING_AGE_DAYS = 180  # newest SEC filing
@@ -72,14 +90,18 @@ MIN_SESSIONS_5M = 20      # Yahoo keeps ~60 days of 5-minute bars (about 40 sess
 MIN_DAILY_BARS = 60       # the scanner's own minimum
 MIN_SYMBOLS = 3000        # about 5,900 US common stocks
 PTR_LOOKBACK_DAYS = 60
-MAX_CRYPTO_AGE_HOURS = 3   # newest Coinbase candle / trade: the market never closes
-CRYPTO_5M_RANGE = "2d"     # two UTC days of 5-minute candles = a few pages of 300
+MAX_CRYPTO_AGE_HOURS = 3   # newest crypto candle / trade: the market never closes
+CRYPTO_5M_RANGE = "2d"     # two UTC days of 5-minute candles = a few pages of 300 (Coinbase) or 1,000 (Binance)
 MIN_CRYPTO_COVERAGE = 0.9  # share of the 5-minute slots between the first and last candle that are present
 MIN_CRYPTO_PRODUCTS = 100  # Coinbase lists several hundred products
 MIN_CRYPTO_USD_PAIRS = 50
+MIN_BINANCE_USDT_PAIRS = 100   # Binance trades several hundred spot pairs against USDT
+MAX_BINANCE_MIN_ORDER = 100.0  # a pair's NOTIONAL minimum, in USDT (BTCUSDT: 5)
 DETAIL_WIDTH = 90
 YAHOO = "/".join(h.split(".")[0] for h in tc.YAHOO_HOSTS) + ".finance.yahoo.com"
+BINANCE = tc.CRYPTO_EXCHANGES["binance"]["host"]        # data-api.binance.vision
 COINBASE = tc.COINBASE_API.split("://", 1)[1]           # api.exchange.coinbase.com
+EXCHANGE_ENV = "DAYTRADER_CRYPTO_EXCHANGE"
 
 
 class CheckFailed(Exception):
@@ -296,8 +318,30 @@ def check_house_ptr(ctx: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Coinbase Exchange (crypto): each check runs on the crypto market's clock (UTC days)
+# Crypto: Binance (the default) and Coinbase Exchange. Each check runs on the crypto market's clock
+# (UTC days), with crypto prices pinned to its own exchange.
 # ---------------------------------------------------------------------------
+
+@contextmanager
+def exchange_scope(exchange: str) -> Iterator[None]:
+    """Crypto prices from `exchange` inside the block, whatever the crypto_exchange setting says. It
+    uses tc's own override ($DAYTRADER_CRYPTO_EXCHANGE, restored afterwards), so the checks go through
+    the same tc.fetch_bars / tc.quote / tc.product_info / tc.crypto_symbols dispatch as the skills."""
+    old = os.environ.get(EXCHANGE_ENV)
+    os.environ[EXCHANGE_ENV] = exchange
+    try:
+        yield
+    except tc.FetchError as e:
+        if exchange == "binance" and "HTTP 451" in str(e):   # Binance's answer to a location it does not serve
+            raise CheckFailed(f"{e} - Binance does not serve this location; the desk can use Coinbase's prices "
+                              "instead: python3 skills/risk/scripts/risk.py config --crypto-exchange coinbase") from e
+        raise
+    finally:
+        if old is None:
+            os.environ.pop(EXCHANGE_ENV, None)
+        else:
+            os.environ[EXCHANGE_ENV] = old
+
 
 def _fresh(ts: float, now: datetime, what: str) -> None:
     hours = (now.timestamp() - ts) / 3600
@@ -305,10 +349,19 @@ def _fresh(ts: float, now: datetime, what: str) -> None:
                                           f"have one from the last {MAX_CRYPTO_AGE_HOURS} hours (stale or frozen data?)")
 
 
-def check_coinbase_5m(ctx: Dict[str, Any]) -> str:
-    sym, now = ctx["crypto_symbol"], ctx["now"]
-    with tc.market_scope(sym):
+def _from_exchange(meta: Dict[str, Any], exchange: str, what: str) -> None:
+    """The response came from the exchange the check pinned (the dispatch honoured the override)."""
+    name = tc.CRYPTO_EXCHANGES[exchange]["name"]
+    got = str(meta.get("exchangeName") or meta.get("exchange") or "")
+    expect(got.startswith(name), f"the {what} came from {got or 'an unnamed source'!r}, not {name} - "
+                                 "is the crypto_exchange override honoured?")
+
+
+def _check_crypto_5m(ctx: Dict[str, Any], exchange: str, sym: str) -> str:
+    now = ctx["now"]
+    with exchange_scope(exchange), tc.market_scope(sym):
         bars, meta = tc.fetch_bars(sym, "5m", CRYPTO_5M_RANGE)
+        _from_exchange(meta, exchange, "candles")
         check_bars(bars, now, 100)
         _fresh(bars[-1].ts, now, "the last candle")
         off_grid = [b for b in bars if b.ts % 300]
@@ -322,17 +375,18 @@ def check_coinbase_5m(ctx: Dict[str, Any]) -> str:
         slots = (bars[-1].ts - bars[0].ts) // 300 + 1
         expect(len(bars) >= MIN_CRYPTO_COVERAGE * slots,
                f"only {len(bars)} of {slots} five-minute candles between the first and the last - missing pages?")
-        ctx["coinbase_last"] = bars[-1]
+        ctx[f"{exchange}_last"] = bars[-1]
         days = tc.group_sessions(bars)
         last = bars[-1]
         return (f"{len(bars):,} candles over {len(days)} UTC days {min(days)}..{max(days)}, last {_when(last.ts)} "
                 f"close {tc.fmt_price(last.close)}")
 
 
-def check_coinbase_1d(ctx: Dict[str, Any]) -> str:
-    sym, now = ctx["crypto_symbol"], ctx["now"]
-    with tc.market_scope(sym):
+def _check_crypto_1d(ctx: Dict[str, Any], exchange: str, sym: str) -> str:
+    now = ctx["now"]
+    with exchange_scope(exchange), tc.market_scope(sym):
         bars, meta = tc.fetch_bars(sym, "1d", "6mo")
+        _from_exchange(meta, exchange, "daily candles")
         check_bars(bars, now, MIN_DAILY_BARS)
         expect(now.timestamp() - bars[-1].ts <= 2 * 86400,
                f"the last daily candle is from {bars[-1].date}, not today or yesterday (UTC)")
@@ -348,10 +402,11 @@ def check_coinbase_1d(ctx: Dict[str, Any]) -> str:
                 f"{tc.fmt_price(last.close)} volume {tc.fmt_big(last.volume)}")
 
 
-def check_coinbase_ticker(ctx: Dict[str, Any]) -> str:
-    sym, now = ctx["crypto_symbol"], ctx["now"]
-    with tc.market_scope(sym):
+def _check_crypto_ticker(ctx: Dict[str, Any], exchange: str, sym: str) -> str:
+    now = ctx["now"]
+    with exchange_scope(exchange), tc.market_scope(sym):
         q = tc.quote(sym)
+        _from_exchange(q, exchange, "ticker")
         price = q.get("price")
         expect(isinstance(price, float) and math.isfinite(price) and price > 0, f"price is not a positive number ({price!r})")
         ts = check_recent(q.get("time"), now, MAX_AGE_DAYS, "the last trade")
@@ -362,7 +417,7 @@ def check_coinbase_ticker(ctx: Dict[str, Any]) -> str:
         expect((ask - bid) / price <= 0.01, f"bid {tc.fmt_price(bid)} / ask {tc.fmt_price(ask)} is over 1% wide")
         expect(bid * 0.99 <= price <= ask * 1.01,
                f"the last trade {tc.fmt_price(price)} is far outside the bid/ask {tc.fmt_price(bid)} / {tc.fmt_price(ask)}")
-        last = ctx.get("coinbase_last")
+        last = ctx.get(f"{exchange}_last")
         if last is not None:                      # the candles and the ticker must describe the same market
             gap = abs(price / last.close - 1) * 100
             expect(gap <= 5, f"the ticker {tc.fmt_price(price)} is {gap:.1f}% away from the last 5-minute close "
@@ -372,6 +427,104 @@ def check_coinbase_ticker(ctx: Dict[str, Any]) -> str:
         currency = f" {q['currency']}" if q.get("currency") else ""
         return (f"{q['symbol']} {tc.fmt_price(price)}{currency} at {_when(ts)} · bid {tc.fmt_price(bid)} "
                 f"/ ask {tc.fmt_price(ask)}{day}")
+
+
+def check_binance_5m(ctx: Dict[str, Any]) -> str:
+    return _check_crypto_5m(ctx, "binance", ctx["binance_symbol"])
+
+
+def check_binance_1d(ctx: Dict[str, Any]) -> str:
+    return _check_crypto_1d(ctx, "binance", ctx["binance_symbol"])
+
+
+def check_binance_ticker(ctx: Dict[str, Any]) -> str:
+    return _check_crypto_ticker(ctx, "binance", ctx["binance_symbol"])
+
+
+BINANCE_UNIVERSE_URL = f"{tc.BINANCE_API}/exchangeInfo?permissions=SPOT&symbolStatus=TRADING"
+LEVERAGED_SUFFIX = re.compile(r"(.+?)(UP|DOWN|BULL|BEAR)")
+
+
+@contextmanager
+def _one_response(url: str, payload: Any) -> Iterator[None]:
+    """Serve `payload` for `url` through tc.get_json (any other URL goes to the network as usual), so the
+    skills' own code parses the one live response this check already has instead of asking again."""
+    saved = tc.get_json
+    tc.get_json = lambda u, *a, **k: payload if u == url else saved(u, *a, **k)  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        tc.get_json = saved  # type: ignore[assignment]
+
+
+def check_binance_products(ctx: Dict[str, Any]) -> str:
+    sym = ctx["binance_symbol"]
+    pair = tc.binance_symbol(sym)
+    base, quote_ccy = tc.crypto_pair(pair)
+    with exchange_scope("binance"):
+        raw = tc.get_json(BINANCE_UNIVERSE_URL, 0)            # every trading spot pair, with its filters
+        rows = raw.get("symbols") if isinstance(raw, dict) else None
+        expect(isinstance(rows, list) and rows, "exchangeInfo listed no symbols")
+        with _one_response(BINANCE_UNIVERSE_URL, raw):
+            usdt = tc.crypto_symbols("USD")                   # the scanner's universe: Binance's USDT pairs
+            info = tc.product_info(sym)                       # exchangeInfo?symbol=PAIR: the pair's own rules
+    # The pair's own rules (exchangeInfo?symbol=PAIR), which entry, exit, risk and the broker size and price with.
+    expect(info.get("symbol") == pair, f"product_info answered for {info.get('symbol')!r}, not {pair}")
+    expect(str(info.get("status") or "").lower() == "online" and not info["trading_disabled"],
+           f"{pair} is {info.get('status')}{' (trading disabled)' if info['trading_disabled'] else ''}")
+    step, tick = info["base_increment"], info["quote_increment"]
+    expect(0 < step <= 1 and 0 < tick <= 1, f"implausible size step {step!r} / price tick {tick!r} for {pair}")
+    try:
+        min_order = float(info.get("min_market_funds"))
+    except (TypeError, ValueError):
+        min_order = float("nan")
+    expect(math.isfinite(min_order) and 0 < min_order <= MAX_BINANCE_MIN_ORDER,
+           f"no plausible minimum order for {pair} (NOTIONAL filter: {info.get('min_market_funds')!r})")
+    rules = f"{pair} trading, size step {tc.fmt_qty(step)}, tick {tick:g}, minimum order {min_order:g} {quote_ccy}"
+    # The scanner's universe: every trading USDT pair but stablecoins and leveraged tokens (BTCUP = BTC + UP).
+    # Any other trading USDT pair missing from it is a coin the scanner can never find.
+    expect(len(usdt) >= MIN_BINANCE_USDT_PAIRS,
+           f"only {len(usdt)} trading USDT pairs (expected at least {MIN_BINANCE_USDT_PAIRS}) - status fields renamed?")
+    stable = [r["symbol"] for r in usdt if r["name"] in tc.STABLECOINS]
+    expect(not stable, f"stablecoins in the scanner universe: {', '.join(stable)}")
+    if quote_ccy == "USDT":
+        expect(f"{base}-USDT" in {r["symbol"] for r in usdt}, f"{pair} is not among the trading USDT pairs")
+    listed = {str(r.get("baseAsset", "")).upper() for r in rows if isinstance(r, dict)}
+    kept = {r["name"] for r in usdt}
+    missing = []
+    for r in rows:
+        b = str(r.get("baseAsset", "")).upper() if isinstance(r, dict) else ""
+        if (not b or b in kept or str(r.get("quoteAsset", "")).upper() != "USDT" or b in tc.STABLECOINS
+                or str(r.get("status", "")).upper() != "TRADING" or r.get("isSpotTradingAllowed") is False):
+            continue
+        lev = LEVERAGED_SUFFIX.fullmatch(b)
+        if not (lev and lev.group(1) in listed):
+            missing.append(b)
+    problems = []
+    if missing:
+        problems.append(f"{len(missing)} trading USDT pair(s) missing from the scanner universe of {len(usdt):,}: "
+                        f"{', '.join(sorted(missing)[:8])} - dropped as leveraged tokens? They are not a listed "
+                        "coin plus UP/DOWN/BULL/BEAR")
+    # Every universe pair must be a symbol tc reads as crypto: tc.fetch_bars takes anything else for a
+    # stock ticker (and asks Yahoo), so the scanner skips such pairs and the desk cannot price them.
+    unreadable = sorted(r["symbol"] for r in usdt if not tc.is_crypto_symbol(r["symbol"]))
+    if unreadable:
+        problems.append(f"{len(unreadable)} pair(s) in the scanner universe that tc.is_crypto_symbol cannot read "
+                        f"(coin names its pair format does not read; the scanner skips them): {', '.join(unreadable[:8])}")
+    expect(not problems, "; ".join(problems) + f" (the pair rules parsed fine: {rules})")
+    return f"{len(usdt):,} trading USDT pairs (stablecoins left out); {rules}"
+
+
+def check_coinbase_5m(ctx: Dict[str, Any]) -> str:
+    return _check_crypto_5m(ctx, "coinbase", ctx["crypto_symbol"])
+
+
+def check_coinbase_1d(ctx: Dict[str, Any]) -> str:
+    return _check_crypto_1d(ctx, "coinbase", ctx["crypto_symbol"])
+
+
+def check_coinbase_ticker(ctx: Dict[str, Any]) -> str:
+    return _check_crypto_ticker(ctx, "coinbase", ctx["crypto_symbol"])
 
 
 @contextmanager
@@ -390,7 +543,7 @@ def check_coinbase_products(ctx: Dict[str, Any]) -> str:
     sym = ctx["crypto_symbol"]
     rows = tc.coinbase_products(ttl=0)
     expect(len(rows) >= MIN_CRYPTO_PRODUCTS, f"only {len(rows)} products listed (expected at least {MIN_CRYPTO_PRODUCTS})")
-    with _one_product_list(rows):
+    with exchange_scope("coinbase"), _one_product_list(rows):
         usd = tc.crypto_symbols("USD")
         info = tc.product_info(sym)
     expect(len(usd) >= MIN_CRYPTO_USD_PAIRS,
@@ -420,12 +573,19 @@ CHECKS: List[Dict[str, Any]] = [
      "run": check_sec_filings},
     {"name": "house-index", "host": "disclosures-clerk.house.gov", "used_by": "pelosi", "run": check_house_index},
     {"name": "house-ptr", "host": "disclosures-clerk.house.gov", "used_by": "pelosi", "run": check_house_ptr},
-    {"name": "coinbase-5m", "host": COINBASE, "used_by": "crypto: entry, exit, time-machine, broker, alerts, analyst",
-     "run": check_coinbase_5m},
-    {"name": "coinbase-1d", "host": COINBASE, "used_by": "crypto: scanner, analyst", "run": check_coinbase_1d},
-    {"name": "coinbase-ticker", "host": COINBASE, "used_by": "crypto: broker, exit, risk, budget",
+    {"name": "binance-5m", "host": BINANCE,
+     "used_by": "crypto (default): entry, exit, time-machine, broker, alerts, analyst", "run": check_binance_5m},
+    {"name": "binance-1d", "host": BINANCE, "used_by": "crypto (default): scanner, analyst", "run": check_binance_1d},
+    {"name": "binance-ticker", "host": BINANCE, "used_by": "crypto (default): broker, exit, risk, budget",
+     "run": check_binance_ticker},
+    {"name": "binance-products", "host": BINANCE, "used_by": "crypto (default): scanner, entry, exit, risk, broker",
+     "run": check_binance_products},
+    {"name": "coinbase-5m", "host": COINBASE,
+     "used_by": "crypto (coinbase): entry, exit, time-machine, broker, alerts, analyst", "run": check_coinbase_5m},
+    {"name": "coinbase-1d", "host": COINBASE, "used_by": "crypto (coinbase): scanner, analyst", "run": check_coinbase_1d},
+    {"name": "coinbase-ticker", "host": COINBASE, "used_by": "crypto (coinbase): broker, exit, risk, budget",
      "run": check_coinbase_ticker},
-    {"name": "coinbase-products", "host": COINBASE, "used_by": "crypto: scanner, entry, exit, risk, broker",
+    {"name": "coinbase-products", "host": COINBASE, "used_by": "crypto (coinbase): scanner, entry, exit, risk, broker",
      "run": check_coinbase_products},
 ]
 CHECK_NAMES = [c["name"] for c in CHECKS]
@@ -451,15 +611,17 @@ def run_one(check: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def run_checks(symbol: str = DEFAULT_SYMBOL, only: Optional[Sequence[str]] = None,
-               now: Optional[datetime] = None, crypto_symbol: str = DEFAULT_CRYPTO_SYMBOL) -> Dict[str, Any]:
+               now: Optional[datetime] = None, crypto_symbol: str = DEFAULT_CRYPTO_SYMBOL,
+               binance_symbol: str = DEFAULT_BINANCE_SYMBOL) -> Dict[str, Any]:
     now = now or tc.now_et()
     if only and "house-ptr" in only and "house-index" not in only:
         only = [*only, "house-index"]          # the PTR check picks its filing from the index
-    ctx: Dict[str, Any] = {"symbol": symbol, "crypto_symbol": crypto_symbol, "now": now}
+    ctx: Dict[str, Any] = {"symbol": symbol, "crypto_symbol": crypto_symbol, "binance_symbol": binance_symbol,
+                           "now": now}
     rows = [run_one(c, ctx) for c in CHECKS if not only or c["name"] in only]
     counts = {s: sum(1 for r in rows if r["status"] == s) for s in ("PASS", "FAIL", "SKIP")}
     return {"ok": counts["FAIL"] == 0, "symbol": symbol, "crypto_symbol": crypto_symbol,
-            "checked_at": now.isoformat(timespec="seconds"),
+            "binance_symbol": binance_symbol, "checked_at": now.isoformat(timespec="seconds"),
             "passed": counts["PASS"], "failed": counts["FAIL"], "skipped": counts["SKIP"], "checks": rows,
             "notes": []}
 
@@ -526,6 +688,8 @@ def build_parser():
     p = tc.make_parser("Live smoke test: one real request per data source, parsed by the skills' own code. "
                        "Exit 0 = every check that ran passed, 1 = a check failed.")
     p.add_argument("--symbol", default=DEFAULT_SYMBOL, help=f"ticker for the per-symbol checks (default {DEFAULT_SYMBOL})")
+    p.add_argument("--binance-symbol", default=DEFAULT_BINANCE_SYMBOL, metavar="PAIR",
+                   help=f"Binance pair for the binance-* checks (default {DEFAULT_BINANCE_SYMBOL})")
     p.add_argument("--crypto-symbol", default=DEFAULT_CRYPTO_SYMBOL, metavar="PAIR",
                    help=f"Coinbase pair for the coinbase-* checks (default {DEFAULT_CRYPTO_SYMBOL})")
     p.add_argument("--only", metavar="CHECKS", help="comma-separated subset: " + ", ".join(CHECK_NAMES))
@@ -538,14 +702,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not re.fullmatch(r"[A-Z0-9][A-Z0-9.\-]{0,9}", symbol):
         raise ValueError(f"--symbol: {args.symbol!r} is not a ticker")
     if tc.is_crypto_symbol(symbol):
-        raise ValueError(f"--symbol: {symbol} is a crypto pair - the Yahoo checks need a stock ticker; "
-                         f"use --crypto-symbol {symbol} for the Coinbase checks")
+        raise ValueError(f"--symbol: {symbol} is a crypto pair - the Yahoo checks need a stock ticker; pass "
+                         f"crypto pairs with --binance-symbol (Binance checks) or --crypto-symbol (Coinbase checks)")
+    binance = args.binance_symbol.strip().upper()
+    if not tc.is_crypto_symbol(binance):
+        raise ValueError(f"--binance-symbol: {args.binance_symbol!r} is not a Binance pair (e.g. BTC-USDT)")
     crypto = args.crypto_symbol.strip().upper()
     if not tc.is_crypto_symbol(crypto):
         raise ValueError(f"--crypto-symbol: {args.crypto_symbol!r} is not a Coinbase pair (e.g. BTC-USD)")
     only = parse_only(args.only)
     with live_env() as ignored:
-        res = run_checks(symbol, only, crypto_symbol=crypto)
+        res = run_checks(symbol, only, crypto_symbol=crypto, binance_symbol=binance)
     res["notes"] = [f"${k} is set and ignored here - this test always asks the live hosts and the real clock"
                     for k in ignored]
     tc.emit(res, args.json, render)

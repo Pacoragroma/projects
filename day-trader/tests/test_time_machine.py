@@ -17,9 +17,9 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from helpers import (SKILLS, TempHomeTestCase, bars_from_closes, crypto_history, et_ts, fake_bars,  # noqa: E402
-                     load_skill_module, random_walk_history, random_walk_session, run_cli, skill_script, tc,
-                     trading_days, utc_ts, write_coinbase_fixtures, write_fixture, yahoo_chart_url,
-                     yahoo_payload)
+                     fake_http, load_skill_module, random_walk_history, random_walk_session, run_cli, skill_script,
+                     tc, trading_days, utc_ts, write_binance_fixtures, write_coinbase_fixtures, write_fixture,
+                     yahoo_chart_url, yahoo_payload)
 
 tm = load_skill_module("time-machine", "time_machine")
 SCRIPT = skill_script("time-machine", "time_machine.py")
@@ -1081,6 +1081,92 @@ class CryptoCliTests(TempHomeTestCase):
         self.assertEqual(p.returncode, 2, p.stderr)
         self.assertIn("api.exchange.coinbase.com", p.stderr)
         self.assertEqual(len(p.stderr.strip().splitlines()), 1)
+
+
+class BinanceCliTests(TempHomeTestCase):
+    """The real script against Binance fixtures (the default exchange) on a Saturday, 04:40 UTC: the
+    same history as CryptoCliTests, with Binance's 0.1% entry-tier taker fee instead of Coinbase's 0.6%."""
+    NOW = f"{SAT}T04:40"
+
+    def setUp(self):
+        super().setUp()
+        tc.use_market_for("BTC-USDT")
+        self.fx = self.home / "fixtures"
+        self.bars = crypto_history(SAT, 61, until="04:45", seed=21)
+        # Binance's few USD pairs are thin: BTC-USDT and BTC-USD both read these BTCUSDT klines.
+        write_binance_fixtures(self.fx, "BTC-USDT", self.bars, "5m", "60d", now_ts=utc_ts(SAT, "04:40"))
+        last = [b for b in self.bars if b.ts < utc_ts(SAT, "04:40")][-1].close
+        self.levels = ["--entry", f"{last:.2f}", "--stop", f"{last * 0.99:.2f}", "--target", f"{last * 1.02:.2f}"]
+        self.env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(self.fx), "DAYTRADER_NOW": self.NOW,
+                    "DAYTRADER_CRYPTO_EXCHANGE": "binance"}
+
+    def cli(self, *args):
+        return run_cli(SCRIPT, *args, env=self.env)
+
+    def test_text_card_json_and_save_with_binance_fees(self):
+        p = self.cli("BTC-USDT", *self.levels, "--paths", "2000")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.splitlines()[0], "TIME MACHINE · BTC-USDT · LONG from 04:40 UTC · 2,000 replays from "
+                                                   "BTC-USDT's past 59 days (UTC)")
+        text = " ".join(p.stdout.split())
+        for want in ("OPEN AT TIME STOP", "per trade before fees", "Fees (paper, 0.1% per fill): round trip ≈ 0.20R",
+                     "the verdict counts the paper fees (0.1% per fill)",
+                     "Replayed 04:40-23:55 UTC in 3-bar blocks from days 2026-09-02..2026-10-30"):
+            self.assertIn(want, text)
+        self.assertNotIn("Coinbase", p.stdout + p.stderr)
+        self.assertNotIn("is priced from", text)                             # a USDT pair is priced as typed
+        p = self.cli("BTC-USDT", *self.levels, "--json", "--paths", "2000", "--save")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        d = json.loads(p.stdout)
+        self.assertEqual((d["sessions_used"], d["first_session"], d["last_session"]), (59, "2026-09-02", FRI))
+        f = d["fees"]
+        self.assertEqual(f["fee_pct"], 0.1)
+        self.assertAlmostEqual(f["round_trip_r"], 0.002 / 0.01, delta=0.002)   # 2 x 0.1% / a 1% stop
+        self.assertAlmostEqual(f["expected_r_after_fees"], d["expected_r"] - f["expected_fees_r"], places=3)
+        self.assertEqual(d["verdict"], tm.verdict(d))                       # judged after fees
+        saved = json.loads((self.home / "plans" / "BTC-USDT.json").read_text())["time_machine"]
+        self.assertEqual((saved["fees"]["fee_pct"], saved["verdict"]), (0.1, d["verdict"]))
+
+    def test_btc_usd_replays_the_btcusdt_pair_with_a_note(self):
+        args = (*self.levels, "--json", "--paths", "1000", "--seed", "7")
+        usd, usdt = (json.loads(self.cli(sym, *args).stdout) for sym in ("BTC-USD", "BTC-USDT"))
+        self.assertIn("BTC-USD is priced from Binance's BTCUSDT pair, quoted in USDT (Binance's few USD pairs are thin)",
+                      usd["notes"])
+        self.assertFalse(any("is priced from" in n for n in usdt["notes"]), usdt["notes"])
+        self.assertEqual((usd["counts"], usd["history"]["results"]), (usdt["counts"], usdt["history"]["results"]))
+
+    def test_too_few_days_names_binance(self):
+        write_binance_fixtures(self.fx, "BTC-USDT", self.bars, "5m", "71d", now_ts=utc_ts(SAT, "04:40"))
+        d = json.loads(self.cli("BTC-USDT", *self.levels, "--json", "--paths", "500", "--sessions", "70").stdout)
+        self.assertIn("Binance returned 60 usable past days (UTC) of 5-minute candles (asked for 70) - a recent "
+                      "listing?", d["notes"])
+
+    def test_unknown_pair_is_bad_input_and_an_unreachable_host_a_data_error(self):
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "binance"                  # temp_home restores it
+        with fake_http({"klines": tc.FetchError("HTTP 400 for https://data-api.binance.vision/api/v3/klines?symbol=NOPEUSDT")}):
+            with self.assertRaises(ValueError) as cm:
+                tm.main(["NOPE-USDT", "--entry", "1.5", "--stop", "1.4", "--target", "1.7"])
+        self.assertEqual(str(cm.exception), "Binance has no pair NOPE-USDT - check the symbol (e.g. BTC-USDT)")
+        empty = self.home / "empty"
+        empty.mkdir()
+        p = run_cli(SCRIPT, "BTC-USDT", *self.levels, env=dict(self.env, DAYTRADER_FIXTURES=str(empty)))
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("data-api.binance.vision", p.stderr)
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1)
+
+
+class DocCommandTests(unittest.TestCase):
+    def test_every_documented_command_parses(self):
+        text = "".join((SKILLS / "time-machine" / name).read_text(encoding="utf-8") for name in ("SKILL.md", "reference.md"))
+        cmds = re.findall(r"python3 scripts/time_machine\.py([^`\n#]*)", text)
+        self.assertGreaterEqual(len(cmds), 10)
+        self.assertTrue(any(c.split()[0] == "BTC-USDT" for c in cmds))      # the primary crypto example
+        for c in cmds:
+            with self.subTest(cmd=c), contextlib.redirect_stderr(io.StringIO()):
+                args = tm.build_parser().parse_args(shlex.split(c))
+                if args.at:
+                    with tc.market_scope(args.symbol):
+                        tm.parse_at(args.at)
 
 
 class StockFeeRegressionTests(TempHomeTestCase):

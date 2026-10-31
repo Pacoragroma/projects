@@ -5,18 +5,20 @@ Fetches ~6 months of daily bars per symbol from Yahoo Finance, drops illiquid na
 looks for breakouts, breakdowns, gaps, unusual volume, trend pullbacks and NR7 coils on the
 latest bar (today's bar while the market is open, with volume compared at time-of-day pace).
 
-Crypto (`--market crypto`, or crypto `--symbols` like BTC-USD): the universe is Coinbase's
-USD pairs (stablecoins dropped), daily candles come from Coinbase Exchange and a "day" is a
-UTC day. Crypto trades 24/7, so each daily bar opens where the last one closed: gap setups are
-skipped (and the output says so), and today's volume is paced linearly across the UTC day.
+Crypto (`--market crypto`, or crypto `--symbols` like BTC-USDT): prices come from Binance's public
+market data by default, or Coinbase's (the crypto_exchange setting, or $DAYTRADER_CRYPTO_EXCHANGE).
+The universe is that exchange's dollar pairs: Binance's USDT pairs (leveraged tokens and
+stablecoins dropped) or Coinbase's USD pairs (stablecoins dropped); a "day" is a UTC day. Crypto
+trades 24/7, so each daily bar opens where the last one closed: gap setups are skipped (and the
+output says so), and today's volume is paced linearly across the UTC day.
 
 Usage:
   python3 scripts/scan.py --symbols TSLA,NVDA,AAPL           # quick: only these symbols
   python3 scripts/scan.py --limit 300 --top 15               # first 300 names of the universe
   python3 scripts/scan.py --setups breakout,gap_up           # whole market (~5,900 names, minutes)
   python3 scripts/scan.py --min-price 10 --min-dollar-volume 50M --top 25 --json
-  python3 scripts/scan.py --market crypto --top 15           # Coinbase USD pairs (24/7, UTC days)
-  python3 scripts/scan.py --symbols BTC-USD,ETH-USD,SOL-USD  # crypto symbols scan as crypto
+  python3 scripts/scan.py --market crypto --top 15           # Binance USDT pairs (24/7, UTC days)
+  python3 scripts/scan.py --symbols BTC-USDT,ETH-USDT,SOL-USDT  # crypto symbols scan as crypto
 
 Exit codes: 0 ok (even with zero matches), 1 bad input, 2 data source unreachable.
 """
@@ -54,9 +56,14 @@ EPS = 1e-9               # thresholds are inclusive; don't lose an exact 3.0% ga
 DEFAULT_MIN_PRICE = 5.0
 DEFAULT_MIN_DOLLAR_VOLUME = 20_000_000.0
 CRYPTO_MIN_PRICE = 0.0               # sub-dollar coins are normal; liquidity is the real filter
-CRYPTO_MIN_DOLLAR_VOLUME = 5_000_000.0
-CRYPTO_WORKERS = 4                   # Coinbase's public API allows ~10 requests/second
+CRYPTO_MIN_DOLLAR_VOLUME = 5_000_000.0   # close x base volume: dollars on Coinbase, USDT (~$1) on Binance
+# Parallel downloads per crypto exchange. A daily scan is 1-2 candle requests per pair: Binance's
+# spot API allows 6,000 request weight a minute per IP (a klines request weighs 2), so ~500 pairs
+# with 8 workers stay far inside it; Coinbase's public API allows ~10 requests a second.
+CRYPTO_WORKERS = {"binance": 8, "coinbase": 4}
+CRYPTO_UNIVERSE = {"binance": "binance_usdt", "coinbase": "coinbase_usd"}   # JSON filters.universe
 GAP_SETUPS = ("gap_up", "gap_down")  # need an opening bell: skipped for 24/7 markets
+UNSUPPORTED_PAIR = "the desk cannot read this pair's coin name - not looked up"   # backstop, see scan_one
 NR7_WEIGHT = 0.6         # a coil has not done anything yet: rank it below active setups (max 60)
 
 # Typical cumulative share of a US stock's daily volume by minutes after the 09:30 open
@@ -87,7 +94,11 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
 def _px(x: Optional[float]) -> Optional[float]:
     if x is None:
         return None
-    return round(x, 2) if abs(x) >= 1 else round(x, 4)
+    if abs(x) >= 1:
+        return round(x, 2)
+    if tc.market().fractional and x != 0:   # sub-cent coins: keep 4 significant digits, as tc.fmt_price shows them
+        return round(x, max(4, 3 - int(math.floor(math.log10(abs(x))))))
+    return round(x, 4)
 
 
 def normalize_daily(bars: Iterable[tc.Bar], today: str, before_open: bool = False) -> List[tc.Bar]:
@@ -140,8 +151,9 @@ def session_bounds(now: datetime, meta: Optional[Dict[str, Any]] = None) -> tupl
 
 
 def _market_time(meta: Optional[Dict[str, Any]]) -> Optional[float]:
-    """Yahoo's regularMarketTime (time of the last trade in the data), if usable. Coinbase data
-    has none: its regularMarketTime is the start of the last candle, not the last trade."""
+    """Yahoo's regularMarketTime (time of the last trade in the data), if usable. Crypto candles
+    (Binance, Coinbase) have none: their regularMarketTime is the start of the last candle, not
+    the last trade."""
     if (meta or {}).get("market") == "crypto":
         return None
     stamp = (meta or {}).get("regularMarketTime")
@@ -437,13 +449,19 @@ def evaluate_symbol(symbol: str, bars: Sequence[tc.Bar], now: datetime,
 
 
 def _is_not_found(msg: str) -> bool:
-    return any(s in msg for s in ("HTTP 404", "Not Found", "No data found", "no chart data", "no candles"))
+    """An unknown symbol: Yahoo 404 / 'Not Found', Coinbase 404 or no candles, Binance 'has no spot pair'."""
+    return any(s in msg for s in ("HTTP 404", "Not Found", "No data found", "no chart data", "no candles",
+                                  "has no spot pair"))
 
 
 def scan_one(entry: Dict[str, Any], now: datetime, ttl: Optional[float] = None,
              **opts: Any) -> Dict[str, Any]:
     """Fetch + evaluate one universe row. Never raises: failures come back as a status."""
     sym = entry["symbol"]
+    if tc.market().every_day and not tc.is_crypto_symbol(sym):
+        # Backstop: a listed coin name tc's pair format cannot read would be taken for a stock ticker
+        # by tc.fetch_bars and sent to Yahoo. Ask nobody. (tc reads one-letter and non-Latin names.)
+        return {"symbol": sym, "status": "skipped", "kind": "unsupported name", "reason": UNSUPPORTED_PAIR}
     try:
         bars, meta = tc.fetch_bars(sym, "1d", "6mo", ttl=ttl)
     except tc.FetchError as e:
@@ -492,8 +510,18 @@ def replay_warning(ahead: Sequence[Dict[str, Any]], now: datetime) -> Optional[s
             "(a daily bar cannot be cut at a time of day)")
 
 
-def market_notes(m: tc.Market, wanted: Optional[Sequence[str]] = None) -> List[str]:
-    """What a scan of market `m` leaves out, in words (none for US stocks)."""
+def usdt_priced(symbols: Iterable[str]) -> List[str]:
+    """The -USD pairs among `symbols` that the configured exchange prices from a USDT pair
+    (Binance's few USD pairs are thin, so BTC-USD comes from BTCUSDT); none on Coinbase."""
+    if tc.crypto_exchange() != "binance":
+        return []
+    return [s for s in symbols if tc.is_crypto_symbol(s) and tc.crypto_pair(s)[1] == "USD"]
+
+
+def market_notes(m: tc.Market, wanted: Optional[Sequence[str]] = None,
+                 symbols: Sequence[str] = ()) -> List[str]:
+    """What a scan of market `m` leaves out, in words (none for US stocks). `symbols` (the scanned
+    ones) adds a note when -USD pairs are priced from USDT pairs."""
     if not m.every_day:
         return []
     skipped = [s for s in GAP_SETUPS if wanted is None or s in wanted]
@@ -502,6 +530,12 @@ def market_notes(m: tc.Market, wanted: Optional[Sequence[str]] = None) -> List[s
     if skipped:
         notes.append(f"gap setups ({', '.join(skipped)}) are skipped: a 24/7 market has no opening bell, "
                      "so each daily bar opens where the last one closed")
+    usd = usdt_priced(symbols)
+    if usd:
+        listed = ", ".join(usd[:4]) + (", ..." if len(usd) > 4 else "")
+        which = "is priced from its USDT pair" if len(usd) == 1 else "are priced from their USDT pairs"
+        notes.append(f"{tc.exchange_name()}'s few USD pairs are thin: {listed} {which} (USDT trades close to, "
+                     "not exactly at, $1)")
     return notes
 
 
@@ -611,7 +645,7 @@ def run_scan(universe: Sequence[Dict[str, Any]], now: datetime, *, workers: int 
         "incomplete": stop_reason is not None,
         "warning": stop_reason,
         "replay_warning": replay_warning(ahead, now),
-        "notes": market_notes(mkt, opts.get("wanted")),
+        "notes": market_notes(mkt, opts.get("wanted"), [e["symbol"] for e in universe]),
         "filters": {"min_price": opts.get("min_price", DEFAULT_MIN_PRICE),
                     "min_dollar_volume": opts.get("min_dollar_volume", DEFAULT_MIN_DOLLAR_VOLUME),
                     "setups": list(opts.get("wanted") or [])},
@@ -626,15 +660,17 @@ _SYMBOL_RE = re.compile(r"[A-Z0-9][A-Z0-9.\-]{0,11}")
 
 
 def parse_symbol_list(text: str) -> List[str]:
-    """'tsla, nvda AAPL' -> ['TSLA', 'NVDA', 'AAPL'] (deduped, Yahoo spelling treated alike)."""
+    """'tsla, nvda AAPL' -> ['TSLA', 'NVDA', 'AAPL'] (deduped, Yahoo spelling treated alike, and a
+    crypto pair's two spellings too: BTC-USDT = BTCUSDT)."""
     out, seen = [], set()
     for raw in re.split(r"[\s,]+", text or ""):
         s = raw.strip().upper().lstrip("$")
         if not s:
             continue
-        if not _SYMBOL_RE.fullmatch(s):
+        crypto = tc.is_crypto_symbol(s)        # e.g. 1000SATS-USDT: longer than a stock ticker
+        if not crypto and not _SYMBOL_RE.fullmatch(s):
             raise ValueError(f"not a ticker symbol: {raw!r}")
-        key = tc.yahoo_symbol(s)
+        key: Any = tc.crypto_pair(s) if crypto else tc.yahoo_symbol(s)
         if key not in seen:
             seen.add(key)
             out.append(s)
@@ -765,23 +801,27 @@ class _Explicit(argparse.Action):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = tc.make_parser("Scan US stocks (or Coinbase crypto pairs) for daily-chart setups (breakout, "
-                       "breakdown, gaps, unusual volume, pullback, NR7) and rank them.")
+    p = tc.make_parser("Scan US stocks (or crypto pairs: Binance prices by default, or Coinbase) for "
+                       "daily-chart setups (breakout, breakdown, gaps, unusual volume, pullback, NR7) and "
+                       "rank them.")
     p.set_defaults(explicit=frozenset())
     p.add_argument("--symbols", help="comma-separated tickers to scan instead of the whole market "
-                                     "(crypto pairs like BTC-USD scan as crypto)")
+                                     "(crypto pairs like BTC-USDT scan as crypto)")
     p.add_argument("--market", choices=tuple(tc.MARKETS),
-                   help="us (default) or crypto (Coinbase USD pairs, 24/7, UTC days)")
+                   help="us (default) or crypto (the crypto exchange's dollar pairs: Binance USDT or "
+                        "Coinbase USD; 24/7, UTC days)")
     p.add_argument("--limit", type=int, help="scan only the first N symbols of the universe")
     p.add_argument("--setups", help=f"only these setups (comma-separated): {', '.join(SETUPS)}")
     p.add_argument("--top", type=int, default=25, help="rows to show (default 25, 0 = all)")
     p.add_argument("--min-price", type=float, default=DEFAULT_MIN_PRICE, action=_Explicit,
                    help="minimum last price (default 5; crypto 0)")
     p.add_argument("--min-dollar-volume", default=str(int(DEFAULT_MIN_DOLLAR_VOLUME)), action=_Explicit,
-                   help="minimum 20-day average close x volume, e.g. 20M (default 20,000,000; crypto 5M)")
+                   help="minimum 20-day average close x volume, e.g. 20M (default 20,000,000; crypto 5M, "
+                        "in USDT on Binance)")
     p.add_argument("--include-etfs", action="store_true", help="add ETFs to the market universe (US only)")
     p.add_argument("--workers", type=int, default=8, action=_Explicit,
-                   help=f"parallel downloads (default 8, crypto {CRYPTO_WORKERS}; max 32)")
+                   help=f"parallel downloads (default 8; crypto {CRYPTO_WORKERS['binance']} on Binance, "
+                        f"{CRYPTO_WORKERS['coinbase']} on Coinbase; max 32)")
     p.add_argument("--quiet", action="store_true", help="no progress lines on stderr")
     return p   # tc's parser: bad flags are bad input, exit 1 (2 means a data source is down)
 
@@ -819,8 +859,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.min_price = CRYPTO_MIN_PRICE
     if crypto and "min_dollar_volume" not in args.explicit:
         args.min_dollar_volume = str(int(CRYPTO_MIN_DOLLAR_VOLUME))
+    exchange = tc.crypto_exchange() if crypto else None
     if crypto and "workers" not in args.explicit:
-        args.workers = CRYPTO_WORKERS
+        args.workers = CRYPTO_WORKERS[exchange]
     min_dv = parse_amount(args.min_dollar_volume)
     if args.min_price < 0 or not math.isfinite(args.min_price):
         raise ValueError("--min-price must be >= 0")
@@ -833,11 +874,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     say = None if args.quiet else (lambda msg: print(msg, file=sys.stderr, flush=True))
 
     if symbols:
-        universe = [{"symbol": s} for s in symbols]
+        universe = [{"symbol": s, "exchange": tc.exchange_name()} if crypto else {"symbol": s} for s in symbols]
     elif crypto:
-        universe = tc.crypto_symbols("USD")
+        universe = tc.crypto_symbols("USD")    # Binance: its USDT pairs (its few USD pairs are thin)
         if not universe:
-            raise tc.FetchError("Coinbase's product list has no online USD pairs")
+            raise tc.FetchError(f"{tc.exchange_name()} lists no tradable "
+                                f"{'USDT' if exchange == 'binance' else 'USD'} pairs")
     else:
         universe = tc.us_symbols(include_etfs=args.include_etfs)
         if not universe:
@@ -853,13 +895,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     now = tc.now_et()
     if say and len(deduped) > PROGRESS_EVERY:
-        say(f"scanning {len(deduped):,} symbols with {args.workers} workers - a full-market scan "
-            "takes a few minutes (use --limit or --symbols for a quick run)")
+        say(f"scanning {len(deduped):,} symbols with {args.workers} workers - "
+            + (f"a full {tc.exchange_name()} scan takes a minute or so" if crypto else
+               "a full-market scan takes a few minutes")
+            + " (use --limit or --symbols for a quick run)")
     res = run_scan(deduped, now, workers=args.workers, top=args.top,
                    ttl=120 if tc.is_market_open(now) else 900, progress=say,
                    min_price=args.min_price, min_dollar_volume=min_dv, wanted=wanted,
                    replay=bool(os.environ.get("DAYTRADER_NOW")))
-    res["filters"]["universe"] = ("symbols" if args.symbols else "coinbase_usd" if crypto else
+    res["filters"]["universe"] = ("symbols" if args.symbols else CRYPTO_UNIVERSE[exchange] if crypto else
                                   "us_common+etfs" if args.include_etfs else "us_common")
     res["disclaimer"] = tc.DISCLAIMER
     tc.emit(res, args.json, render)

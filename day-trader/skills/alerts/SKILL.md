@@ -8,9 +8,9 @@ description: >-
   lows. Use when the user says "alert me if TSLA hits 370", "tell me when NVDA breaks 180", "ping me
   if it drops below my stop", "let me know if AMD moves 3%", "watch for a VWAP reclaim", "set alerts
   for my plan", "did any of my alerts go off?", "what alerts do I have?", "remove the TSLA alerts",
-  or "watch my levels while I'm away". Crypto pairs (BTC-USD, ETH-USD) work 24/7 on Coinbase
-  prices. Free Yahoo Finance and Coinbase data, no API key. Alerts only notify - nothing here places
-  an order; paper trading only.
+  or "watch my levels while I'm away". Crypto pairs (BTC-USDT, ETH-USDT, BTC-USD) work 24/7 on
+  Binance prices by default (or Coinbase). Free Yahoo Finance and Binance or Coinbase data, no API
+  key. Alerts only notify - nothing here places an order; paper trading only.
 ---
 # Alerts
 
@@ -42,10 +42,10 @@ python3 scripts/alerts.py remove ALR-20261030-001 ALR-20261030-002
 python3 scripts/alerts.py remove --symbol TSLA
 python3 scripts/alerts.py remove --fired
 python3 scripts/alerts.py remove --all
-python3 scripts/alerts.py add BTC-USD --below 98000 --once           # crypto pair: Coinbase, 24/7, UTC
+python3 scripts/alerts.py add BTC-USDT --below 98000 --once          # crypto pair: Binance, 24/7, UTC
 ```
 
-Symbols are Yahoo tickers (`BRK.B`, `^GSPC` for an index) or Coinbase crypto pairs (`BTC-USD`). `add` takes exactly one of `--above
+Symbols are Yahoo tickers (`BRK.B`, `^GSPC` for an index) or crypto pairs (`BTC-USDT`, `BTCUSDT`, `BTC-USD`). `add` takes exactly one of `--above
 PRICE`, `--below PRICE`, `--pct-move PCT` or `--vwap-cross [any|above|below]` (put it after the
 symbol), plus `--note TEXT`, `--once`, `--rearm-pct PCT` (default 0.25), and for `--pct-move` only
 `--ref PRICE|prev-close`. `add` and `from-plan` download the current
@@ -68,7 +68,8 @@ watch (final summary with `"stopped": "data error"`, then exit 2).
 ## How it works
 - **Data:** one Yahoo `5m` chart request per symbol per check (`5d` range; `1mo`/`60d` when an alert
   has not been checked for longer), regular session 09:30-16:00 ET only, plus Yahoo's last price folded
-  into the bar still forming. Bars are snapped to the 5-minute grid and rounded to 4 decimals.
+  into the bar still forming. Bars are snapped to the 5-minute grid and rounded to 4 decimals
+  (crypto prices stay exact: sub-cent coins need more digits).
 - **Only post-creation prices count.** Each alert keeps a cursor (bars already processed are not
   re-read). The bar the alert was created in may have made its high/low earlier, so it counts only if
   it later makes a *new* high/low past the snapshot taken at creation, or closes beyond the level.
@@ -89,8 +90,12 @@ watch (final summary with `"stopped": "data error"`, then exit 2).
   `above`/`below` fire only on that direction (the other direction silently re-arms it). Needs
   volume: symbols Yahoo reports without volume (indexes like `^VIX`, FX) are refused - use levels.
 - `--once`: switches off after its first fire (status `fired`; clean up with `remove --fired`).
-- **Crypto** (`BTC-USD`, ...): Coinbase Exchange 5-minute candles (`api.exchange.coinbase.com`, no
-  key), around the clock, weekends included. Each alert runs in its own symbol's market, so one
+- **Crypto** (`BTC-USDT`, ...; `BTC-USD` works too): 5-minute candles from **Binance by default (or
+  Coinbase)** - public data, no account, no key; the `crypto_exchange` setting or
+  `$DAYTRADER_CRYPTO_EXCHANGE` picks the exchange (Binance's few USD pairs are thin: there `BTC-USD` reads
+  `BTCUSDT`). A crypto alert records whose price armed it (`add` prints `last 100,000.00 on
+  Binance`; JSON `exchange`); a check on the other exchange says so in a `note:` and carries on with
+  it. Around the clock, weekends included. Each alert runs in its own symbol's market, so one
   `check` can mix stocks and crypto: for crypto the "session" (VWAP, `--ref prev-close`) is the UTC
   day, and its fire times print in UTC. The header uses the alerts' shared clock (ET if mixed).
 - Plan alerts (from `plans/<SYM>.json`): long = stop *below*, target *above*; short = mirror; entry =
@@ -117,8 +122,8 @@ watch (final summary with `"stopped": "data error"`, then exit 2).
 - JSON (`check`): `as_of, tz, market_open, markets {us|crypto: open?}, checked, active, fired [{id, symbol, market, kind, condition, leg,
   level, how (touch|gap|close), price, date, bar_time, bar_complete, bar {open, high, low, close}, vwap, last_price,
   note, once, deactivated, source, plan_role}], alerts [{id, symbol, condition, status, distance_pct,
-  waiting_for, fire_count, last_fired, levels [{dir, level, armed}], ...}], symbols {SYM: {range,
-  bars, last, last_bar}}, errors {SYM: msg}, notes []`. One symbol failing lands in `errors`; the
+  waiting_for, fire_count, last_fired, levels [{dir, level, armed}], exchange (crypto), ...}], symbols
+  {SYM: {range, bars, last, last_bar; crypto also market, exchange}}, errors {SYM: msg}, notes []`. One symbol failing lands in `errors`; the
   others are still checked.
 
 ## Next step on the desk
@@ -138,5 +143,6 @@ watch (final summary with `"stopped": "data error"`, then exit 2).
   anything go off?".
 - Exit code 1 = bad input or state (the message says what to fix). If the script exits with code 2
   ("data error: ..."), tell the user which host failed (it is in the message, e.g.
-  `query1.finance.yahoo.com` or `api.exchange.coinbase.com`) - in sandboxes the host may need to be allow-listed. Never invent
+  `query1.finance.yahoo.com`, or for crypto `data-api.binance.vision` on Binance and
+  `api.exchange.coinbase.com` on Coinbase) - in sandboxes the host may need to be allow-listed. Never invent
   prices, headlines, or odds to fill the gap; the alerts stay saved and unchanged.

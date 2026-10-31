@@ -5,11 +5,12 @@ when an edge case shows up in the notes, or when you chain the JSON into another
 
 ## Method, step by step
 
-1. **Bars.** `tc.fetch_bars(SYM, "5m", "60d")` (crypto: Coinbase candles over `max(60, sessions + 1)`
-   days, grouped by UTC day - see 10), regular session (09:30-16:00 ET) only, grouped by
-   ET date. A repeated live bar (Yahoo sometimes sends the current bar twice, or adds a separate
-   row stamped with the last trade time, e.g. 10:17:43, that may carry only the latest price) is
-   merged into its 5-minute slot: first open, highest high, lowest low, last close.
+1. **Bars.** `tc.fetch_bars(SYM, "5m", "60d")` (crypto: the exchange's candles, Binance by default
+   or Coinbase, over `max(60, sessions + 1)` days, grouped by UTC day - see 10), regular session
+   (09:30-16:00 ET) only, grouped by ET date. A repeated live bar (Yahoo sometimes sends the current
+   bar twice, or adds a separate row stamped with the last trade time, e.g. 10:17:43, that may carry
+   only the latest price) is merged into its 5-minute slot: first open, highest high, lowest low,
+   last close.
 2. **Library.** Past sessions = dates before today. Today's session joins only after today's
    close (then the replays are for the next session). Sessions with under 12 bars (1 hour) are
    skipped as glitches; fewer than 5 usable sessions is an error (exit 1). The most recent
@@ -60,19 +61,22 @@ when an edge case shows up in the notes, or when you chain the JSON into another
    points the way the two answers differ; otherwise it says the odds are sensitive to small
    time-of-day drifts. (A whole-window move near 0% can hide a drift in the first bars that is a
    sizeable share of a tight stop - the horizon measure shows it.)
-10. **Crypto** (Coinbase products such as BTC-USD; `tc.use_market_for` switches the market). The
-    session is the UTC day: 288 slots, 00:00-23:55 UTC, weekends included; the library is the
-    most recent `--sessions` UTC days before today (the fetch covers one day more, since the
-    window's first day is partial; today's UTC day never joins - it is not over). There is no
-    close, so the replays and the history check end at the time stop: the saved exit plan's
-    `exit_plan.time_stop` when valid, else 23:55 UTC (the last replayed bar is the one ending
-    there). Past the time stop the replays are for the next UTC day from 00:00. **Fees:**
-    `fees = fee_summary(...)` with `fee_pct = tc.fee_pct()` (setting `crypto_fee_pct`, default
-    0.6% of notional per fill): `at_target_r` / `at_stop_r` = fee x (entry + exit) / risk, the
-    open replays pay it at their average closing price, `expected_fees_r` = the count-weighted
-    mean, `expected_r_after_fees = expected_r - expected_fees_r`, `round_trip_r` = 2 x fee x entry /
-    risk, and `breakeven_win_rate_after_fees_pct` = (1 + at_stop) / (R:R - at_target + 1 + at_stop)
-    (null when even the target loses money after fees). The verdict uses `expected_r_after_fees`;
+10. **Crypto** (pairs such as BTC-USDT or BTC-USD; `tc.use_market_for` switches the market). Prices
+    come from Binance by default, or Coinbase (`tc.crypto_exchange()`: the `crypto_exchange` setting
+    or `$DAYTRADER_CRYPTO_EXCHANGE`); Binance's few USD pairs are thin, so there BTC-USD is replayed from
+    BTCUSDT and a note says so. The session is the UTC day: 288 slots, 00:00-23:55 UTC, weekends
+    included; the library is the most recent `--sessions` UTC days before today (the fetch covers
+    one day more, since the window's first day is partial; today's UTC day never joins - it is not
+    over). There is no close, so the replays and the history check end at the time stop: the saved
+    exit plan's `exit_plan.time_stop` when valid, else 23:55 UTC (the last replayed bar is the one
+    ending there). Past the time stop the replays are for the next UTC day from 00:00. **Fees:**
+    `fees = fee_summary(...)` with `fee_pct = tc.fee_pct()` (setting `crypto_fee_pct`; unset, the
+    exchange's entry-tier taker fee: 0.1% of notional per fill on Binance, 0.6% on Coinbase):
+    `at_target_r` / `at_stop_r` = fee x (entry + exit) / risk, the open replays pay it at their
+    average closing price, `expected_fees_r` = the count-weighted mean,
+    `expected_r_after_fees = expected_r - expected_fees_r`, `round_trip_r` = 2 x fee x entry / risk,
+    and `breakeven_win_rate_after_fees_pct` = (1 + at_stop) / (R:R - at_target + 1 + at_stop) (null
+    when even the target loses money after fees). The verdict uses `expected_r_after_fees`;
     `expected_r` stays the before-fees value.
 11. **Seed.** Default = first 48 bits of sha256("SYMBOL|YYYY-MM-DD"). Same symbol, same day, same
     flags -> the same numbers. The SVG's 300 drawn paths are the first 300 replays; their
@@ -104,6 +108,9 @@ when an edge case shows up in the notes, or when you chain the JSON into another
 * `only N past sessions` (< 20) - rough odds. `newest 5-minute data is from ...` (> 7 days) -
   halted/delisted/stale.
 * `past sessions only have bars until HH:MM` - the replays stop early (only half days at that time).
+* Crypto: `BTC-USD is priced from Binance's BTCUSDT pair, quoted in USDT (Binance's few USD
+  pairs are thin)` - the odds come from the USDT pair; `Binance returned N usable past days (UTC) ... - a
+  recent listing?` (or `Coinbase returned ...`) - fewer days than `--sessions` asked for.
 * `the saved SYM entry X is an entry-skill trigger (ORB(15) at 10:15 ET): trigger is from the
   finished <date> session - re-plan from the next open` - the plan's entry came from `entry.py
   --save` after that session had closed (or for a past `--date`), or from a trigger on an earlier

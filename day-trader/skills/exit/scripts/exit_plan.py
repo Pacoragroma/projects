@@ -15,10 +15,13 @@ Usage:
   python3 scripts/exit_plan.py TSLA --side short --entry 364.18 --save  # store in plans/TSLA.json
   python3 scripts/exit_plan.py TSLA --method manual --save              # reuse the saved plan's entry+stop
   python3 scripts/exit_plan.py TSLA --entry 364.18 --json
-  python3 scripts/exit_plan.py BTC-USD --save                           # crypto: UTC day, 23:55 time stop
+  python3 scripts/exit_plan.py BTC-USDT --save                          # crypto: UTC day, 23:55 time stop
 
-Crypto (a Coinbase product such as BTC-USD) trades 24/7: times are UTC, "today" is the UTC day,
-the default time stop is 23:55 UTC and prices round to the product's price increment.
+Crypto (a pair such as BTC-USDT; BTC-USD works too) trades 24/7: times are UTC, "today" is the UTC
+day, the default time stop is 23:55 UTC and prices round to the pair's price tick. Prices come from
+Binance's public market data by default, or Coinbase's (the crypto_exchange setting, or
+$DAYTRADER_CRYPTO_EXCHANGE). The plan shows the paper fees in R: crypto_fee_pct per fill, which
+defaults to that exchange's entry-tier taker fee (Binance 0.1%, Coinbase 0.6%).
 
 Exit codes: 0 ok, 1 bad input (or not enough bars for the method), 2 data source unreachable.
 """
@@ -73,8 +76,9 @@ def _tz() -> str:
 def tick(price: float, rounding: str = ROUND_HALF_UP, increment: Optional[float] = None) -> float:
     """Round to the quoting tick: cents at $1 and up, $0.0001 below $1 (half-up, as people round).
 
-    Crypto: the product's price increment (Coinbase quote_increment) when given; without it,
-    cents at $1 and up and 4 significant digits below (sub-cent coins quote far below $0.0001).
+    Crypto: the pair's price tick (tc.product_info's quote_increment: Binance tickSize, Coinbase
+    quote_increment) when given; without it, cents at $1 and up and 4 significant digits below
+    (sub-cent coins quote far below $0.0001).
     The value is first cleaned to 8 decimals so float noise (98.49999999999999) cannot flip a
     floor/ceiling rounding by a whole tick.
     """
@@ -233,7 +237,7 @@ def make_plan(side: str, entry: float, method: str, bars: Sequence[tc.Bar],
       'HH:MM', today 'YYYY-MM-DD', now_ts (bars ending after it are not complete),
       min_rr (warn below), last_price (stale-plan checks), market_open (False: last_price is the
       previous close, so those checks are worded as conditional on the open), tick (crypto: the
-      product's price increment), fee_pct (crypto: paper fee per fill, % - adds `fees` in R).
+      pair's price tick), fee_pct (crypto: paper fee per fill, % - adds `fees` in R).
     Defaults follow the active market (time stop 15:55 ET; 23:55 UTC for crypto).
     """
     p = dict(DEFAULTS, time_stop=tc.market().time_stop)
@@ -525,7 +529,7 @@ def time_context(now: datetime, time_stop_min: int, session_end: Optional[int] =
             warnings.append(f"only {minutes_left} minutes left before the {tc.hhmm(ts_min)} time stop")
         if last_bar is not None and now_min >= tc.MARKET_OPEN + 10:
             if last_bar.date != today:
-                why = ("delayed data or no trades - is the product still trading?" if every_day
+                why = ("delayed data or no trades - is the pair still trading?" if every_day
                        else "delayed data, a market holiday, or the stock is halted")
                 warnings.append(f"no 5-minute bars from today yet (latest {_stamp(last_bar)} {tz}) - {why}")
             elif now.timestamp() - (last_bar.ts + BAR_SECONDS) > STALE_DATA_SECONDS:
@@ -647,7 +651,8 @@ def _int(value: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = tc.make_parser("Set the stop, target and time stop before you enter a day trade (THE PLAN). "
                        "Paper planning only - not financial advice.")
-    p.add_argument("symbol", help="ticker, e.g. TSLA, or a Coinbase product such as BTC-USD")
+    p.add_argument("symbol", help="ticker, e.g. TSLA, or a crypto pair such as BTC-USDT (Binance prices by "
+                   "default, or Coinbase)")
     p.add_argument("--entry", type=_number, help="planned entry price (default: the saved plan's "
                    "entry, else the current price)")
     p.add_argument("--side", type=str.lower, choices=("long", "short"),
@@ -682,13 +687,15 @@ def parse_symbol(raw: str) -> str:
 
 
 def _not_found(err: Exception) -> bool:
+    """An unknown symbol: Yahoo 'Not Found', Coinbase 404, Binance 400 ('has no spot pair')."""
     msg = str(err)
-    return any(s in msg for s in ("HTTP 404", "Yahoo: Not Found", "No data found", "no chart data"))
+    return any(s in msg for s in ("HTTP 404", "Yahoo: Not Found", "No data found", "no chart data",
+                                  "has no spot pair"))
 
 
 def price_increment(sym: str) -> Tuple[Optional[float], Optional[str]]:
-    """Crypto: (Coinbase quote_increment, None), or (None, note) when the product list is
-    unreachable - tick() then keeps cents (4 significant digits below $1). Stocks: (None, None)."""
+    """Crypto: (the pair's price tick from the exchange's rules, None), or (None, note) when they
+    are unreachable - tick() then keeps cents (4 significant digits below $1). Stocks: (None, None)."""
     if not _crypto():
         return None, None
     try:
@@ -696,6 +703,24 @@ def price_increment(sym: str) -> Tuple[Optional[float], Optional[str]]:
     except (tc.FetchError, KeyError, TypeError, ValueError) as e:
         return None, (f"{sym} price increment unavailable ({e}); prices are rounded to cents "
                       "(4 significant digits below $1)")
+
+
+def price_source_note(sym: str, meta: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Crypto: a note when the exchange prices `sym` from a pair in another currency (Binance has
+    few, thin USD pairs, so BTC-USD comes from BTCUSDT). None for stocks and pairs priced as typed."""
+    m = meta or {}
+    if not _crypto() or not m.get("symbol") or not m.get("currency"):
+        return None
+    try:
+        quote = tc.crypto_pair(sym)[1]
+    except ValueError:
+        return None
+    ccy = str(m["currency"]).upper()
+    if ccy == quote:
+        return None
+    name = tc.exchange_name()
+    return (f"{sym} is priced from {name}'s {m['symbol']} pair, quoted in {ccy} "
+            f"({name}'s few {quote} pairs are thin)")
 
 
 def _plan_number(plan: Dict[str, Any], key: str) -> Optional[float]:
@@ -740,7 +765,7 @@ def save(res: Dict[str, Any], existing: Optional[Dict[str, Any]]) -> Tuple[Dict[
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     sym = parse_symbol(args.symbol)
-    tc.use_market_for(sym)               # crypto (BTC-USD): UTC days, 24/7, Coinbase prices
+    tc.use_market_for(sym)               # crypto (BTC-USDT): UTC days, 24/7, Binance or Coinbase prices
     given = [k for k in ("stop", "pct", "lookback", "atr_mult") if getattr(args, k) is not None]
     method = resolve_method(args.method, given)
     time_stop_min = parse_time_stop(args.time_stop or tc.market().time_stop)
@@ -764,14 +789,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         stop, stop_source = plan_stop, "saved plan"
 
     # 5-minute bars: required for atr/structure, optional context for percent/manual.
-    source = "Coinbase" if _crypto() else "Yahoo"
+    source = tc.exchange_name() if _crypto() else "Yahoo"
     increment: Optional[float] = None
     try:
         raw, meta = tc.fetch_bars(sym, "5m", "5d")
     except tc.FetchError as e:
         if _not_found(e):
             if _crypto():
-                raise ValueError(f"Coinbase has no product {sym} - check the symbol (e.g. BTC-USD)") from e
+                raise ValueError(f"{source} has no pair {sym} - check the symbol (e.g. BTC-USDT)") from e
             raise ValueError(f"Yahoo Finance has no data for {sym} - check the symbol") from e
         if method in ("atr", "structure") or (args.entry is None and plan_entry is None):
             raise
@@ -781,6 +806,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         increment, inc_note = price_increment(sym)   # crypto only; the data host answered, so try it
         if inc_note:
             notes.append(inc_note)
+        src_note = price_source_note(sym, meta)       # crypto: BTC-USD priced from BTCUSDT on Binance
+        if src_note:
+            notes.append(src_note)
     bars = usable_bars(raw, now_ts)
     if method in ("atr", "structure") and not bars:
         raise ValueError(f"{source} returned no regular-session 5-minute bars for {sym} in the last 5 days "

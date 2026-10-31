@@ -3,7 +3,9 @@
 The smoke test is meant for the live hosts, so here every source is faked: tc.fetch_bars via
 helpers.fake_bars and tc.http_get via helpers.fake_http (the House index zip and PTR PDF come
 from test_pelosi's builders), or urlopen itself for the blocked-proxy case. Crypto bars go
-through the real tc.coinbase_bars (its paging and candle parser) on fake_http's Coinbase routes.
+through the real tc.crypto_bars dispatch - tc.binance_bars or tc.coinbase_bars, their paging and
+candle parsers - on fake_http's Binance and Coinbase routes, so the binance-* and coinbase-*
+checks must each pin their own exchange whatever $DAYTRADER_CRYPTO_EXCHANGE says.
 One synthetic world makes every check PASS; broken, stale, odd-shaped and blocked sources must
 turn into FAIL rows (exit 1) without stopping the other checks.
 """
@@ -19,12 +21,12 @@ import time
 import unittest
 import urllib.error
 from contextlib import redirect_stdout
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import (ROOT, TempHomeTestCase, coinbase_rows, crypto_history, daily_bars, et_ts,  # noqa: E402
-                     fake_bars, fake_http, random_walk_history, tc, utc_ts)
+from helpers import (ROOT, TempHomeTestCase, binance_rows, coinbase_rows, crypto_history, daily_bars,  # noqa: E402
+                     et_ts, fake_bars, fake_http, random_walk_history, tc, utc_ts)
 import test_pelosi as tp  # noqa: E402  (synthetic House index zips and PTR PDFs)
 
 TOOL = ROOT / "tools" / "smoke_live.py"
@@ -38,16 +40,20 @@ SYM = "TSLA"
 CIK = 1318605
 SUBMISSIONS = f"data.sec.gov/submissions/CIK{CIK:010d}.json"
 PTR_DOC = "20026590"
-CSYM = "BTC-USD"
+CSYM = "BTC-USD"                       # the Coinbase pair
+BSYM, BPAIR = "BTC-USDT", "BTCUSDT"    # the Binance pair, as typed and as Binance names it
 UTC_DAY = "2026-10-30"                 # NOW is 20:30 UTC
 HOSTS = {"yahoo-5m": "query1/query2.finance.yahoo.com", "yahoo-1d": "query1/query2.finance.yahoo.com",
          "yahoo-quote": "query1/query2.finance.yahoo.com", "nasdaq-symbols": "www.nasdaqtrader.com",
          "news-rss": "feeds.finance.yahoo.com", "news-search": "query1/query2.finance.yahoo.com",
          "sec-filings": "www.sec.gov, data.sec.gov", "house-index": "disclosures-clerk.house.gov",
-         "house-ptr": "disclosures-clerk.house.gov", "coinbase-5m": "api.exchange.coinbase.com",
+         "house-ptr": "disclosures-clerk.house.gov", "binance-5m": "data-api.binance.vision",
+         "binance-1d": "data-api.binance.vision", "binance-ticker": "data-api.binance.vision",
+         "binance-products": "data-api.binance.vision", "coinbase-5m": "api.exchange.coinbase.com",
          "coinbase-1d": "api.exchange.coinbase.com", "coinbase-ticker": "api.exchange.coinbase.com",
          "coinbase-products": "api.exchange.coinbase.com"}
 N_CHECKS = len(HOSTS)
+BINANCE_CHECKS = ["binance-5m", "binance-1d", "binance-ticker", "binance-products"]
 COINBASE_CHECKS = ["coinbase-5m", "coinbase-1d", "coinbase-ticker", "coinbase-products"]
 
 
@@ -164,6 +170,44 @@ def coinbase_routes(five: Optional[List[tc.Bar]] = None, daily: Optional[List[tc
     }
 
 
+def binance_pair(base: str, quote: str = "USDT", status: str = "TRADING", spot: bool = True,
+                 step: str = "0.00001000", tick: str = "0.01000000", min_notional: Any = "5.00000000") -> Dict[str, Any]:
+    """One exchangeInfo symbol row, with the three filters the skills read."""
+    filters = [{"filterType": "PRICE_FILTER", "minPrice": "0.01000000", "maxPrice": "1000000.00000000", "tickSize": tick},
+               {"filterType": "LOT_SIZE", "minQty": step, "maxQty": "9000.00000000", "stepSize": step}]
+    if min_notional is not None:
+        filters.append({"filterType": "NOTIONAL", "minNotional": min_notional, "applyMinToMarket": True})
+    return {"symbol": base + quote, "status": status, "baseAsset": base, "quoteAsset": quote,
+            "isSpotTradingAllowed": spot, "filters": filters}
+
+
+def binance_universe(n_usdt: int = 120, extra: Sequence[Dict[str, Any]] = ()) -> Dict[str, Any]:
+    """exchangeInfo for every trading spot pair: 123 tradable USDT coins once stablecoins are left out."""
+    rows = [binance_pair(b) for b in ("BTC", "ETH", "SOL", "USDC", "FDUSD")] + [binance_pair("ETH", "BTC")]
+    rows += [binance_pair(f"C{i:03d}") for i in range(n_usdt)] + [binance_pair("OLD", status="BREAK")]
+    return {"timezone": "UTC", "symbols": rows + list(extra)}
+
+
+def binance_routes(five: Optional[List[tc.Bar]] = None, daily: Optional[List[tc.Bar]] = None,
+                   price: Optional[float] = None, bid: Optional[float] = None, ask: Optional[float] = None,
+                   close_time: Optional[float] = None, universe: Any = None, pair_info: Any = None) -> Dict[str, Any]:
+    """Binance's public market-data endpoints on data-api.binance.vision (fake_http matches substrings)."""
+    five = crypto_five() if five is None else five
+    last = five[-1].close if five else 100_000.0
+    price = round(last + 3.0, 2) if price is None else price
+    when = utc_ts(UTC_DAY, "20:29") + 55 if close_time is None else close_time
+    return {
+        f"/klines?symbol={BPAIR}&interval=5m&": binance_rows(five),
+        f"/klines?symbol={BPAIR}&interval=1d&": binance_rows(crypto_daily() if daily is None else daily, 1440),
+        f"/ticker/24hr?symbol={BPAIR}": {"symbol": BPAIR, "lastPrice": f"{price:.8f}", "openPrice": "98000.00000000",
+                                         "bidPrice": f"{(price - 0.01) if bid is None else bid:.8f}",
+                                         "askPrice": f"{(price + 0.01) if ask is None else ask:.8f}",
+                                         "volume": "9000.00000000", "closeTime": int(when * 1000)},
+        f"/exchangeInfo?symbol={BPAIR}": {"symbols": [binance_pair("BTC")]} if pair_info is None else pair_info,
+        "/exchangeInfo?permissions=SPOT&symbolStatus=TRADING": binance_universe() if universe is None else universe,
+    }
+
+
 def http_world() -> Dict[str, Any]:
     pelosi = smoke.load_skill("pelosi", "pelosi")
     routes: Dict[str, Any] = dict(symbol_files())
@@ -175,6 +219,7 @@ def http_world() -> Dict[str, Any]:
         pelosi.INDEX_URL.format(year=2026): house_index(),
         pelosi.ptr_url(2026, PTR_DOC): tp.pelosi_pdf_bytes(),
     })
+    routes.update(binance_routes())
     routes.update(coinbase_routes())
     return routes
 
@@ -199,8 +244,8 @@ class SmokeTestCase(TempHomeTestCase):
         stocks = mocks[0].side_effect
 
         def fetch(symbol: str, interval: str = "5m", range_: str = "60d", prepost: bool = False, ttl: Any = None):
-            if tc.is_crypto_symbol(symbol):          # the real Coinbase paging and parser, on the fake routes
-                return tc.coinbase_bars(symbol, interval, range_, ttl)
+            if tc.is_crypto_symbol(symbol):          # the real exchange dispatch, paging and parsers, on the fake routes
+                return tc.crypto_bars(symbol, interval, range_, ttl)
             return stocks(symbol, interval, range_, prepost, ttl)
         mocks[0].side_effect = fetch
         return mocks[0], mocks[1]
@@ -222,8 +267,9 @@ class AllPassTests(SmokeTestCase):
         self.assertEqual({n: r["status"] for n, r in rows.items()}, {n: "PASS" for n in smoke.CHECK_NAMES},
                          json.dumps(res, indent=1))
         self.assertEqual((res["ok"], res["passed"], res["failed"], res["skipped"]), (True, N_CHECKS, 0, 0))
-        self.assertEqual((res["symbol"], res["crypto_symbol"]), (SYM, CSYM))
+        self.assertEqual((res["symbol"], res["binance_symbol"], res["crypto_symbol"]), (SYM, BSYM, CSYM))
         self.assertEqual({n: r["host"] for n, r in rows.items()}, HOSTS)
+        self.assertLess(smoke.CHECK_NAMES.index("binance-5m"), smoke.CHECK_NAMES.index("coinbase-5m"))  # the default first
 
         self.assertIn("3,120 bars, 40 sessions", rows["yahoo-5m"]["detail"])
         self.assertIn("125 daily bars", rows["yahoo-1d"]["detail"])
@@ -236,9 +282,16 @@ class AllPassTests(SmokeTestCase):
         self.assertIn("3 filings in the 2026 index, 2 PTRs, newest filed 2026-10-29", rows["house-index"]["detail"])
         self.assertIn(f"DocID {PTR_DOC} (", rows["house-ptr"]["detail"])
         self.assertIn("6 trade(s)", rows["house-ptr"]["detail"])
-        self.assertIn("575 candles over 3 UTC days 2026-10-28..2026-10-30, last 2026-10-30 20:25 UTC",
-                      rows["coinbase-5m"]["detail"])
-        self.assertIn("150 daily candles 2026-06-03..2026-10-30 (UTC days)", rows["coinbase-1d"]["detail"])
+        for ex in ("binance", "coinbase"):
+            self.assertIn("575 candles over 3 UTC days 2026-10-28..2026-10-30, last 2026-10-30 20:25 UTC",
+                          rows[f"{ex}-5m"]["detail"])
+            self.assertIn("150 daily candles 2026-06-03..2026-10-30 (UTC days)", rows[f"{ex}-1d"]["detail"])
+        self.assertIn(f"{BPAIR} ", rows["binance-ticker"]["detail"])
+        self.assertIn(" USDT at 2026-10-30 20:29 UTC · bid ", rows["binance-ticker"]["detail"])
+        self.assertIn("· 24h open 98,000.00", rows["binance-ticker"]["detail"])
+        self.assertEqual(rows["binance-products"]["detail"],
+                         "123 trading USDT pairs (stablecoins left out); BTCUSDT trading, size step 0.00001, "
+                         "tick 0.01, minimum order 5 USDT")
         self.assertIn(f"{CSYM} ", rows["coinbase-ticker"]["detail"])
         self.assertIn(" USD at 2026-10-30 20:29 UTC · bid ", rows["coinbase-ticker"]["detail"])
         self.assertIn("· 24h open 98,000.00", rows["coinbase-ticker"]["detail"])
@@ -247,10 +300,10 @@ class AllPassTests(SmokeTestCase):
                          "size step 0.00000001, tick 0.01")
 
         # The skills' own code paths, one request per source (the Nasdaq list is two files; Coinbase
-        # pages its candles, 300 a request, and the ticker brings its 24 h stats).
+        # pages its candles 300 a request and Binance 1,000; Coinbase's ticker brings its 24 h stats).
         self.assertEqual(sorted((c.args[0], c.args[1], c.args[2]) for c in bars.call_args_list),
-                         [(CSYM, "1d", "6mo"), (CSYM, "5m", "2d"), (SYM, "1d", "6mo"), (SYM, "1m", "1d"),
-                          (SYM, "5m", "60d")])
+                         [(CSYM, "1d", "6mo"), (CSYM, "5m", "2d"), (BSYM, "1d", "6mo"), (BSYM, "5m", "2d"),
+                          (SYM, "1d", "6mo"), (SYM, "1m", "1d"), (SYM, "5m", "60d")])
         urls = [c.args[0] for c in http.call_args_list]
         self.assertEqual(len(urls), len(set(urls)), urls)
         coinbase = [u for u in urls if u.startswith(tc.COINBASE_API)]
@@ -259,7 +312,13 @@ class AllPassTests(SmokeTestCase):
         self.assertEqual(sorted(coinbase), sorted(pages + [f"{tc.COINBASE_API}/products/{CSYM}/ticker",
                                                            f"{tc.COINBASE_API}/products/{CSYM}/stats",
                                                            f"{tc.COINBASE_API}/products"]))
-        self.assertEqual(len(urls) - len(coinbase), 8, urls)
+        binance = [u for u in urls if u.startswith(tc.BINANCE_API)]
+        pages = [w[0] for rng, gran in (("2d", "5m"), ("6mo", "1d"))
+                 for w in tc.binance_candle_windows(BSYM, gran, rng, NOW.timestamp())]
+        self.assertEqual(sorted(binance), sorted(pages + [f"{tc.BINANCE_API}/ticker/24hr?symbol={BPAIR}",
+                                                          f"{tc.BINANCE_API}/exchangeInfo?symbol={BPAIR}",
+                                                          smoke.BINANCE_UNIVERSE_URL]))
+        self.assertEqual(len(urls) - len(coinbase) - len(binance), 8, urls)
         self.assertTrue(any(u.startswith("https://query1.finance.yahoo.com/v1/finance/search?q=TSLA") for u in urls))
         self.assertIn(f"https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/{PTR_DOC}.pdf", urls)
         self.assertFalse(any("8221999" in u for u in urls), "a paper filing is never downloaded")
@@ -350,8 +409,9 @@ class FailureTests(SmokeTestCase):
         self.assertEqual({n: r["status"] for n, r in rows.items()},
                          {"yahoo-5m": "PASS", "yahoo-1d": "FAIL", "yahoo-quote": "FAIL", "nasdaq-symbols": "FAIL",
                           "news-rss": "FAIL", "news-search": "FAIL", "sec-filings": "FAIL",
-                          "house-index": "PASS", "house-ptr": "FAIL", "coinbase-5m": "PASS", "coinbase-1d": "PASS",
-                          "coinbase-ticker": "PASS", "coinbase-products": "PASS"})
+                          "house-index": "PASS", "house-ptr": "FAIL", "binance-5m": "PASS", "binance-1d": "PASS",
+                          "binance-ticker": "PASS", "binance-products": "PASS", "coinbase-5m": "PASS",
+                          "coinbase-1d": "PASS", "coinbase-ticker": "PASS", "coinbase-products": "PASS"})
         self.assertFalse(res["ok"])
         self.assertIn("older than 7 days - stale or frozen data?", rows["yahoo-1d"]["detail"])
         self.assertIn("no fixture for interval 1m", rows["yahoo-quote"]["detail"])
@@ -365,7 +425,7 @@ class FailureTests(SmokeTestCase):
         self.assertEqual(code, 1)
         self.assertRegex(text, r"(?m)^yahoo-1d\s+query1/query2[.]finance[.]yahoo[.]com\s+FAIL\s")
         self.assertRegex(text, r"(?m)^news-rss\s+feeds[.]finance[.]yahoo[.]com\s+FAIL\s")
-        self.assertIn(f"FAILED: 7 of {N_CHECKS} checks failed (6 passed).", text)
+        self.assertIn(f"FAILED: 7 of {N_CHECKS} checks failed (10 passed).", text)
         self.assertNotIn("Blocked:", text)      # these hosts answered; their data was wrong
 
     def test_a_parser_crash_is_a_fail_row(self):
@@ -418,9 +478,12 @@ class FailureTests(SmokeTestCase):
         self.assertIn("blocked by proxy for https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=300"
                       "&start=", out)
         self.assertIn("if you are in a sandbox, api.exchange.coinbase.com may need to be allow-listed", out)
+        self.assertIn("BTC-USDT: blocked by proxy for https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT"
+                      "&interval=5m&startTime=", out)
+        self.assertIn("if you are in a sandbox, data-api.binance.vision may need to be allow-listed", out)
         self.assertIn("Blocked: query1/query2.finance.yahoo.com; www.nasdaqtrader.com; feeds.finance.yahoo.com; "
-                      "www.sec.gov, data.sec.gov; disclosures-clerk.house.gov; api.exchange.coinbase.com - allow "
-                      "outbound HTTPS", out)
+                      "www.sec.gov, data.sec.gov; disclosures-clerk.house.gov; data-api.binance.vision; "
+                      "api.exchange.coinbase.com - allow outbound HTTPS", out)
         self.assertIn(f"FAILED: {N_CHECKS - 1} of {N_CHECKS} checks failed, 1 skipped (0 passed).", out)
 
 
@@ -446,7 +509,22 @@ class CoinbaseTests(SmokeTestCase):
         self.assertEqual([c.args[0] for c in http.call_args_list].count(f"{tc.COINBASE_API}/products"), 1)
         self.assertIs(tc.market(), tc.US)                         # each check's market scope is undone
         self.assertEqual(tc.coinbase_products.__name__, "coinbase_products")   # the one-list helper is undone
-        self.assertEqual(rows["coinbase-ticker"]["used_by"], "crypto: broker, exit, risk, budget")
+        self.assertEqual(rows["coinbase-ticker"]["used_by"], "crypto (coinbase): broker, exit, risk, budget")
+
+    def test_coinbase_checks_pin_coinbase_when_the_desk_prices_on_binance(self):
+        """Binance is the default: with no override (or one saying binance) the coinbase-* checks must still
+        ask Coinbase - through the same tc.fetch_bars / tc.quote / tc.product_info dispatch - and only Coinbase."""
+        for env in (None, "binance"):
+            with mock.patch.dict(os.environ):
+                os.environ.pop(smoke.EXCHANGE_ENV, None)
+                if env:
+                    os.environ[smoke.EXCHANGE_ENV] = env
+                bars, http = self.world()
+                rows = self.rows(smoke.run_checks(SYM, only=COINBASE_CHECKS, now=NOW))
+                self.assertEqual({n: r["status"] for n, r in rows.items()}, {n: "PASS" for n in COINBASE_CHECKS}, rows)
+                urls = [c.args[0] for c in http.call_args_list]
+                self.assertTrue(urls and all(u.startswith(tc.COINBASE_API) for u in urls), urls)
+                self.assertEqual(os.environ.get(smoke.EXCHANGE_ENV), env)      # the pin is undone
 
     def test_ticker_alone_skips_the_candle_cross_check(self):
         self.world()
@@ -516,6 +594,151 @@ class CoinbaseTests(SmokeTestCase):
         rows = self.crypto(products=products)
         self.assertEqual(rows["coinbase-products"]["status"], "FAIL")
 
+
+# ---------------------------------------------------------------------------
+# Binance (the default crypto source): the same 24/7 standards, plus its own pair rules
+# ---------------------------------------------------------------------------
+
+class BinanceTests(SmokeTestCase):
+    def binance(self, **routes: Any) -> Dict[str, Dict[str, Any]]:
+        world = http_world()
+        world.update(binance_routes(**routes))
+        self.world(routes=world)
+        return self.rows(smoke.run_checks(SYM, only=BINANCE_CHECKS, now=NOW))
+
+    def test_binance_checks_pin_binance_and_parse_the_universe_once(self):
+        # temp_home leaves $DAYTRADER_CRYPTO_EXCHANGE=coinbase: the binance-* checks must still ask Binance only.
+        self.assertEqual(os.environ.get(smoke.EXCHANGE_ENV), "coinbase")
+        bars, http = self.world()
+        rows = self.rows(smoke.run_checks(SYM, only=BINANCE_CHECKS, now=NOW))
+        self.assertEqual({n: r["status"] for n, r in rows.items()}, {n: "PASS" for n in BINANCE_CHECKS}, rows)
+        urls = [c.args[0] for c in http.call_args_list]
+        self.assertTrue(urls and all(u.startswith(tc.BINANCE_API) for u in urls), urls)
+        self.assertEqual(urls.count(smoke.BINANCE_UNIVERSE_URL), 1)          # served to tc, not asked twice
+        for name in ("binance-5m", "binance-ticker"):
+            self.assertIn(" UTC", rows[name]["detail"])
+            self.assertNotRegex(rows[name]["detail"], r"\bET\b")
+        self.assertEqual(os.environ.get(smoke.EXCHANGE_ENV), "coinbase")     # the pin is undone
+        self.assertIs(tc.market(), tc.US)
+        self.assertEqual(tc.get_json.__name__, "get_json")                   # the one-response helper is undone
+        self.assertEqual(rows["binance-ticker"]["used_by"], "crypto (default): broker, exit, risk, budget")
+
+    def test_any_binance_pair_spelling_reads_btcusdt(self):
+        for typed in ("BTCUSDT", "BTC-USD"):        # Binance's few USD pairs are thin: BTC-USD is priced from BTCUSDT
+            self.world()
+            res = smoke.run_checks(SYM, only=BINANCE_CHECKS, now=NOW, binance_symbol=typed)
+            self.assertEqual([r["status"] for r in res["checks"]], ["PASS"] * 4, res)
+            self.assertIn(f"{BPAIR} trading", self.rows(res)["binance-products"]["detail"])
+
+    def test_stale_klines_and_ticker_fail(self):
+        rows = self.binance(five=crypto_five(until="15:00"), close_time=utc_ts(UTC_DAY, "15:00"))
+        self.assertEqual(rows["binance-5m"]["status"], "FAIL")
+        self.assertIn("5.6 h old - a 24/7 market should have one from the last 3 hours", rows["binance-5m"]["detail"])
+        self.assertEqual(rows["binance-ticker"]["status"], "FAIL")
+        self.assertIn("the last trade is from 2026-10-30 15:00 UTC, 5.5 h old", rows["binance-ticker"]["detail"])
+
+    def test_pages_that_ignore_start_and_end_time_fail(self):
+        # Every page answers with the newest 300 klines: 25 hours instead of the 2 days asked for.
+        rows = self.binance(five=crypto_five()[-300:])
+        self.assertEqual(rows["binance-5m"]["status"], "FAIL")
+        self.assertIn("not 2d back - were the start/end pages honoured?", rows["binance-5m"]["detail"])
+
+    def test_missing_pages_and_off_grid_klines_fail(self):
+        five = crypto_five()
+        hole = (utc_ts("2026-10-29", "06:00"), utc_ts("2026-10-29", "20:00"))
+        rows = self.binance(five=[b for b in five if not hole[0] <= b.ts < hole[1]])
+        self.assertEqual(rows["binance-5m"]["status"], "FAIL")
+        self.assertIn("five-minute candles between the first and the last - missing pages?", rows["binance-5m"]["detail"])
+        rows = self.binance(five=[tc.Bar(b.ts + 60, b.open, b.high, b.low, b.close, b.volume) for b in five[:-1]])
+        self.assertEqual(rows["binance-5m"]["status"], "FAIL")
+        self.assertIn("off the 5-minute grid", rows["binance-5m"]["detail"])
+
+    def test_open_times_in_seconds_not_milliseconds_fail(self):
+        # binance_rows writes milliseconds; open times 1,000 times too small read as January 1970.
+        five = [tc.Bar(b.ts // 1000, b.open, b.high, b.low, b.close, b.volume) for b in crypto_five()]
+        rows = self.binance(five=five)
+        self.assertEqual(rows["binance-5m"]["status"], "FAIL")
+        self.assertIn("Binance returned no candles for BTCUSDT", rows["binance-5m"]["detail"])
+
+    def test_daily_klines_must_be_utc_days(self):
+        rows = self.binance(daily=crypto_daily(shift_hours=4))
+        self.assertEqual(rows["binance-1d"]["status"], "FAIL")
+        self.assertIn("do not start at 00:00 UTC", rows["binance-1d"]["detail"])
+
+    def test_ticker_that_disagrees_with_the_klines_or_is_crossed_fails(self):
+        rows = self.binance(price=crypto_five()[-1].close * 1.10)
+        self.assertEqual(rows["binance-ticker"]["status"], "FAIL")
+        self.assertIn("% away from the last 5-minute close", rows["binance-ticker"]["detail"])
+        rows = self.binance(price=100_000.0, bid=100_010.0, ask=99_990.0, five=crypto_five()[:-1] + [
+            tc.Bar(utc_ts(UTC_DAY, "20:25"), 100_000.0, 100_010.0, 99_990.0, 100_000.0, 5.0)])
+        self.assertEqual(rows["binance-ticker"]["status"], "FAIL")
+        self.assertIn("no usable bid/ask (100010.0 / 99990.0)", rows["binance-ticker"]["detail"])
+
+    def test_bad_pair_rules_and_universes_fail(self):
+        rows = self.binance(pair_info={"symbols": [binance_pair("BTC", status="BREAK")]})
+        self.assertEqual(rows["binance-products"]["status"], "FAIL")
+        self.assertIn("BTCUSDT is break (trading disabled)", rows["binance-products"]["detail"])
+        rows = self.binance(pair_info={"symbols": [binance_pair("BTC", min_notional=None)]})
+        self.assertIn("no plausible minimum order for BTCUSDT (NOTIONAL filter: None)", rows["binance-products"]["detail"])
+        rows = self.binance(pair_info={"symbols": [binance_pair("BTC", step="0", tick="5")]})
+        self.assertIn("implausible size step 1e-08 / price tick 5.0 for BTCUSDT", rows["binance-products"]["detail"])
+        rows = self.binance(universe=binance_universe(n_usdt=3))
+        self.assertIn("only 6 trading USDT pairs (expected at least 100)", rows["binance-products"]["detail"])
+        rows = self.binance(universe={"code": -1003, "msg": "Too much request weight used"})
+        self.assertIn("exchangeInfo listed no symbols", rows["binance-products"]["detail"])
+        world = http_world()
+        world[f"/exchangeInfo?symbol={BPAIR}"] = tc.FetchError(f"HTTP 400 for {tc.BINANCE_API}/exchangeInfo?symbol={BPAIR}")
+        self.world(routes=world)
+        rows = self.rows(smoke.run_checks(SYM, only=["binance-products"], now=NOW))
+        self.assertIn("Binance has no spot pair BTCUSDT", rows["binance-products"]["detail"])
+
+    def test_a_real_coin_dropped_as_a_leveraged_token_fails(self):
+        """BTCUP (BTC + UP) is a leveraged token and may be left out; JUP and SYRUP are coins, not 'J'/'SYR' + UP."""
+        rows = self.binance(universe=binance_universe(extra=[binance_pair("BTCUP")]))
+        self.assertEqual(rows["binance-products"]["status"], "PASS", rows["binance-products"])
+        rows = self.binance(universe=binance_universe(extra=[binance_pair("JUP"), binance_pair("SYRUP")]))
+        self.assertEqual(rows["binance-products"]["status"], "PASS", rows["binance-products"])   # tc keeps them now
+        real = tc.binance_crypto_symbols
+
+        def drops_jup_and_syrup(*a: Any, **kw: Any) -> Any:   # the old filter, simulated: the check must catch it
+            return [r for r in real(*a, **kw) if r["name"] not in ("JUP", "SYRUP")]
+        with mock.patch.object(tc, "binance_crypto_symbols", side_effect=drops_jup_and_syrup):
+            rows = self.binance(universe=binance_universe(extra=[binance_pair("JUP"), binance_pair("SYRUP")]))
+        self.assertEqual(rows["binance-products"]["status"], "FAIL")
+        self.assertIn("2 trading USDT pair(s) missing from the scanner universe of 123: JUP, SYRUP - dropped as "
+                      "leveraged tokens? They are not a listed coin plus UP/DOWN/BULL/BEAR (the pair rules parsed fine: "
+                      "BTCUSDT trading, size step 0.00001, tick 0.01, minimum order 5 USDT)", rows["binance-products"]["detail"])
+
+    def test_universe_pairs_the_desk_cannot_read_fail(self):
+        """Binance lists coins named with one letter (A, C, F, G, S, T, U, W) or Chinese characters: in the
+        universe, but tc.is_crypto_symbol cannot read them, so the desk cannot price them (the scanner skips them)."""
+        rows = self.binance(universe=binance_universe(extra=[binance_pair("A"), binance_pair("币安人生")]))
+        self.assertEqual(rows["binance-products"]["status"], "PASS", rows["binance-products"])   # tc reads them now
+        real = tc.is_crypto_symbol
+
+        def old_reader(sym: Any) -> bool:   # the old 2-12 Latin-character rule, simulated: the check must catch it
+            base = str(sym).split("-")[0]
+            return real(sym) and 2 <= len(base) <= 12 and base.isascii()
+        with mock.patch.object(tc, "is_crypto_symbol", side_effect=old_reader):
+            rows = self.binance(universe=binance_universe(extra=[binance_pair("A"), binance_pair("币安人生")]))
+        self.assertEqual(rows["binance-products"]["status"], "FAIL")
+        self.assertIn("2 pair(s) in the scanner universe that tc.is_crypto_symbol cannot read (coin names its pair "
+                      "format does not read; the scanner skips them): A-USDT, 币安人生-USDT (the pair rules parsed fine: "
+                      "BTCUSDT trading, size step 0.00001, tick 0.01, minimum order 5 USDT)", rows["binance-products"]["detail"])
+
+    def test_http_451_says_binance_does_not_serve_the_location(self):
+        world = http_world()
+        world["/klines?symbol=BTCUSDT&interval=5m&"] = tc.FetchError(
+            f"HTTP 451 for {tc.BINANCE_API}/klines?symbol=BTCUSDT&interval=5m")
+        self.world(routes=world)
+        rows = self.rows(smoke.run_checks(SYM, only=["binance-5m", "coinbase-5m"], now=NOW))
+        self.assertEqual((rows["binance-5m"]["status"], rows["coinbase-5m"]["status"]), ("FAIL", "PASS"))
+        self.assertIn("HTTP 451 for", rows["binance-5m"]["detail"])
+        self.assertIn("Binance does not serve this location; the desk can use Coinbase's prices instead: "
+                      "python3 skills/risk/scripts/risk.py config --crypto-exchange coinbase", rows["binance-5m"]["detail"])
+        self.assertEqual(os.environ.get(smoke.EXCHANGE_ENV), "coinbase")
+
+
 class CliTests(unittest.TestCase):
     def run_tool(self, *args: str) -> subprocess.CompletedProcess:
         # Only argument errors here: each exits before any request is made.
@@ -524,8 +747,10 @@ class CliTests(unittest.TestCase):
     def test_usage_errors_exit_1(self):
         for args, words in ((["--only", "yahoo-5m,bogus"], "unknown check bogus"),
                             (["--symbol", "$$$"], "is not a ticker"),
-                            (["--symbol", "BTC-USD"], "use --crypto-symbol BTC-USD for the Coinbase checks"),
+                            (["--symbol", "BTC-USD"], "pass crypto pairs with --binance-symbol (Binance checks) "
+                                                      "or --crypto-symbol (Coinbase checks)"),
                             (["--crypto-symbol", "TSLA"], "is not a Coinbase pair (e.g. BTC-USD)"),
+                            (["--binance-symbol", "TSLA"], "is not a Binance pair (e.g. BTC-USDT)"),
                             (["--frobnicate"], "unrecognized arguments")):
             p = self.run_tool(*args)
             self.assertEqual(p.returncode, 1, (args, p.stderr))

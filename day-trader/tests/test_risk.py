@@ -1,4 +1,5 @@
 """Tests for skills/risk/scripts/risk.py (offline, synthetic data only)."""
+import contextlib
 import io
 import json
 import os
@@ -12,12 +13,14 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from helpers import (TempHomeTestCase, bars_from_closes, et_ts, fake_bars, load_skill_module,  # noqa: E402
-                     run_cli, skill_script, tc, write_coinbase_products, write_fixture, yahoo_chart_url,
-                     yahoo_payload)
+                     run_cli, skill_script, tc, write_binance_products, write_coinbase_products, write_fixture,
+                     yahoo_chart_url, yahoo_payload)
 
 risk = load_skill_module("risk", "risk")
 SCRIPT = skill_script("risk", "risk.py")
-SETTINGS = dict(tc.DEFAULT_SETTINGS)
+SETTINGS = dict(tc.DEFAULT_SETTINGS)       # the defaults: crypto on Binance at its 0.1% fee (stocks pay no fee)
+# What tc.load_settings() gives with crypto_exchange coinbase and no fee of the user's own: Coinbase's 0.6%.
+COINBASE = dict(SETTINGS, crypto_exchange="coinbase", crypto_fee_pct=tc.CRYPTO_EXCHANGES["coinbase"]["fee_pct"])
 
 
 def run_main(*argv):
@@ -583,15 +586,19 @@ class CryptoSizingTests(TempHomeTestCase):
         return code, json.loads(out)
 
     def test_size_position_fractional_with_fees(self):
-        sz = risk.size_position("long", 100000.0, 99500.0, 101000.0, SETTINGS, market=tc.CRYPTO)
+        sz = risk.size_position("long", 100000.0, 99500.0, 101000.0, COINBASE, market=tc.CRYPTO)
         # loss per BTC = 500 + 0.6% x (100000 + 99500) = 1697 -> $50 / 1697 = 0.02946375 (floored to 1e-8)
         self.assertEqual((sz["shares"], sz["market"], sz["step"], sz["fee_pct"]), (0.02946375, "crypto", 1e-8, 0.6))
         self.assertEqual((sz["risk_used"], sz["fees_at_stop"], sz["max_loss"]), (14.73, 35.27, 50.0))
         self.assertEqual((sz["fees_r"], sz["rr"], sz["rr_after_fees"], sz["fees_at_target"]), (2.394, 2.0, -0.1214, 35.53))
         self.assertEqual(sz["limits"], {"risk": 0.02946375, "max_position_pct": 0.0625, "buying_power": 0.25})
+        self.assertEqual(sz["exchange"], "coinbase")
+        # without settings the defaults follow the configured exchange (Coinbase in these tests), not one fixed fee
+        self.assertEqual(risk.size_position("long", 100000.0, 99500.0, 101000.0, market=tc.CRYPTO), sz)
         us = risk.size_position("long", 364.18, 358.32, 370.04, SETTINGS)       # stocks unchanged
         self.assertEqual((us["shares"], us["max_loss"], us["market"]), (8, 46.88, "us"))
         self.assertNotIn("fees_r", us)
+        self.assertEqual(risk.size_position("long", 364.18, 358.32, 370.04, COINBASE), us)   # no fee on stocks
 
     def test_card_shows_the_fractional_order_and_what_fees_cost(self):
         code, d = self.btc()
@@ -684,6 +691,143 @@ class CryptoSizingTests(TempHomeTestCase):
         self.assertNotIn("crypto fees", out)                               # the stock card is unchanged
 
 
+STOCK_CARD = ("RISK SETTINGS\n  account       $25,000.00\n  risk/trade    0.2% = $50.00\n  max position  25% of the "
+              "account = $6,250.00\n  min R:R       1.0\n  daily limits  max loss $150.00 · max open risk $150.00 · 5 "
+              "trades · stop after 3 losses in a row\nChange with: risk.py config --account N --risk-pct X "
+              "--max-position-pct X --min-rr X (daily limits: budget skill).\n")
+
+
+class BinanceSizingTests(TempHomeTestCase):
+    """Crypto on Binance, the default exchange: its LOT_SIZE step, its 0.1% fee, its 5 USDT minimum, its label."""
+    NOW = "2026-10-31T04:40"          # a Saturday (UTC once the symbol makes the market crypto)
+
+    def setUp(self):
+        super().setUp()
+        self.fx = self.home / "fx"
+        write_binance_products(self.fx)          # BTCUSDT: step 0.00001, tick 0.01, minNotional 5
+        env = mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(self.fx), "DAYTRADER_CRYPTO_EXCHANGE": "binance"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def size(self, *extra, sym="BTC-USDT", entry="100000", stop="98000", target="104000"):
+        argv = ["size", "--symbol", sym, "--entry", entry, "--stop", stop] + (["--target", target] if target else [])
+        code, out = run_main(*argv, *extra, "--json")
+        return code, json.loads(out)
+
+    def test_defaults_follow_the_exchange_fee(self):
+        sz = risk.size_position("long", 100000.0, 99500.0, 101000.0, SETTINGS, market=tc.CRYPTO)
+        # loss per BTC = 500 + 0.1% x 199500 = 699.5: the $50 budget allows 0.07147962, the 25% max position 0.0625
+        self.assertEqual((sz["shares"], sz["capped_by"], sz["fee_pct"], sz["exchange"]),
+                         (0.0625, "max_position_pct", 0.1, "binance"))
+        self.assertEqual((sz["risk_used"], sz["fees_at_stop"], sz["max_loss"], sz["fees_r"], sz["rr_after_fees"]),
+                         (31.25, 12.47, 43.72, 0.399, 1.1422))
+        self.assertEqual(sz["limits"]["risk"], 0.07147962)
+        self.assertEqual(risk.size_position("long", 100000.0, 99500.0, 101000.0, market=tc.CRYPTO), sz)
+        self.assertEqual((risk.default_settings()["crypto_fee_pct"], tc.load_settings()["crypto_fee_pct"]), (0.1, 0.1))
+        with mock.patch.dict(os.environ, {"DAYTRADER_CRYPTO_EXCHANGE": "coinbase"}):
+            self.assertEqual(risk.size_position("long", 100000.0, 99500.0, 101000.0, market=tc.CRYPTO)["fee_pct"], 0.6)
+
+    def test_card_uses_binance_step_fee_and_label(self):
+        code, d = self.size()
+        # loss per BTC = 2000 + 0.1% x 198000 = 2198 -> $50 / 2198 = 0.022748 -> 0.02274 on Binance's 0.00001 step
+        self.assertEqual((code, d["order"], d["shares"], d["step"], d["tick"], d["min_order"]),
+                         (0, "BUY 0.02274 BTC-USDT", 0.02274, 1e-05, 0.01, 5.0))
+        self.assertEqual((d["exchange"], d["fee_pct"], d["risk_used"], d["fees_at_stop"], d["max_loss"], d["rr_after_fees"]),
+                         ("binance", 0.1, 45.48, 4.5, 49.98, 1.727))
+        self.assertFalse(any("Coinbase" in x for x in d["notes"] + d["warnings"]), d["notes"])
+        code, text = run_main("size", "--symbol", "BTC-USDT", "--entry", "100000", "--stop", "98000", "--target", "104000")
+        self.assertIn("BUY 0.02274 BTC-USDT @ 100,000.00 · STOP 98,000.00 · TARGET 104,000.00 · PAPER · Binance prices", text)
+        self.assertIn("- fees: 0.1% per fill (paper, crypto_fee_pct) · round-trip fees ≈ 0.10R at these levels", text)
+        self.assertIn("Next: budget skill check (--symbol BTC-USDT --risk 49.98), then a paper broker ticket for 0.02274 "
+                      "BTC-USDT", text)
+
+    def test_usd_and_compact_symbols_are_priced_from_the_usdt_pair(self):
+        code, d = self.size(sym="BTC-USD")
+        self.assertEqual((d["order"], d["unit"], d["step"]), ("BUY 0.02274 BTC-USD", "BTC", 1e-05))
+        self.assertIn("BTC-USD is priced from Binance's BTCUSDT pair (Binance's few USD pairs are thin; USDT trades close to, "
+                      "not exactly at, $1)", d["notes"])
+        code, d = self.size(sym="BTCUSDT")
+        self.assertEqual((d["order"], d["unit"]), ("BUY 0.02274 BTCUSDT", "BTC"))
+        self.assertFalse(any("priced from" in n for n in d["notes"]))
+        code, text = run_main("size", "--symbol", "BTCUSDT", "--entry", "100000", "--stop", "98000")
+        self.assertIn("  risk/BTC      $2,000.00 (2.00% of price) + $198.00 fees = $2,198.00", text)
+
+    def test_minimum_order_short_and_offline_wording(self):
+        code, d = self.size("--risk-dollars", "0.1", target=None)          # 0.1 / 2198 -> 0.00004 BTC = $4 notional
+        self.assertEqual((d["shares"], d["notional"]), (0.00004, 4.0))
+        self.assertIn("notional $4.00 is below Binance's 5 USDT minimum order for BTC-USDT - a real order this small "
+                      "would be rejected", d["warnings"])
+        self.assertFalse(any("minimum order" in w for w in self.size()[1]["warnings"]))
+        code, d = self.size(stop="101000", target=None)
+        self.assertEqual(d["side"], "short")
+        self.assertTrue(any(n.startswith("spot crypto cannot be sold short on Binance (that needs margin or derivatives)")
+                            for n in d["notes"]), d["notes"])
+        empty = self.home / "nofx"
+        empty.mkdir()
+        with mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(empty)}):
+            code, d = self.size()
+        self.assertEqual((code, d["shares"], d["step"]), (0, 0.02274795, 1e-8))
+        self.assertTrue(any(n.startswith("Binance pair rules unavailable") for n in d["notes"]), d["notes"])
+
+    def test_save_records_the_exchange_of_the_sizing(self):
+        code, d = self.size("--save")
+        sec = tc.load_plan("BTC-USDT")["sizing"]
+        self.assertEqual((code, sec["shares"], sec["exchange"], sec["step"], sec["fee_pct"], sec["max_loss"]),
+                         (0, 0.02274, "binance", 1e-05, 0.1, 49.98))
+
+    def test_config_crypto_exchange_switches_prices_and_the_default_fee(self):
+        os.environ.pop("DAYTRADER_CRYPTO_EXCHANGE")                          # the saved setting decides from here
+        self.assertEqual(run_main("config")[1], STOCK_CARD)                   # Binance by default: the stock card as it was
+        code, out = run_main("config", "--crypto-exchange", "coinbase")
+        self.assertIn("  crypto fees   0.6% per fill (paper; Coinbase prices)\n", out)
+        self.assertIn("- new crypto sizes and tickets use Coinbase prices and pair rules, and its 0.6% entry-tier taker "
+                      "fee; paper trades already open keep the exchange that priced them", out)
+        self.assertEqual((tc.crypto_exchange(), tc.load_settings()["crypto_fee_pct"]), ("coinbase", 0.6))
+        code, out = run_main("config")
+        self.assertIn("  crypto fees   0.6% per fill (paper; Coinbase prices)\n", out)    # a chosen exchange shows
+        self.assertIn("--min-rr X --crypto-fee-pct X --crypto-exchange binance|coinbase (daily limits", out)
+        code, d = self.size()
+        self.assertEqual((d["exchange"], d["fee_pct"]), ("coinbase", 0.6))
+        self.assertTrue(any(n.startswith("Coinbase product rules unavailable") for n in d["notes"]))  # no Coinbase fixture
+        code, out = run_main("config", "--crypto-exchange", "BINANCE", "--json")
+        d = json.loads(out)
+        self.assertEqual((d["settings"]["crypto_exchange"], d["settings"]["crypto_fee_pct"], d["changed"]),
+                         ("binance", 0.1, ["crypto_exchange"]))
+        self.assertEqual(d["crypto"], {"exchange": "binance", "name": "Binance", "fee_pct": 0.1, "exchange_fee_pct": 0.1,
+                                       "saved_exchange": "binance"})
+        self.assertEqual(run_main("config")[1], STOCK_CARD)                   # back on the default: no crypto row
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            run_main("config", "--crypto-exchange", "kraken")
+
+    def test_a_fee_of_your_own_stays_and_the_environment_wins(self):
+        code, out = run_main("config", "--crypto-exchange", "coinbase")      # $DAYTRADER_CRYPTO_EXCHANGE=binance here
+        self.assertIn("- $DAYTRADER_CRYPTO_EXCHANGE=binance overrides the saved setting while it is set: crypto prices "
+                      "still come from Binance here", out)
+        self.assertEqual((tc.crypto_exchange(), tc.load_json("settings.json")["crypto_exchange"]), ("binance", "coinbase"))
+        os.environ.pop("DAYTRADER_CRYPTO_EXCHANGE")
+        run_main("config", "--crypto-fee-pct", "0.4")
+        code, out = run_main("config", "--crypto-exchange", "binance")
+        self.assertIn("  crypto fees   0.4% per fill (paper; Binance prices) · Binance's entry-tier taker fee is 0.1%", out)
+        self.assertIn("- your own crypto_fee_pct of 0.4% stays; Binance's entry-tier taker fee is 0.1% (risk.py config "
+                      "--crypto-fee-pct 0.1)", out)
+
+    def test_help_names_each_exchange_fee_and_the_stock_card_is_the_same_on_both(self):
+        sub = [a for a in risk.build_parser()._actions if isinstance(a, risk.argparse._SubParsersAction)][0]
+        helps = {o: a.help for a in sub.choices["config"]._actions for o in a.option_strings}
+        self.assertIn("default: the crypto exchange's entry-tier taker fee - Binance 0.1, Coinbase 0.6",
+                      helps["--crypto-fee-pct"])
+        self.assertIn("default binance", helps["--crypto-exchange"])
+        cards = {}
+        for ex in ("binance", "coinbase"):
+            with mock.patch.dict(os.environ, {"DAYTRADER_CRYPTO_EXCHANGE": ex}):
+                cards[ex] = (run_main("config")[1], run_main("show")[1])
+        self.assertEqual(cards["binance"], cards["coinbase"])
+        self.assertEqual(cards["binance"][0], STOCK_CARD)
+        self.assertNotIn("crypto", cards["binance"][1])
+        with mock.patch.dict(os.environ, {"DAYTRADER_CRYPTO_EXCHANGE": "binance"}):
+            self.assertIn("  crypto fees   0.1% per fill (paper; Binance prices)\n", run_main("show", "--market", "crypto")[1])
+
+
 class CliTests(TempHomeTestCase):
     NOW = "2026-10-30T10:15"
 
@@ -736,6 +880,20 @@ class CliTests(TempHomeTestCase):
         self.assertIn("BUY 0.02946375 BTC-USD @ 100,000.00", r.stdout)
         self.assertIn("round-trip fees ≈ 2.39R at these levels", r.stdout)
         self.assertEqual(tc.load_plan("BTC-USD")["sizing"]["shares"], 0.02946375)
+
+    def test_cli_binance_size_on_a_saturday(self):
+        fx = self.home / "fx"
+        write_binance_products(fx)
+        env = dict(self._env(fx), DAYTRADER_NOW="2026-10-31T04:40", DAYTRADER_CRYPTO_EXCHANGE="binance")
+        r = run_cli(SCRIPT, "size", "BTC-USDT", "--entry", "100000", "--stop", "98000", "--target", "104000", "--save",
+                    env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("BUY 0.02274 BTC-USDT @ 100,000.00 · STOP 98,000.00 · TARGET 104,000.00 · PAPER · Binance prices",
+                      r.stdout)
+        self.assertIn("round-trip fees ≈ 0.10R at these levels", r.stdout)
+        self.assertNotIn("Coinbase", r.stdout)
+        sec = tc.load_plan("BTC-USDT")["sizing"]
+        self.assertEqual((sec["shares"], sec["exchange"], sec["step"], sec["fee_pct"]), (0.02274, "binance", 1e-05, 0.1))
 
 
 if __name__ == "__main__":

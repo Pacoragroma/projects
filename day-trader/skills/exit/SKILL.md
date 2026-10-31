@@ -5,13 +5,13 @@ description: >-
   ("THE PLAN"). Stop from today's 5-minute bars (1.5 x ATR by default, or beyond the recent
   swing), a fixed percent or the user's price; target at a reward:risk multiple (default 2R) or
   a price; reports risk/reward per share, R:R, break-even win rate, stop in ATRs and %, a time stop
-  (15:55 ET; 23:55 UTC for crypto), a breakeven rule and warnings when the stop is too tight or too
-  wide. Saves to the shared trade plan. Use when the user asks "where should my stop go?", "set a
-  stop and target for TSLA", "what's my exit plan?", "give me a 2R target from 364.18", "is my stop
-  too tight?", "plan the trade before I get in", "plan a trade on TSLA and test it", "plan and test
-  a trade", "where do I take profit?", "stop 358.32, what's my R:R?", after an entry trigger, or for
-  crypto: "paper trade BTC", "plan a trade on BTC-USD" (UTC, fees in R). Free Yahoo Finance
-  (stocks) / Coinbase (crypto) data, no API key. Not financial advice.
+  (15:55 ET; 23:55 UTC for crypto), a breakeven rule and warnings for a stop too tight or too wide.
+  Saves to the trade plan. Use when the user asks "where should my stop go?", "set a stop and target
+  for TSLA", "what's my exit plan?", "give me a 2R target from 364.18", "is my stop too tight?",
+  "plan the trade before I get in", "plan a trade on TSLA and test it", "plan and test a trade",
+  "where do I take profit?", "stop 358.32, what's my R:R?", after an entry trigger, or for crypto:
+  "paper trade BTC", "plan a trade on BTC-USDT" (UTC, fees in R). Free Yahoo Finance (stocks) /
+  Binance or Coinbase (crypto) data, no API key. Not financial advice.
 ---
 # Exit Plan
 
@@ -42,7 +42,7 @@ and updates the shared plan (`plans/<SYM>.json`). Run sibling skills' scripts fr
 Skip any step the user rules out. Show the plan card, the Time Machine verdict and the ticket together,
 and say plainly that it is paper trading and not financial advice.
 
-Crypto works the same way: use a Coinbase product such as `BTC-USD` for SYM ("paper trade BTC"). Times are UTC, a session is a UTC day, sizes are fractional and the paper broker charges fees (shown in R).
+Crypto works the same way: use a pair such as `BTC-USDT` for SYM ("paper trade BTC"; `BTC-USD` works too). Prices come from Binance by default (or Coinbase). Times are UTC, a session is a UTC day, sizes are fractional and the paper broker charges fees (shown in R).
 
 ## Run
 > Scripts live in this skill's `scripts/` folder. Run them from the skill's folder (`python3 scripts/<tool>.py ...`) or by absolute path. Python 3.9+, standard library only.
@@ -56,8 +56,8 @@ python3 scripts/exit_plan.py TSLA --entry 364.18 --stop 358.32 --target 370.04
 python3 scripts/exit_plan.py TSLA --side short --entry 364.18 --atr-mult 2
 python3 scripts/exit_plan.py TSLA --method manual --save             # reuse the saved plan's entry + stop
 python3 scripts/exit_plan.py TSLA --entry 364.18 --time-stop 11:30 --save --json
-python3 scripts/exit_plan.py BTC-USD --save                         # crypto: UTC day, 23:55 UTC time stop
-python3 scripts/exit_plan.py BTC-USD --entry 94500 --pct 1.5 --rr 2
+python3 scripts/exit_plan.py BTC-USDT --save                         # crypto: UTC day, 23:55 UTC time stop
+python3 scripts/exit_plan.py BTC-USDT --entry 94500 --pct 1.5 --rr 2
 ```
 
 Flags:
@@ -108,17 +108,22 @@ Flags:
 * **Time stop:** flat by 15:55 ET by default. On early-close days (from Yahoo's trading period)
   it moves to 5 minutes before the close. Crypto: 23:55 UTC (`tc.market().time_stop`); past it,
   plan for the next UTC day.
-* **Crypto** (a Coinbase product such as `BTC-USD`): Coinbase 5-minute candles, 24/7. "Today" is the
-  UTC day, so ATR(14) uses today's UTC bars (from 01:10 UTC; before that the last 14 bars, which run
-  straight across midnight - there is no overnight gap), and the day-range check uses whole UTC days.
-  Prices round to the product's price increment (Coinbase `quote_increment`; cents if the product
-  list is unreachable). **Fees:** the paper broker charges `crypto_fee_pct` (default 0.6%) of
-  notional on each fill, so the card adds a `Fees` row - the round trip in R and the break-even win
-  rate after fees - and a `!` warning when fees are 0.25R or more (or eat the whole target). A tight
-  5-minute stop on BTC can cost several R in fees: say so plainly.
+* **Crypto** (a pair such as `BTC-USDT`; `BTC-USD` works too): 5-minute candles from **Binance by
+  default (or Coinbase)**, 24/7. The `crypto_exchange` setting (the risk skill's
+  `risk.py config --crypto-exchange coinbase`) or `$DAYTRADER_CRYPTO_EXCHANGE` picks the exchange.
+  Binance's few USD pairs are thin, so there `BTC-USD` is priced from `BTCUSDT` (a note says so). "Today"
+  is the UTC day, so ATR(14) uses today's UTC bars (from 01:10 UTC; before that the last 14 bars,
+  which run straight across midnight: there is no overnight gap), and the day-range check uses whole
+  UTC days. Prices round to the pair's price tick (Binance `tickSize`, Coinbase `quote_increment`;
+  cents if the exchange's pair rules are unreachable). **Fees:** the paper broker charges
+  `crypto_fee_pct` of notional on each fill, by default the exchange's entry-tier taker fee: 0.1% on
+  Binance, 0.6% on Coinbase (a fee you set yourself wins). So the card adds a `Fees` row - the round
+  trip in R and the break-even win rate after fees - and a `!` warning when fees are 0.25R or more
+  (or eat the whole target). A tight 5-minute stop on BTC can cost a large share of R in fees, more
+  so at Coinbase's 0.6%: say so plainly.
 * **Management:** once +1R trades, move the stop to breakeven. There is no breakeven step when
   the target is at +1R or closer. Never widen the stop.
-* **Without data:** `percent` and `manual` still work when Yahoo (or Coinbase) is unreachable, provided you
+* **Without data:** `percent` and `manual` still work when Yahoo (or the crypto exchange) is unreachable, provided you
   give the entry. They print a warning that the ATR checks were skipped. `atr` and `structure`
   exit 2.
 * **Limits:**
@@ -173,9 +178,9 @@ Flags:
 * Paper trading only. This skill places nothing. Orders go through the broker skill and only
   after the user's explicit yes.
 * If the script exits with code 2 ("data error: ..."), tell the user which host failed (it is in
-  the message, usually `query1`/`query2.finance.yahoo.com`, or `api.exchange.coinbase.com` for
-  crypto). In sandboxes the host may need to
+  the message, usually `query1`/`query2.finance.yahoo.com`; for crypto `data-api.binance.vision`
+  on Binance or `api.exchange.coinbase.com` on Coinbase). In sandboxes the host may need to
   be allow-listed. Never invent prices, headlines, or odds to fill the gap. A `percent` or
   `manual` plan with an explicit `--entry` still works offline, without the ATR checks; say
   that the checks were skipped. Exit code 1 means bad input: fix the flags or levels shown in
-  the error.
+  the error (or the symbol, for a crypto pair the exchange does not list).

@@ -13,8 +13,9 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from helpers import (TempHomeTestCase, bars_from_closes, et_ts, fake_bars, load_skill_module, run_cli,
-                     skill_script, tc, utc_ts, write_coinbase_fixtures, write_coinbase_products,  # noqa: E402
-                     write_coinbase_quote, write_fixture, yahoo_chart_url, yahoo_payload)
+                     skill_script, tc, utc_ts, write_binance_fixtures, write_binance_products,  # noqa: E402
+                     write_binance_quote, write_coinbase_fixtures, write_coinbase_products, write_coinbase_quote,
+                     write_fixture, yahoo_chart_url, yahoo_payload)
 
 broker = load_skill_module("broker", "broker")
 SCRIPT = skill_script("broker", "broker.py")
@@ -1122,6 +1123,7 @@ class CryptoPureTests(unittest.TestCase):
 
 class CryptoBrokerCase(BrokerCase):
     NOW = f"{CDAY}T04:40"
+    SYM = "BTC-USD"
 
     def setUp(self):
         super().setUp()
@@ -1137,7 +1139,7 @@ class CryptoBrokerCase(BrokerCase):
             return super().run_main(*argv, now=now)
 
     def cticket(self, *extra, qty="0.01", entry="101250", stop="99000", target="104000", now=None):
-        args = ["ticket", "--symbol", "BTC-USD", "--qty", qty, "--entry", entry, "--stop", stop]
+        args = ["ticket", "--symbol", self.SYM, "--qty", qty, "--entry", entry, "--stop", stop]
         if target is not None:
             args += ["--target", target]
         return self.run_json(*args, *extra, now=now)
@@ -1356,6 +1358,232 @@ class CryptoSyncTests(CryptoBrokerCase):
         self.assertEqual(led["trades"][1]["status"], "open")
 
 
+# ---------------------------------------------------------------------------
+# Crypto on Binance (the default exchange), and every row priced on its own exchange
+# ---------------------------------------------------------------------------
+
+class ExchangeRowTests(TempHomeTestCase):
+    def test_rows_name_their_exchange_and_the_label_follows_it(self):
+        self.assertEqual((broker.unit_word("BTCUSDT"), broker.unit_word("BTC-USDT")), ("BTC", "BTC"))
+        self.assertEqual(broker.row_exchange({"symbol": "BTC-USDT", "exchange": "Binance"}), "binance")
+        self.assertEqual(broker.row_exchange({"symbol": "BTC-USD"}), "coinbase")      # rows from v1.1.0 were Coinbase's
+        self.assertIsNone(broker.row_exchange({"symbol": "TSLA", "exchange": "binance"}))
+        self.assertEqual(broker.paper_label({"symbol": "BTC-USDT", "exchange": "binance"}),
+                         "PAPER · REAL MONEY: OFF · Binance prices")
+        self.assertEqual(broker.paper_label({"symbol": "BTC-USD"}), "PAPER · REAL MONEY: OFF · Coinbase prices")
+        self.assertEqual(broker.paper_label({"symbol": "TSLA", "exchange": "binance"}), "PAPER · REAL MONEY: OFF")
+        self.assertEqual((broker.min_order_text(5.0, "BTC-USD", "binance"), broker.min_order_text(1.0, "BTC-USD", "coinbase"),
+                          broker.min_order_text(0.0001, "ETH-BTC", "binance")), ("5 USDT", "$1.00", "0.0001 BTC"))
+        self.assertEqual((broker.feed_key({"symbol": "btc-usd"}), broker.feed_key({"symbol": "TSLA"})),
+                         (("BTC-USD", "coinbase"), ("TSLA", None)))
+
+    def test_exchange_scope_routes_tc_and_puts_the_setting_back(self):
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "binance"
+        with broker.exchange_scope("coinbase"):
+            self.assertEqual((tc.crypto_exchange(), tc.CRYPTO.source), ("coinbase", "Coinbase Exchange"))
+        self.assertEqual(os.environ["DAYTRADER_CRYPTO_EXCHANGE"], "binance")
+        del os.environ["DAYTRADER_CRYPTO_EXCHANGE"]
+        with broker.exchange_scope("binance"):
+            self.assertEqual(tc.crypto_exchange(), "binance")
+        self.assertNotIn("DAYTRADER_CRYPTO_EXCHANGE", os.environ)
+        with self.assertRaises(tc.StateError) as cm, broker.exchange_scope("kraken"):
+            pass
+        self.assertIn("ledger.json names exchange 'kraken'", str(cm.exception))
+
+
+class BinanceBrokerCase(CryptoBrokerCase):
+    """The crypto cases on Binance: BTC-USDT (step 0.00001, tick 0.01, minimum 5 USDT), 0.1% per fill."""
+    SYM = "BTC-USDT"
+
+    def setUp(self):
+        super().setUp()                    # Coinbase fixtures too, for the tests that switch exchanges
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "binance"
+        write_binance_products(self.fx)
+
+    def quote(self, price, when=f"{CDAY}T04:40:30Z"):
+        write_binance_quote(self.fx, self.SYM, price, when_ts=tc.parse_iso_utc(when))
+
+
+class BinanceTicketTests(BinanceBrokerCase):
+    def test_saturday_ticket_on_binance_prices_step_and_fee(self):
+        code, res = self.cticket()
+        self.assertEqual((code, res["status"], res["preview"]), (0, "pending", False))
+        k = res["ticket"]
+        self.assertEqual((k["market"], k["exchange"], k["qty"], k["tick"], k["qty_step"], k["fee_pct"]),
+                         ("crypto", "binance", 0.01, 0.01, 1e-05, 0.1))
+        # $22.50 of price risk + 0.1% x (101250 + 99000) x 0.01 = $2.00 of fees at the stop
+        self.assertEqual((k["risk"], k["fees_at_stop"], k["max_loss"]), (22.5, 2.0, 24.5))
+        self.assertEqual(res["card"], "BUY 0.01 BTC-USDT · LIMIT 101,250.00 · TARGET 104,000.00 · STOP 99,000.00 · PAPER "
+                                      "· REAL MONEY: OFF · Binance prices · WAITING FOR YOUR YES — reply yes to confirm "
+                                      "ticket TKT-20261031-001")
+        code, text = self.run_main("ticket", "--symbol", "BTC-USDT", "--qty", "0.01", "--entry", "101250", "--stop",
+                                   "99000", "--target", "104000")
+        self.assertIn("  Fees      0.1% per fill (paper) · $2.00 if the stop fills -> loss at the stop $24.50", text)
+        self.assertIn("  Budget    OK · $125.50 of $150.00 daily loss budget left after this", text)
+        self.assertNotIn("Coinbase", text)
+
+    def test_binance_pair_rules_minimum_order_usd_symbols_and_shorts(self):
+        with self.assertRaises(ValueError) as cm:
+            self.cticket(qty="0.000015")
+        self.assertIn("--qty 0.000015 is not a multiple of BTC-USDT's size step 0.00001 (e.g. 0.00001)", str(cm.exception))
+        code, res = self.cticket(qty="0.00004")                              # $4.05 of BTC
+        self.assertIn("notional $4.05 is below Binance's 5 USDT minimum order for BTC-USDT - a real order this small "
+                      "would be rejected", res["warnings"])
+        self.assertFalse(any("minimum order" in w for w in self.cticket()[1]["warnings"]))
+        code, res = self.run_json("ticket", "--symbol", "BTC-USD", "--qty", "0.01", "--entry", "101250", "--stop", "99000")
+        self.assertEqual((res["ticket"]["exchange"], res["ticket"]["qty_step"]), ("binance", 1e-05))
+        self.assertIn("BTC-USD is priced from Binance's BTCUSDT pair (Binance's few USD pairs are thin; USDT trades close to, "
+                      "not exactly at, $1)", res["notes"])
+        code, res = self.cticket(stop="102000", target="100000")
+        self.assertTrue(any(n.startswith("spot crypto cannot be sold short on Binance (that needs margin or derivatives)")
+                            for n in res["notes"]), res["notes"])
+
+    def test_offline_and_sizing_from_another_exchange(self):
+        fx, self.fx = self.fx, self.home / "nofx"          # no fixtures at all: offline
+        self.fx.mkdir()
+        try:
+            code, res = self.run_json("ticket", "--symbol", "BTC-USDT", "--qty", "0.01", "--entry", "101250",
+                                      "--stop", "99000")
+        finally:
+            self.fx = fx
+        self.assertEqual((code, res["ticket"]["qty_step"], res["ticket"]["exchange"]), (0, 1e-8, "binance"))
+        self.assertTrue(any(n.startswith("Binance pair rules unavailable") for n in res["notes"]), res["notes"])
+        tc.save_plan({"symbol": "BTC-USDT", "side": "long", "entry": 101250.0, "stop": 99000.0, "target": 104000.0,
+                      "sizing": {"shares": 0.01234567, "side": "long", "entry": 101250.0, "stop": 99000.0,
+                                 "market": "crypto", "exchange": "coinbase", "step": 1e-8, "fee_pct": 0.6}})
+        code, res = self.run_json("ticket", "--symbol", "BTC-USDT")
+        self.assertEqual((code, res["ticket"]["qty"], res["ticket"]["qty_source"]), (0, 0.01234, "plan sizing"))
+        self.assertIn("the saved BTC-USDT sizing was made for Coinbase (its size step and fee); this ticket uses Binance "
+                      "prices - re-size it: risk.py size --symbol BTC-USDT --save", res["warnings"])
+
+
+class BinanceFillSyncTests(BinanceBrokerCase):
+    def test_fill_and_stop_are_net_of_binance_fees(self):
+        tr = self.open_btc()
+        self.assertEqual((tr["symbol"], tr["exchange"], tr["entry_price"], tr["fee_pct"], tr["entry_fee"]),
+                         ("BTC-USDT", "binance", 101234.56, 0.1, 1.01))
+        code, text = self.run_main("positions", "--market", "crypto", now=f"{CDAY}T04:45")
+        self.assertIn("Crypto P&L is net of the paper fees of both fills (Binance prices).", text)
+        five = crypto_flat("04:40", "05:00") + [cbar("05:00", 101200, 101300, 98900, 99100)]
+        with fake_bars({("BTC-USDT", "5m"): five}):
+            code, res = self.run_json("sync", "--market", "crypto", now=f"{CDAY}T05:10")
+        ev = res["events"][0]
+        # gross -22.35; fees 1.01 + 0.99 (0.1% of each fill); net -24.35 = -1.09R of the 22.35 price risk
+        self.assertEqual((ev["reason"], ev["price"], ev["exchange"], ev["gross_pnl"], ev["fees"], ev["pnl"],
+                          ev["r_multiple"]), ("stop", 99000.0, "binance", -22.35, 2.0, -24.35, -1.09))
+        self.assertEqual(res["summary"]["realized_pnl"], -24.35)
+        self.assertIn("BTC-USDT LONG 0.01: STOP @ 99,000.00 in the 05:00 UTC bar · -$24.35 -1.09R (net of $2.00 fees)",
+                      broker.render_sync(res))
+
+    def test_a_ticket_confirmed_after_the_switch_fills_on_its_own_exchange(self):
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "coinbase"
+        write_coinbase_quote(self.fx, "BTC-USD", 101234.56, when=f"{CDAY}T04:40:30Z")
+        code, res = self.run_json("ticket", "--symbol", "BTC-USD", "--qty", "0.01", "--entry", "101250", "--stop", "99000",
+                                  "--target", "104000")
+        self.assertEqual((res["ticket"]["exchange"], res["ticket"]["fee_pct"]), ("coinbase", 0.6))
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "binance"          # the user switches before saying yes
+        write_binance_quote(self.fx, "BTC-USD", 100500.0, when_ts=utc_ts(CDAY, "04:40") + 30)    # Binance is lower
+        code, res = self.cconfirm()
+        tr = res["trade"]
+        self.assertEqual((code, res["fill_price"], tr["exchange"], tr["fee_pct"], tr["entry_fee"]),
+                         (0, 101234.56, "coinbase", 0.6, 6.07))                  # Coinbase's price and fee, not Binance's
+        self.assertIn("TKT-20261031-001 was made on Coinbase prices, so it fills and is managed on Coinbase (at its 0.6% "
+                      "fee); the crypto_exchange setting now says Binance, which new tickets use", res["notes"])
+        self.assertIn("· PAPER · REAL MONEY: OFF · Coinbase prices", broker.render_confirm(res))
+        self.assertEqual(os.environ["DAYTRADER_CRYPTO_EXCHANGE"], "binance")
+
+    def test_sync_positions_and_close_price_every_row_on_its_own_exchange(self):
+        b = btc_trade(exchange="binance", fee_pct=0.1, entry_fee=1.01, fees=1.01)
+        c = btc_trade(id="TRADE-20261031-002", ticket_id="TKT-20261031-002")   # no exchange field: a Coinbase row
+        tc.save_ledger({"tickets": [], "trades": [b, c]})
+        write_binance_quote(self.fx, "BTC-USD", 101500.0, when_ts=utc_ts(CDAY, "04:45"))
+        write_coinbase_quote(self.fx, "BTC-USD", 102000.0, when=f"{CDAY}T04:45:00Z")
+        code, res = self.run_json("positions", "--market", "crypto", now=f"{CDAY}T04:45")
+        self.assertEqual({p["id"]: (p["exchange"], p["last"]) for p in res["positions"]},
+                         {b["id"]: ("binance", 101500.0), c["id"]: ("coinbase", 102000.0)})
+        code, text = self.run_main("positions", "--market", "crypto", now=f"{CDAY}T04:45")
+        self.assertIn("Crypto P&L is net of the paper fees of both fills (Binance and Coinbase prices).", text)
+        flat = crypto_flat("04:40", "05:05")
+        drop = flat[:-1] + [cbar("05:00", 101200, 101300, 98900, 99100)]          # only Coinbase trades through 99,000
+        seen = []
+
+        def fake(symbol, interval="5m", range_="60d", prepost=False, ttl=None):
+            seen.append((symbol, tc.crypto_exchange()))
+            return list(drop if tc.crypto_exchange() == "coinbase" else flat), {"symbol": symbol}
+        with mock.patch.object(tc, "fetch_bars", side_effect=fake):
+            code, res = self.run_json("sync", "--market", "crypto", now=f"{CDAY}T05:06")
+        self.assertEqual(seen, [("BTC-USD", "binance"), ("BTC-USD", "coinbase")])
+        self.assertEqual([(e["trade_id"], e["exchange"], e["reason"]) for e in res["events"]], [(c["id"], "coinbase", "stop")])
+        self.assertEqual([(o["trade_id"], o["exchange"]) for o in res["open"]], [(b["id"], "binance")])
+        self.assertEqual(os.environ["DAYTRADER_CRYPTO_EXCHANGE"], "binance")
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "coinbase"                # the Binance trade still closes on Binance
+        with fake_bars({("BTC-USD", "5m"): flat}):
+            code, res = self.run_json("close", b["id"], now=f"{CDAY}T05:06")
+        self.assertEqual((res["closed_by"], res["trade"]["exit_price"], res["quote"]["price"], res["trade"]["fee_pct"]),
+                         ("manual", 101500.0, 101500.0, 0.1))                  # Binance's quote, not Coinbase's 102,000
+        self.assertIn("· Binance prices", broker.render_close(res))
+
+    def test_an_unknown_exchange_is_reported_not_priced_elsewhere(self):
+        tc.save_ledger({"tickets": [], "trades": [btc_trade(symbol="BTC-USDT", exchange="binance", fee_pct=0.1),
+                                                  btc_trade(id="TRADE-20261031-002", exchange="kraken")]})
+        with fake_bars({("BTC-USDT", "5m"): crypto_flat("04:40", "05:00")}):
+            code, res = self.run_json("sync", "--market", "crypto", now=f"{CDAY}T05:01")
+        self.assertEqual([(e["symbol"], e["exchange"]) for e in res["errors"]], [("BTC-USD", "kraken")])
+        self.assertIn("ledger.json names exchange 'kraken' - expected binance or coinbase", res["errors"][0]["error"])
+        self.assertEqual([t["status"] for t in self.ledger()["trades"]], ["open", "open"])
+
+
+class BinanceSafetyTests(BinanceBrokerCase):
+    """The safety rules on the default exchange, as CryptoTicketTests / CryptoConfirmTests check them on
+    Coinbase: a preview past the time stop has nothing to confirm, the yes rule holds on a Saturday, and
+    the daily budget (Binance's 0.1% fees at the stop included) is enforced at the ticket and again at yes."""
+
+    def test_past_the_utc_time_stop_is_a_preview_with_nothing_to_confirm(self):
+        code, res = self.cticket(now=f"{CDAY}T23:57")
+        self.assertEqual((code, res["status"], res["preview"]), (0, "preview", True))
+        self.assertIn("· Binance prices · PAST THE 23:55 UTC TIME STOP", res["card"])
+        self.assertNotIn("id", res["order"])                                  # a preview has no ticket id
+        self.assertEqual(self.ledger()["tickets"], [])
+        with self.assertRaises(ValueError) as cm:                               # nothing was saved to say yes to
+            self.cconfirm(now=f"{CDAY}T23:58")
+        self.assertIn("no ticket TKT-20261031-001", str(cm.exception))
+        code, res = self.cticket(now="2026-11-01T00:01")                     # Sunday, a new UTC day
+        self.assertEqual((code, res["status"], res["ticket"]["id"]), (0, "pending", "TKT-20261101-001"))
+
+    def test_the_yes_rule_holds_on_a_saturday(self):
+        code, res = self.cticket()
+        tid = res["ticket"]["id"]
+        code, res = self.cconfirm(tid, yes=False)
+        self.assertEqual((code, res["confirmed"]), (1, False))
+        self.assertIn("in a later message", res["reason"])
+        with self.assertRaises(ValueError) as cm:                             # same breath: refused
+            self.cconfirm(tid, now=f"{CDAY}T04:40:05")
+        self.assertIn("s ago", str(cm.exception))
+        self.assertEqual(([k["status"] for k in self.ledger()["tickets"]], self.ledger()["trades"]), (["pending"], []))
+        code, res = self.cconfirm(tid)
+        self.assertEqual((code, res["status"], res["trade"]["exchange"], res["trade"]["fee_pct"]),
+                         (0, "filled", "binance", 0.1))
+
+    def test_the_budget_counts_binance_fees_at_the_ticket_and_again_at_yes(self):
+        # 0.065 BTC: $146.25 of price risk fits the $150 daily max loss; + $13.02 of fees at the stop does not
+        code, res = self.cticket(qty="0.065")
+        self.assertEqual((code, res["blocked"]), (broker.EXIT_BLOCKED, True))
+        self.assertTrue(any("$159.27" in r for r in res["reasons"]), res["reasons"])
+        self.assertEqual(self.ledger()["tickets"], [])
+        code, res = self.cticket(qty="0.06")                                  # $135 + $12.02 = $147.02: OK now
+        self.assertEqual((code, res["status"]), (0, "pending"), res)
+        led = self.ledger()
+        led["trades"].append(btc_trade(id="TRADE-20261031-000", symbol="BTC-USDT", exchange="binance", fee_pct=0.1,
+                                       status="closed", pnl=-10.0, r_multiple=-0.5, exit_price=98000.0,
+                                       closed_at=f"{CDAY}T03:00:00+00:00", opened_at=f"{CDAY}T02:00:00+00:00"))
+        tc.save_ledger(led)
+        # at yes: $10 lost today + $134.07 price risk at the 101,234.56 fill fits $150; + $12.01 of fees does not
+        code, res = self.cconfirm()
+        self.assertEqual((code, res["confirmed"], res["blocked"]), (broker.EXIT_BLOCKED, False, True))
+        self.assertEqual([k["status"] for k in self.ledger()["tickets"]], ["pending"])
+        self.assertEqual([t["id"] for t in self.ledger()["trades"]], ["TRADE-20261031-000"])
+
+
 class PaperOnlyTests(unittest.TestCase):
     def test_no_live_flag_or_mode(self):
         p = broker.build_parser()
@@ -1513,6 +1741,74 @@ class CliTests(TempHomeTestCase):
         st = json.loads(cli(f"{CDAY}T05:31", "status", "--market", "crypto", "--json", script=budget_script).stdout)
         self.assertEqual((st["date"], st["realized_pnl"], st["trades_today"], st["status"]),
                          (CDAY, 15.34, 1, "OPEN FOR TRADING"))
+
+    def binance_cli_flow(self, exit_bar):
+        """BTC-USDT on Binance (the default exchange), Saturday 2026-10-31 04:40 UTC: ticket -> yes in a later
+        step -> `exit_bar` (05:05) takes the trade out -> P&L net of 0.1% fees on both fills -> the budget's
+        UTC day. Binance fixtures only, no network. Returns (sync stdout, history totals, budget status JSON)."""
+        fx = self.home / "fx"
+        write_binance_products(fx)
+        write_binance_quote(fx, "BTC-USDT", 101234.56, when_ts=utc_ts(CDAY, "04:40") + 30)
+        five = crypto_flat("00:00", "05:30", start_day="2026-10-30")
+        i = next(n for n, b in enumerate(five) if b.ts == utc_ts(CDAY, "05:05"))
+        five[i] = exit_bar
+        write_binance_fixtures(fx, "BTC-USDT", five, "5m", "2d", now_ts=utc_ts(CDAY, "05:30"))
+        env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(fx), "DAYTRADER_CRYPTO_EXCHANGE": "binance"}
+        budget_script = skill_script("budget", "budget.py")
+
+        def cli(now, *args, script=SCRIPT):
+            return run_cli(script, *args, env=dict(env, DAYTRADER_NOW=now))
+
+        r = cli(f"{CDAY}T04:40", "ticket", "--symbol", "BTC-USDT", "--qty", "0.01", "--entry", "101250",
+                "--stop", "99000", "--target", "104000")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("BUY 0.01 BTC-USDT · LIMIT 101,250.00 · TARGET 104,000.00 · STOP 99,000.00 · PAPER · "
+                      "REAL MONEY: OFF · Binance prices", r.stdout)
+        self.assertIn("  Fees      0.1% per fill (paper) · $2.00 if the stop fills -> loss at the stop $24.50", r.stdout)
+        self.assertIn("WAITING FOR YOUR YES — reply yes to confirm ticket TKT-20261031-001", r.stdout)
+        self.assertNotIn("PREVIEW", r.stdout)                                   # the weekend is open for crypto
+        self.assertNotIn("Coinbase", r.stdout)
+        r = cli(f"{CDAY}T04:41", "confirm", "TKT-20261031-001")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("NOT CONFIRMED", r.stdout)
+        r = cli(f"{CDAY}T04:41", "confirm", "TKT-20261031-001", "--yes", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        res = json.loads(r.stdout)
+        tr = res["trade"]
+        self.assertEqual((res["status"], res["fill_price"], tr["exchange"], tr["fee_pct"], tr["entry_fee"]),
+                         ("filled", 101234.56, "binance", 0.1, 1.01))
+        sync = cli(f"{CDAY}T05:30", "sync", "--market", "crypto")
+        self.assertEqual(sync.returncode, 0, sync.stderr)
+        r = cli(f"{CDAY}T05:30", "history", "--market", "crypto", "--json")
+        totals = json.loads(r.stdout)["totals"]
+        r = cli(f"{CDAY}T05:31", "status", "--market", "crypto", script=budget_script)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("RISKED SO FAR · Sat 2026-10-31 · 05:31 UTC (market open)", r.stdout)
+        st = json.loads(cli(f"{CDAY}T05:31", "status", "--market", "crypto", "--json", script=budget_script).stdout)
+        led = tc.load_ledger()
+        self.assertEqual(([k["exchange"] for k in led["tickets"]], [t["exchange"] for t in led["trades"]]),
+                         (["binance"], ["binance"]))
+        return sync.stdout, totals, st, r.stdout
+
+    def test_binance_saturday_ticket_confirm_sync_target_budget_cli(self):
+        text, tot, st, card = self.binance_cli_flow(cbar("05:05", 101200, 104100, 101100, 103900))
+        # gross (104000 - 101234.56) x 0.01 = 27.65; fees 1.01 + 1.04; R = 25.60 / the 22.35 price risk
+        self.assertIn("TRADE-20261031-001 BTC-USDT LONG 0.01: TARGET @ 104,000.00 in the 05:05 UTC bar · +$25.60 +1.15R "
+                      "(net of $2.05 fees)", text)
+        self.assertEqual((tot["net_pnl"], tot["fees"], tot["gross_pnl"], tot["avg_r"]), (25.6, 2.05, 27.65, 1.15))
+        self.assertIn("realized P&L  +$25.60  (1 closed: 1 W / 0 L)", card)
+        self.assertEqual((st["date"], st["realized_pnl"], st["trades_today"], st["status"], st["loss_budget"]["used"]),
+                         (CDAY, 25.6, 1, "OPEN FOR TRADING", 0.0))
+
+    def test_binance_saturday_ticket_confirm_sync_stop_budget_cli(self):
+        text, tot, st, card = self.binance_cli_flow(cbar("05:05", 101200, 101300, 98900, 99100))
+        # gross (99000 - 101234.56) x 0.01 = -22.35; fees 1.01 + 0.99; net -24.35 = -1.09R of the price risk
+        self.assertIn("TRADE-20261031-001 BTC-USDT LONG 0.01: STOP @ 99,000.00 in the 05:05 UTC bar · -$24.35 -1.09R "
+                      "(net of $2.00 fees)", text)
+        self.assertEqual((tot["net_pnl"], tot["fees"], tot["gross_pnl"], tot["avg_r"]), (-24.35, 2.0, -22.35, -1.09))
+        self.assertIn("realized P&L  -$24.35  (1 closed: 0 W / 1 L)", card)
+        self.assertEqual((st["date"], st["realized_pnl"], st["loss_streak"], st["loss_budget"]["used"]),
+                         (CDAY, -24.35, 1, 24.35))
 
     def test_data_error_is_one_line_exit_2(self):
         env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_NOW": f"{DAY}T10:15"}

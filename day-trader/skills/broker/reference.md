@@ -38,20 +38,28 @@ ticket ──► pending ──confirm --yes──► confirmed (filled now → 
 
 ## Markets
 
-| | US stocks | Crypto (`BTC-USD`, `ETH-USD`, ... any `BASE-QUOTE` Coinbase product) |
+| | US stocks | Crypto (`BTC-USDT`, `ETH-USDT`, `BTCUSDT`, `BTC-USD`, ... any `BASE-QUOTE` pair) |
 |---|---|---|
-| prices | Yahoo Finance | Coinbase Exchange public market data (`api.exchange.coinbase.com`), no key |
+| prices | Yahoo Finance | Binance by default (or Coinbase): public market data from `data-api.binance.vision`, or `api.exchange.coinbase.com` with the `crypto_exchange` setting `coinbase`; no account, no key |
 | clock / day | US/Eastern, weekdays 09:30-16:00 | UTC, every day 00:00-24:00 (a session = a UTC day) |
 | default time stop | 15:55 ET | 23:55 UTC |
-| size (`--qty`) | whole shares | fractional, a multiple of the product's `base_increment` (else 1e-8) |
-| price tick | cents at $1+ (`sub-penny` refused) | the product's `quote_increment` (off-tick refused) |
-| paper fees | none | `crypto_fee_pct` (default 0.6) % of notional on every fill |
+| size (`--qty`) | whole shares | fractional, a multiple of the pair's size step (Binance `LOT_SIZE` stepSize, Coinbase `base_increment`; else 1e-8) |
+| price tick | cents at $1+ (`sub-penny` refused) | the pair's tick (Binance `PRICE_FILTER` tickSize, Coinbase `quote_increment`; off-tick refused) |
+| minimum order | none | Binance `NOTIONAL` minNotional (5 USDT for BTCUSDT), Coinbase `min_market_funds`: a smaller notional gets a warning |
+| paper fees | none | `crypto_fee_pct` % of notional on every fill (unset = the exchange's entry-tier taker fee: Binance 0.1, Coinbase 0.6) |
 
 * `--market us|crypto` on `sync`, `positions`, `tickets`, `history` picks whose clock and "today" are
   shown (default `$DAYTRADER_MARKET`, else US). Each ticket and trade is always replayed, dated and
   expired in its own market; times of the other market carry their label (`05:15 UTC`).
-* `ticket` reads the product rules (`/products`, cached a day). Offline it assumes the 1e-8 size
-  step, does not check the tick, and says so in a note.
+* `ticket` reads the pair rules (Binance `exchangeInfo`, Coinbase `/products`; cached a day). Offline
+  it assumes the 1e-8 size step, does not check the tick, and says so in a note.
+* **One exchange per ticket, for life.** A crypto ticket records the exchange whose prices made it
+  (`exchange`: `binance` | `coinbase`) and its trade inherits it. `confirm`, `sync`, `close`,
+  `cancel` and `positions` price that row on its own exchange only - never the other one - whatever
+  the `crypto_exchange` setting (or `$DAYTRADER_CRYPTO_EXCHANGE`) says now. A ticket confirmed after
+  the setting changed fills on its own exchange at its own `fee_pct`, with a note saying so. Crypto
+  rows from before the field existed (v1.1.0) were priced on Coinbase and stay on Coinbase. On
+  Binance a `-USD` symbol is priced from its USDT pair (`BTC-USD` → `BTCUSDT`; a note says so).
 
 ## Fill rules
 
@@ -63,7 +71,7 @@ ticket ──► pending ──confirm --yes──► confirmed (filled now → 
 | sell-short limit, quote ≥ limit | filled at the quote |
 | sell-short limit, quote < limit | `working` |
 | fill price already through the stop or past the target | refused (exit 1), ticket stays pending |
-| crypto, any fill | the price rounded to the product's tick; pays `fee_pct` % of its notional |
+| crypto, any fill | the price rounded to the pair's tick; pays `fee_pct` % of its notional |
 | working buy limit, later bar with `low < limit` | filled at `min(limit, bar open)` |
 | working buy limit, confirmation bar closes `< limit` | filled at the limit |
 | working short limit, later bar with `high > limit` | filled at `max(limit, bar open)` |
@@ -178,16 +186,17 @@ Other fields that can appear:
 
 * tickets: `cancelled_at`, `cancel_reason`, `expired_at`, `synced_at`;
 * trades: `ambiguous_exit`, `synced_at`.
-* every ticket and trade carries `market` (`us` | `crypto`). Crypto tickets add `tick`, `qty_step`,
-  `fee_pct`, `fees_at_stop`, `max_loss`; crypto trades add `tick`, `fee_pct`, `entry_fee`,
-  `exit_fee`, `fees`, `gross_pnl` (ids, stamps and days in UTC):
+* every ticket and trade carries `market` (`us` | `crypto`). Crypto tickets add `exchange`, `tick`,
+  `qty_step`, `fee_pct`, `fees_at_stop`, `max_loss`; crypto trades add `exchange`, `tick`, `fee_pct`,
+  `entry_fee`, `exit_fee`, `fees`, `gross_pnl` (ids, stamps and days in UTC):
 
 ```json
-{"id": "TRADE-20261031-001", "symbol": "BTC-USD", "market": "crypto", "side": "long", "qty": 0.01,
+{"id": "TRADE-20261031-001", "symbol": "BTC-USDT", "market": "crypto", "side": "long", "qty": 0.01,
  "entry_price": 101234.56, "stop": 99000.0, "target": 104000.0, "time_stop": "23:55",
  "opened_at": "2026-10-31T04:41:00+00:00", "status": "closed", "exit_price": 104000.0,
- "closed_at": "2026-10-31T05:10:00+00:00", "exit_reason": "target", "tick": 0.01, "fee_pct": 0.6,
- "entry_fee": 6.07, "exit_fee": 6.24, "fees": 12.31, "gross_pnl": 27.65, "pnl": 15.34, "r_multiple": 0.69}
+ "closed_at": "2026-10-31T05:10:00+00:00", "exit_reason": "target", "exchange": "binance",
+ "tick": 0.01, "fee_pct": 0.1, "entry_fee": 1.01, "exit_fee": 1.04, "fees": 2.05, "gross_pnl": 27.65,
+ "pnl": 25.6, "r_multiple": 1.15}
 ```
 
 Writes are atomic, behind a lock file (`ledger.lock`). Only this skill writes the ledger.
@@ -219,7 +228,7 @@ Writes are atomic, behind a lock file (`ledger.lock`). Only this skill writes th
     * `{kind: "closed", trade_id, reason, price, at, bar, pnl, r_multiple, ambiguous}`;
     * `{kind: "expired", ticket_id, price, at}`;
   * also: `open[]` (with `checked_through`), `working[]`, `issues[]`,
-    `errors[{symbol, error}]`, `expired_tickets[]`, `summary` (`tc.day_summary`).
+    `errors[{symbol, error}]` (crypto: plus `exchange`), `expired_tickets[]`, `summary` (`tc.day_summary`).
 * `close`: `closed_by: "manual"|"sync", trade, quote, notes[]`.
 * `cancel`: `ticket, was` (the status it had), `notes[]`.
 * `positions`: `positions[]` (each trade plus `last, unrealized, unrealized_r,
@@ -228,19 +237,21 @@ Writes are atomic, behind a lock file (`ledger.lock`). Only this skill writes th
 * `tickets`: `tickets[]` (status shown as `expired` once past `expires_at`).
 * `history`: `days, since, trades[]`, and `totals {trades, wins, losses, flat, win_rate_pct,
   net_pnl, avg_r, best, worst}` (plus `fees, gross_pnl` when crypto trades are in the window).
-* `sync` events of crypto trades add `market`, `fees`, `gross_pnl`.
+* `sync` events (and `open[]`, `working[]` rows) of crypto trades add `market`, `exchange`, and
+  closes `fees`, `gross_pnl`.
 
 ## Data
 
-* Fills use `tc.quote` (Yahoo 1-minute chart, `regularMarketPrice`; crypto: the Coinbase ticker).
+* Fills use `tc.quote` (Yahoo 1-minute chart, `regularMarketPrice`; crypto: the ticker of the
+  ticket's exchange - Binance's 24 h ticker, or Coinbase's).
 * Exits use `tc.fetch_bars(symbol, "5m", "5d")`, or `"60d"` for items more than 4 days old.
-  Yahoo keeps 60 days of 5-minute bars. Crypto: Coinbase 5-minute candles for the UTC days since
-  the oldest open item (`"2d"` for today's), 300 candles a page.
+  Yahoo keeps 60 days of 5-minute bars. Crypto: the row's exchange's 5-minute candles for the UTC
+  days since the oldest open item (`"2d"` for today's; Binance pages 1,000 candles, Coinbase 300).
 * Offline tests and demos: set `$DAYTRADER_FIXTURES`. Replays: set `$DAYTRADER_NOW` (naive = the
   command's market clock: ET, or UTC for a crypto ticket/trade or `--market crypto`; `Z` works).
 
 ```bash
-python3 scripts/broker.py ticket --symbol ETH-USD --qty 0.25 --type market --stop 3450 --target 3650
+python3 scripts/broker.py ticket --symbol ETH-USDT --qty 0.25 --type market --stop 3450 --target 3650
 python3 scripts/broker.py positions --market crypto
 python3 scripts/broker.py history --days 7 --market crypto --json
 ```

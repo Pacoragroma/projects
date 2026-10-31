@@ -2,6 +2,8 @@
 import io
 import json
 import os
+import re
+import shlex
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -10,9 +12,10 @@ from unittest import mock
 # tests/ is not a package: make `import helpers` work for `python3 -m unittest tests.test_entry` too.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from helpers import (TempHomeTestCase, et_ts, fake_bars, load_skill_module, run_cli, skill_script,  # noqa: E402
-                     tc, utc_ts, write_coinbase_fixtures, write_coinbase_products, write_fixture,
-                     yahoo_chart_url, yahoo_payload)
+from helpers import (SKILLS, TempHomeTestCase, et_ts, fake_bars, fake_http, load_skill_module, run_cli,  # noqa: E402
+                     skill_script, tc, utc_ts, write_binance_fixtures, write_binance_products,
+                     write_coinbase_fixtures, write_coinbase_products, write_fixture, yahoo_chart_url,
+                     yahoo_payload)
 
 E = load_skill_module("entry", "entry")
 SCRIPT = skill_script("entry", "entry.py")
@@ -796,6 +799,106 @@ class CryptoCliTests(TempHomeTestCase):
         self.assertTrue(p.stderr.startswith("data error: "), p.stderr)
         self.assertIn("api.exchange.coinbase.com", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Crypto on Binance (the default exchange): BTC-USDT, compact BTCUSDT, BTC-USD priced from BTCUSDT
+# ---------------------------------------------------------------------------
+
+class BinanceCliTests(TempHomeTestCase):
+    """The real script against Binance fixtures, on a Saturday (same tape as CryptoCliTests)."""
+    NOW = "2026-10-31T04:40"
+
+    def setUp(self):
+        super().setUp()
+        self.fx = self.home / "fixtures"
+        bars = []
+        for day in ("2026-10-26", "2026-10-27", "2026-10-28", "2026-10-29", FRI):
+            bars += utc_day(day, 100.0)
+        bars += mk_utc(SAT, ORB_ROWS + flat(102.2, 51))                     # 00:00 .. 04:40 (forming)
+        # Binance's few USD pairs are thin: BTC-USD, BTCUSDT and BTC-USDT all read these BTCUSDT klines.
+        write_binance_fixtures(self.fx, "BTC-USDT", bars, "5m", "5d", now_ts=utc_ts(SAT, "04:40"))
+        write_binance_products(self.fx)
+        self.env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(self.fx), "DAYTRADER_NOW": self.NOW,
+                    "DAYTRADER_CRYPTO_EXCHANGE": "binance"}
+
+    def test_text_json_and_save_on_btc_usdt(self):
+        p = run_cli(SCRIPT, "BTC-USDT", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        lines = p.stdout.splitlines()
+        self.assertEqual(lines[0], "BTC-USDT 5m · ORB(15) · TRIGGERED 00:25 UTC · LONG @ 101.90 (OR 99.00–101.50)")
+        self.assertIn("  trigger bar 00:20-00:25 UTC", p.stdout)
+        self.assertIn("suggested stop 99.00 (OR low) · risk 2.90/BTC (2.85%)", p.stdout)
+        self.assertNotIn("is priced from", p.stdout)                         # a USDT pair is priced as typed
+        self.assertNotIn("Coinbase", p.stdout + p.stderr)
+        p = run_cli(SCRIPT, "BTC-USDT", "--json", "--save", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        r = json.loads(p.stdout)
+        self.assertEqual((r["symbol"], r["date"], r["status"], r["entry"], r["suggested_stop"]),
+                         ("BTC-USDT", SAT, "TRIGGERED", 101.9, 99.0))
+        plan = json.loads((self.home / "plans" / "BTC-USDT.json").read_text())
+        self.assertEqual((plan["entry"], plan["stop"], plan["entry_signal"]["date"]), (101.9, 99.0, SAT))
+
+    def test_binance_is_the_default_exchange(self):
+        os.environ.pop("DAYTRADER_CRYPTO_EXCHANGE")                          # no variable (temp_home restores it)
+        env = {k: v for k, v in self.env.items() if k != "DAYTRADER_CRYPTO_EXCHANGE"}   # and no setting
+        p = run_cli(SCRIPT, "BTC-USDT", "--json", env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)                         # only Binance fixtures exist
+        r = json.loads(p.stdout)
+        self.assertEqual((r["triggered_at"], r["entry"]), ("00:25", 101.9))
+
+    def test_compact_and_usd_symbols(self):
+        p = run_cli(SCRIPT, "BTCUSDT", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("BTCUSDT 5m · ORB(15) · TRIGGERED 00:25 UTC · LONG @ 101.90", p.stdout)
+        self.assertIn("risk 2.90/BTC (2.85%)", p.stdout)                     # one coin, not one "BTCUSDT"
+        self.assertNotIn("is priced from", p.stdout)
+        p = run_cli(SCRIPT, "BTC-USD", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        r = json.loads(p.stdout)
+        self.assertEqual((r["triggered_at"], r["entry"], r["suggested_stop"]), ("00:25", 101.9, 99.0))
+        self.assertIn("BTC-USD is priced from Binance's BTCUSDT pair, quoted in USDT (Binance's few USD pairs are thin)",
+                      r["notes"])
+
+    def test_the_tick_comes_from_binance_pair_rules(self):
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "binance"                  # temp_home restores it
+        tc.use_market_for("BTC-USDT")
+        with mock.patch.dict(os.environ, {"DAYTRADER_FIXTURES": str(self.fx)}):
+            self.assertEqual(E.price_tick("BTC-USDT"), 0.01)                  # PRICE_FILTER tickSize
+            self.assertIsNone(E.price_tick("ETH-BTC"))                        # no rules fixture: fall back
+
+    def test_unknown_pair_is_bad_input_and_an_unreachable_host_a_data_error(self):
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "binance"
+        tc.use_market_for("NOPE-USDT")
+        with fake_http({"klines": tc.FetchError("HTTP 400 for https://data-api.binance.vision/api/v3/klines?symbol=NOPEUSDT")}):
+            with self.assertRaises(ValueError) as cm:
+                E.fetch("NOPE-USDT", "5d")
+        self.assertEqual(str(cm.exception), "NOPE-USDT: Binance has no such pair (crypto pairs look like BTC-USDT or BTC-USD)")
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "coinbase"                 # Coinbase answers 404
+        with fake_http({"candles": tc.FetchError("HTTP 404 for https://api.exchange.coinbase.com/products/NOPE-USDT/candles")}):
+            with self.assertRaises(ValueError) as cm:
+                E.fetch("NOPE-USDT", "5d")
+        self.assertIn("Coinbase has no such pair", str(cm.exception))
+        empty = self.home / "empty"
+        empty.mkdir()
+        p = run_cli(SCRIPT, "BTC-USDT", env=dict(self.env, DAYTRADER_FIXTURES=str(empty)))
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertTrue(p.stderr.startswith("data error: "), p.stderr)
+        self.assertIn("data-api.binance.vision", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+
+class DocTests(unittest.TestCase):
+    def test_every_documented_command_parses(self):
+        text = (SKILLS / "entry" / "SKILL.md").read_text(encoding="utf-8")
+        cmds = re.findall(r"python3 scripts/entry\.py([^`\n#]*)", text)
+        self.assertGreaterEqual(len(cmds), 9)
+        self.assertTrue(any(c.split()[0] == "BTC-USDT" for c in cmds))      # the primary crypto example
+        for c in cmds:
+            with self.subTest(cmd=c), redirect_stderr(io.StringIO()):
+                args = E.build_parser().parse_args(shlex.split(c))
+                with tc.market_scope(args.symbol):
+                    E.options_from_args(args, tc.parse_et("2026-10-30T10:00"))
 
 
 if __name__ == "__main__":

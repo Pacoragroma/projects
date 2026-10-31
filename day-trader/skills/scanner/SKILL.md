@@ -7,8 +7,9 @@ description: >-
   and rank them by a 0-100 score. Use when the user asks "what's moving", "find me setups",
   "scan the market", "any breakouts today", "what's gapping", "stocks with unusual volume",
   "screen my watchlist", "which of TSLA, NVDA, AMD look good", or wants trade ideas to start
-  the day. Also scans crypto (Coinbase USD pairs like BTC-USD: `--market crypto`, 24/7, UTC days).
-  Free Yahoo Finance, Nasdaq Trader and Coinbase data, no API key. Ideas to research, not advice.
+  the day. Also scans crypto (`--market crypto`: Binance USDT pairs like BTC-USDT by default, or
+  Coinbase USD pairs; 24/7, UTC days). Free Yahoo Finance, Nasdaq Trader and Binance or Coinbase
+  data, no API key. Ideas to research, not advice.
 ---
 # Scanner
 
@@ -28,8 +29,8 @@ python3 scripts/scan.py --setups breakout,gap_up --top 20     # whole market: a 
 python3 scripts/scan.py --setups gap_up,gap_down,unusual_volume --min-dollar-volume 50M
 python3 scripts/scan.py --setups pullback --min-price 20 --include-etfs --top 10
 python3 scripts/scan.py --symbols TSLA,NVDA --json            # machine-readable, for chaining
-python3 scripts/scan.py --market crypto --top 15              # crypto: Coinbase USD pairs (24/7)
-python3 scripts/scan.py --symbols BTC-USD,ETH-USD,SOL-USD      # crypto symbols scan as crypto
+python3 scripts/scan.py --market crypto --top 15              # crypto: Binance USDT pairs (24/7)
+python3 scripts/scan.py --symbols BTC-USDT,ETH-USDT,SOL-USDT   # crypto symbols scan as crypto
 ```
 
 Flags: `--symbols A,B` (only these), `--limit N` (first N of the universe), `--setups` (any of
@@ -39,23 +40,28 @@ Flags: `--symbols A,B` (only these), `--limit N` (first N of the universe), `--s
 `--quiet` (no progress lines on stderr), `--market us|crypto` (default us, or the market of
 `--symbols`; one market per scan - a mixed list is refused), `--json`.
 
-**Crypto** (`--market crypto`, or crypto `--symbols` such as `BTC-USD`): the universe is every
-online Coinbase USD pair minus stablecoins; daily candles come from Coinbase Exchange
-(`api.exchange.coinbase.com`, public, no key) and a "day" is a UTC day. Defaults change to
-`--min-price 0`, `--min-dollar-volume 5M` and 4 workers (explicit flags win). Crypto trades 24/7,
-so a daily bar opens where the last one closed: **gap setups are skipped** and the output says so
-(`Note:` lines, JSON `notes`); today's volume is paced evenly across the UTC day.
+**Crypto** (`--market crypto`, or crypto `--symbols` such as `BTC-USDT`; `BTC-USD`, `BTCUSDT` work
+too): daily candles from **Binance by default (or Coinbase)** - public data, no account, no key; the
+`crypto_exchange` setting or `$DAYTRADER_CRYPTO_EXCHANGE` picks the exchange. The universe is every
+trading Binance USDT pair (~500; leveraged tokens and stablecoins dropped) or online Coinbase USD
+pair (stablecoins dropped); a "day" is a UTC day. Binance's few USD pairs are thin: there `BTC-USD` is
+priced from `BTCUSDT` (a `Note:` says so) and volume is in USDT (about $1). Defaults change to
+`--min-price 0`, `--min-dollar-volume 5M` and 8 workers on Binance, 4 on Coinbase (explicit flags
+win). Crypto trades 24/7, so a daily bar opens where the last one closed: **gap setups are skipped**
+and the output says so (`Note:` lines, JSON `notes`); today's volume is paced evenly over the UTC day.
 
 **Speed:** a full-market scan is ~5,900 Yahoo requests and takes a few minutes (progress prints to
-stderr every 250 symbols). If the user wants something quick, or names tickers, use `--symbols` or
-`--limit` first, and tell them before starting a full scan that it will take a few minutes.
-Re-running within ~2 minutes (market open) or ~15 minutes (closed) reuses the download cache.
+stderr every 250 symbols; a full Binance crypto scan is ~500 pairs, about a minute). If the user
+wants something quick, or names tickers, use `--symbols` or `--limit` first, and tell them before
+starting a full scan that it will take a few minutes. Re-running within ~2 minutes (market open,
+crypto always) or ~15 minutes (closed) reuses the download cache.
 
 ## How it works
 1. Universe: Nasdaq Trader's symbol lists, minus ETFs (unless `--include-etfs`), warrants,
    units, rights, preferreds and notes. Or just `--symbols`.
 2. For each symbol: ~6 months of daily bars (`1d`, `6mo`). Skipped (and counted): download
-   failures, unknown symbols, fewer than 60 bars, no bar in the last 6 days (halted/delisted).
+   failures, unknown symbols, fewer than 60 bars, no bar in the last 6 days (halted/delisted),
+   crypto pairs the desk cannot read yet (one-letter or non-Latin coin names: "unsupported name").
 3. Liquidity filter: last price >= `--min-price`, and average close x volume of the 20 bars
    *before* today >= `--min-dollar-volume` (one spike day cannot qualify a thin stock).
 4. Setups on "today" = the latest bar (today's bar in progress while the market is open):
@@ -95,7 +101,8 @@ not a probability of profit.
 
 ## Reading the output / how to present it to the user
 - Header: time (ET; UTC for crypto, marked `SCANNER · crypto`) and whether today's bar is still
-  forming. Mid-session, say "rvol is projected". Relay crypto `Note:` lines (no gap setups).
+  forming. Mid-session, say "rvol is projected". Relay crypto `Note:` lines (price source, no gap
+  setups, USD pairs priced from USDT).
 - `WARNING: replay at HH:MM ET ...` (JSON `replay_warning`; `after_as_of: true` on each affected
   row): the as-of day's daily bar includes trading after that time, so last, change, rvol and
   setups show the later picture. Relay it; do not present those numbers as "at HH:MM".
@@ -135,8 +142,8 @@ not a probability of profit.
 - Paper trading only - this skill places nothing; orders go through the broker skill and only
   after the user's explicit yes.
 - If the script exits with code 2 ("data error: ..."), tell the user which host failed (it is in
-  the message, e.g. `query1.finance.yahoo.com`, `www.nasdaqtrader.com` or
-  `api.exchange.coinbase.com`) - in sandboxes the
-  host may need to be allow-listed. Never invent prices, headlines, or odds to fill the gap.
-  Exit code 1 means bad input (e.g. an unknown setup name, or no `--symbols` ticker that Yahoo
-  knows; a single unknown ticker in a list is just reported under "Skipped").
+  the message, e.g. `query1.finance.yahoo.com`, `www.nasdaqtrader.com`, or for crypto
+  `data-api.binance.vision` on Binance and `api.exchange.coinbase.com` on Coinbase) - in sandboxes
+  the host may need to be allow-listed. Never invent prices, headlines, or odds to fill the gap.
+  Exit code 1 means bad input (e.g. an unknown setup name, or no `--symbols` ticker that Yahoo or
+  the crypto exchange knows; a single unknown ticker in a list is just reported under "Skipped").

@@ -11,9 +11,9 @@ from datetime import timedelta
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import (SKILLS, TempHomeTestCase, et_ts, fake_bars, load_skill_module, run_cli,  # noqa: E402
-                     skill_script, tc, utc_ts, write_coinbase_fixtures, write_fixture, yahoo_chart_url,
-                     yahoo_payload)
+from helpers import (SKILLS, TempHomeTestCase, et_ts, fake_bars, fake_http, load_skill_module,  # noqa: E402
+                     run_cli, skill_script, tc, utc_ts, write_binance_fixtures, write_coinbase_fixtures,
+                     write_fixture, yahoo_chart_url, yahoo_payload)
 
 A = load_skill_module("alerts", "alerts")
 SCRIPT = skill_script("alerts", "alerts.py")
@@ -786,6 +786,8 @@ class SkillDocTests(unittest.TestCase):
                       "(`python3 scripts/<tool>.py ...`) or by absolute path. Python 3.9+, standard library only.", text)
         cmds = re.findall(r"python3 scripts/alerts\.py ([^`\n]*)", text)
         self.assertGreater(len(cmds), 8)
+        self.assertTrue(any(c.split()[:2] == ["add", "BTC-USDT"] for c in cmds))   # the primary crypto example
+        self.assertIn("Binance by default (or", text)
         parser = A.build_parser()
         for c in cmds:
             argv = shlex.split(c.split("  #")[0].split(" # ")[0])
@@ -943,6 +945,136 @@ class CryptoCliTests(TempHomeTestCase):
         p = run_cli(SCRIPT, "add", "BTC-USD", "--above", "101000", env=dict(self.env, DAYTRADER_FIXTURES=str(empty)))
         self.assertEqual(p.returncode, 2, p.stderr)
         self.assertIn("api.exchange.coinbase.com", p.stderr)
+        self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Crypto on Binance (the default exchange): BTC-USDT, BTC-USD priced from BTCUSDT, sub-cent coins
+# ---------------------------------------------------------------------------
+
+def scaled(bars, k):
+    return [tc.Bar(b.ts, b.open * k, b.high * k, b.low * k, b.close * k, b.volume / k) for b in bars]
+
+
+class BinanceCoreTests(TempHomeTestCase):
+    NOW = f"{CDAY}T04:40"
+
+    def setUp(self):
+        super().setUp()
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "binance"            # temp_home restores it
+        tc.set_market(tc.CRYPTO)
+
+    def test_sub_cent_coin_levels_stay_exact(self):
+        bars = scaled(crypto_bars(), 1e-10)                       # ~0.00001 USDT, one dip to 0.00000979
+        now = tc.now_et()
+        ctx = A.market_context([b for b in bars if b.ts < now.timestamp()], None, now)
+        self.assertEqual(ctx["last"], 1e-05)
+        a = A.make_alert("PEPE-USDT", "below", ctx, now, [], level=0.0000098, once=True)
+        self.assertEqual((a["level"], a["exchange"], a["legs"][0]["armed"]), (9.8e-06, "binance", True))
+        self.assertEqual(A.condition_text(a), "below 0.000009800")
+        r = A.evaluate(a, bars, None, tc.to_local(utc_ts(CDAY, "05:10"), tc.CRYPTO))
+        self.assertEqual([(e["bar_time"], e["level"]) for e in r["events"]], [("04:50", 9.8e-06)])
+        band = A.make_alert("PEPE-USDT", "pct_move", ctx, now, [], pct=2.0)
+        self.assertEqual([leg["level"] for leg in band["legs"]], [1.02e-05, 9.8e-06])   # not 0.0
+        tc.set_market(tc.US)                                       # stocks: 4 decimals, as before
+        self.assertEqual((A._exact(370.0399780), A._px(0.00001234)), (370.04, 0.0))
+
+    def test_unknown_pair_is_bad_input(self):
+        with fake_http({"klines": tc.FetchError("HTTP 400 for https://data-api.binance.vision/api/v3/klines?symbol=NOPEUSDT")}):
+            with self.assertRaises(ValueError) as cm:
+                A.fetch("NOPE-USDT", "2d")
+        self.assertEqual(str(cm.exception), "NOPE-USDT: Binance has no candles for this pair (not a listed pair? "
+                                             "crypto pairs look like BTC-USDT or BTC-USD)")
+
+    def test_only_crypto_alerts_record_an_exchange(self):
+        now = tc.now_et()
+        ctx = A.market_context([b for b in crypto_bars() if b.ts < now.timestamp()], None, now)
+        self.assertEqual(A.make_alert("BTC-USDT", "above", ctx, now, [], level=101_000.0)["exchange"], "binance")
+        tc.set_market(tc.US)
+        us = A.make_alert("TSLA", "above", A.market_context(BARS, None, at("09:42")), at("09:42"), [], level=101.0)
+        self.assertNotIn("exchange", us)
+        self.assertNotIn("exchange", A.summary_row(us))
+
+
+class BinanceCommandTests(TempHomeTestCase):
+    NOW = f"{CDAY}T04:40"
+
+    def cli(self, *argv, now):
+        os.environ["DAYTRADER_NOW"] = now
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = A.main(list(argv))
+        return code, out.getvalue()
+
+    def test_an_alert_set_on_coinbase_says_when_binance_checks_it(self):
+        crypto = crypto_bars()
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "coinbase"
+        with fake_bars({("BTC-USD", "5m"): [b for b in crypto if b.ts < utc_ts(CDAY, "04:40")]}):
+            self.cli("add", "BTC-USD", "--below", "98000", now=f"{CDAY}T04:40")
+            self.cli("add", "BTC-USD", "--above", "150000", now=f"{CDAY}T04:40")
+        state = json.loads((self.home / "alerts.json").read_text())
+        self.assertEqual([a["exchange"] for a in state["alerts"]], ["coinbase", "coinbase"])
+        state["alerts"][1].pop("exchange")                       # saved by v1.1.0: no field, Coinbase prices
+        (self.home / "alerts.json").write_text(json.dumps(state))
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "binance"
+        with fake_bars({("BTC-USD", "5m"): crypto}):
+            code, out = self.cli("check", now=f"{CDAY}T05:10")
+            self.assertEqual(code, 0)
+            self.assertIn("FIRED  ALR-20261031-001  BTC-USD  below 98,000.00", out)
+            self.assertIn("note: BTC-USD: ALR-20261031-001, ALR-20261031-002 were set on Coinbase prices, "
+                          "now checked on Binance prices", out)
+            _, again = self.cli("check", "--json", now=f"{CDAY}T05:15")
+        rep = json.loads(again)
+        self.assertEqual(rep["notes"], [])                            # said once: the alerts now read Binance
+        self.assertEqual((rep["symbols"]["BTC-USD"]["exchange"], rep["alerts"][0]["exchange"]), ("binance", "binance"))
+        self.assertEqual({a["exchange"] for a in json.loads((self.home / "alerts.json").read_text())["alerts"]},
+                         {"binance"})
+
+
+class BinanceCliTests(TempHomeTestCase):
+    """The real script against Binance fixtures on a Saturday (the same tape as CryptoCliTests)."""
+
+    def setUp(self):
+        super().setUp()
+        self.fx = self.home / "fx"
+        bars = crypto_bars()
+        for hhmm in ("04:40", "05:10"):                       # the live window's URL moves with "now"
+            write_binance_fixtures(self.fx, "BTC-USDT", bars, "5m", "2d", now_ts=utc_ts(CDAY, hhmm))
+        self.env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(self.fx),
+                    "DAYTRADER_NOW": f"{CDAY}T04:40", "DAYTRADER_CRYPTO_EXCHANGE": "binance"}
+
+    def test_add_check_list_btc_usdt_on_a_saturday(self):
+        p = run_cli(SCRIPT, "add", "BTC-USDT", "--below", "98000", "--once", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("Added ALR-20261031-001 · BTC-USDT below 98,000.00 · once · armed", p.stdout)
+        self.assertIn("  last 100,000.00 on Binance · fires at <= 98,000.00 (-2.00% away)", p.stdout)
+        p = run_cli(SCRIPT, "add", "BTC-USD", "--above", "150000", env=self.env)     # read from BTCUSDT
+        self.assertEqual(p.returncode, 0, p.stderr)
+        p = run_cli(SCRIPT, "check", env=dict(self.env, DAYTRADER_NOW=f"{CDAY}T05:10"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(p.stdout.startswith("ALERTS CHECK · 05:10 UTC · 2 active alerts on 2 symbols\n"), p.stdout)
+        self.assertIn("traded below 98,000.00 04:50-04:55 UTC (low 97,900.00) · last 100,000.00 · one-shot, now off",
+                      p.stdout)
+        self.assertNotIn("Coinbase", p.stdout + p.stderr)
+        self.assertNotIn("note:", p.stdout)
+        j = run_cli(SCRIPT, "list", "--json", env=dict(self.env, DAYTRADER_NOW=f"{CDAY}T05:10"))
+        rows = {r["symbol"]: r for r in json.loads(j.stdout)["alerts"]}
+        self.assertEqual((rows["BTC-USDT"]["exchange"], rows["BTC-USDT"]["status"]), ("binance", "fired"))
+        self.assertEqual((rows["BTC-USD"]["exchange"], rows["BTC-USD"]["market"]), ("binance", "crypto"))
+
+    def test_binance_is_the_default_and_its_host_is_named_when_down(self):
+        os.environ.pop("DAYTRADER_CRYPTO_EXCHANGE")                          # no variable (temp_home restores it)
+        env = {k: v for k, v in self.env.items() if k != "DAYTRADER_CRYPTO_EXCHANGE"}   # and no setting
+        p = run_cli(SCRIPT, "add", "BTCUSDT", "--pct-move", "2", "--json", env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)                         # only Binance fixtures exist
+        a = json.loads(p.stdout)["added"][0]
+        self.assertEqual((a["exchange"], a["ref_price"], [g["level"] for g in a["legs"]]),
+                         ("binance", 100_000.0, [102_000.0, 98_000.0]))
+        empty = self.home / "empty"
+        empty.mkdir()
+        p = run_cli(SCRIPT, "add", "BTC-USDT", "--above", "101000", env=dict(env, DAYTRADER_FIXTURES=str(empty)))
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("data-api.binance.vision", p.stderr)
         self.assertEqual(len(p.stderr.strip().splitlines()), 1, p.stderr)
 
 

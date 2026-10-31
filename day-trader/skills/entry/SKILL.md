@@ -8,9 +8,9 @@ description: >-
   "tell me when NVDA reclaims VWAP", "watch AMD for a break of 165", "let me know when it takes out
   yesterday's high", "wait for the entry", "what would the 15-minute ORB have done on Tuesday", or
   wants a trigger before setting a stop and target. Crypto too (24/7, UTC days): "paper trade BTC",
-  "plan a trade on BTC-USD", "did ETH-USD break its range since 04:00". Free Yahoo Finance (stocks)
-  or Coinbase (crypto) 5-minute data, no API key. Reports mechanical triggers, not advice; paper
-  trading only.
+  "plan a trade on BTC-USDT", "did ETH-USDT break its range since 04:00". Free Yahoo Finance
+  (stocks) or Binance / Coinbase (crypto; Binance by default) 5-minute data, no API key. Reports
+  mechanical triggers, not advice; paper trading only.
 ---
 # Entry
 
@@ -31,8 +31,8 @@ python3 scripts/entry.py AMD --level 165 --side long --cutoff 15:55 # --level im
 python3 scripts/entry.py AAPL --setup pdh --cutoff 15:55            # long only (pdl = short only)
 python3 scripts/entry.py TSLA --watch --interval 60 --max-minutes 30 --save
 python3 scripts/entry.py TSLA --date 2026-10-29 --json              # replay a past session
-python3 scripts/entry.py BTC-USD --or-start 04:00 --save            # crypto: range from 04:00 UTC
-python3 scripts/entry.py BTC-USD --level 100000 --side long --cutoff 23:55
+python3 scripts/entry.py BTC-USDT --or-start 04:00 --save           # crypto: range from 04:00 UTC
+python3 scripts/entry.py BTC-USDT --level 100000 --side long --cutoff 23:55
 ```
 
 Flags: `--setup orb|vwap|level|pdh|pdl` (default `orb`), `--side long|short|both` (default `both`
@@ -48,25 +48,30 @@ The 11:30 default cutoff suits the morning ORB. For a VWAP, level or PDH/PDL wat
 made after 11:30, pass a later cutoff (e.g. `--cutoff 15:55`); otherwise the result is EXPIRED at
 once (the output adds a note when the default cutoff caused the expiry).
 
-**Crypto** (a Coinbase product such as `BTC-USD`, `ETH-USD`, `SOL-USD`) works the same way with
-these differences: it trades 24/7, so times are **UTC** and a session is a **UTC day** (VWAP, the
-day range and PDH/PDL all use UTC days; weekends trade). There is no opening bell: the ORB starts at
-00:00 UTC unless you anchor it with `--or-start HH:MM` (e.g. where the user starts watching), and
-the default cutoff is 2 hours after that start (02:00 UTC by default), so a later request needs
-`--or-start` or `--cutoff 23:55`. Prices come from Coinbase's public candles (no account, no key);
-the one-tick stop rule uses the product's price increment.
+**Crypto** (a pair such as `BTC-USDT`, `ETH-USDT`, `SOL-USDT`; `BTC-USD` works too) works the same
+way with these differences: it trades 24/7, so times are **UTC** and a session is a **UTC day**
+(VWAP, the day range and PDH/PDL all use UTC days; weekends trade). There is no opening bell: the
+ORB starts at 00:00 UTC unless you anchor it with `--or-start HH:MM` (e.g. where the user starts
+watching), and the default cutoff is 2 hours after that start (02:00 UTC by default), so a later
+request needs `--or-start` or `--cutoff 23:55`. Prices come from **Binance by default (or
+Coinbase)**: public candles, no account, no key. The `crypto_exchange` setting (`binance` or
+`coinbase`) or `$DAYTRADER_CRYPTO_EXCHANGE` picks the exchange. Binance's few USD pairs are thin, so there
+`BTC-USD` is priced from `BTCUSDT` (a note says so); the compact form `BTCUSDT` works too. The
+one-tick stop rule uses the pair's price tick (Binance `tickSize`, Coinbase `quote_increment`).
 
 `--watch` prints one status line per check and the full card at the end; it stops on TRIGGERED,
-EXPIRED, `--max-minutes`, or Ctrl-C (exit 130). If the first check cannot reach Yahoo it exits 2 at
-once; after that it rides out up to 2 failed checks in a row. It runs in the foreground, so in a chat keep
+EXPIRED, `--max-minutes`, or Ctrl-C (exit 130). If the first check cannot reach the data source
+(Yahoo, or the crypto exchange) it exits 2 at once; after that it rides out up to 2 failed checks in
+a row. It runs in the foreground, so in a chat keep
 `--max-minutes` inside your command timeout (or run it in the background), or simply re-run the
 one-shot check when the user asks again. With `--json`, `--watch` prints one JSON object per line
 per check, then a last one with `"final": true`.
 
 ## How it works
 - Data: Yahoo 5-minute bars (`5d`; `60d` for a past `--date`), regular session 09:30-16:00 ET,
-  plus the previous session for PDH/PDL. Bars are snapped to the 5-minute grid. Crypto: Coinbase
-  5-minute candles over the same ranges, whole UTC days.
+  plus the previous session for PDH/PDL. Bars are snapped to the 5-minute grid. Crypto: 5-minute
+  candles from the selected exchange (Binance by default, or Coinbase) over the same ranges, whole
+  UTC days.
 - **Completed bars only.** A bar counts once its 5 minutes are over (start + 5 min <= now); the bar
   still forming never triggers. `triggered_at` is the trigger bar's *close* time (10:10 bar ->
   10:15). Entry = that bar's close. Only bars closing by `--cutoff` can trigger.
@@ -141,8 +146,9 @@ forming counts here, since its prices already traded; it never counts for the tr
   of the bar still forming.
 - Paper trading only. This skill places nothing; `--save` only writes a plan file. Orders go
   through the broker skill and only after the user's explicit yes.
-- Exit code 1 = bad input (the message says what to fix, e.g. `--setup level needs --level PRICE`).
+- Exit code 1 = bad input (the message says what to fix, e.g. `--setup level needs --level PRICE`,
+  or a crypto pair the exchange does not list).
 - If the script exits with code 2 ("data error: ..."), tell the user which host failed (it is in
-  the message, e.g. `query1.finance.yahoo.com`, or `api.exchange.coinbase.com` for crypto) - in
-  sandboxes the host may need to be allow-listed. Never invent prices, headlines, or odds to fill
-  the gap.
+  the message, e.g. `query1.finance.yahoo.com`, or for crypto `data-api.binance.vision` on Binance
+  and `api.exchange.coinbase.com` on Coinbase) - in sandboxes the host may need to be allow-listed.
+  Never invent prices, headlines, or odds to fill the gap.

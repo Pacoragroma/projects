@@ -14,9 +14,11 @@ checks is not missed. A repeating alert fires at most once per bar and re-arms o
 5-minute bar closes back across the level (by --rearm-pct, default 0.25%); --once alerts switch off
 after firing.
 
-Crypto pairs (BTC-USD, ETH-USD, ...) use Coinbase Exchange 5-minute candles and work 24/7: each
-alert runs in its own symbol's market (a crypto "session" - for VWAP and the previous close - is
-the UTC day, and its times print in UTC), so one check can mix stock and crypto alerts.
+Crypto pairs (BTC-USDT, ETH-USDT, BTCUSDT, BTC-USD, ...) use 5-minute candles from Binance's public
+market data by default, or Coinbase's (the crypto_exchange setting, or $DAYTRADER_CRYPTO_EXCHANGE),
+and work 24/7: each alert runs in its own symbol's market (a crypto "session" - for VWAP and the
+previous close - is the UTC day, and its times print in UTC), so one check can mix stock and crypto
+alerts. A crypto alert records the exchange that armed it; a check on another exchange says so.
 
 Usage:
   python3 scripts/alerts.py add TSLA --above 370.04 --note "plan target"
@@ -29,7 +31,7 @@ Usage:
   python3 scripts/alerts.py check --json
   python3 scripts/alerts.py watch --interval 60 --max-minutes 120 --bell
   python3 scripts/alerts.py remove ALR-20261030-001 | --symbol TSLA | --fired | --all
-  python3 scripts/alerts.py add BTC-USD --below 98000 --once     # crypto: 24/7, UTC days
+  python3 scripts/alerts.py add BTC-USDT --below 98000 --once    # crypto: 24/7, UTC days
 
 Exit codes: 0 ok, 1 bad input/state, 2 data source unreachable, 130 watch stopped with Ctrl-C.
 State: $DAYTRADER_HOME/alerts.json.
@@ -60,7 +62,14 @@ FAR_LEVEL_PCT = 50.0            # warn (typo?) when a level is this far from the
 PLAN_ROLES = ("entry", "stop", "target")
 VWAP_DIRECTIONS = ("any", "above", "below")
 EPS = 1e-9
-CRYPTO_CONTEXT_RANGE = "2d"     # today's UTC day + the previous one (its close), ~2-3 Coinbase pages
+CRYPTO_CONTEXT_RANGE = "2d"     # today's UTC day + the previous one (its close): 1-3 candle requests
+LEGACY_EXCHANGE = "coinbase"     # crypto alerts saved before they recorded an exchange (v1.1.0) used Coinbase
+
+
+def exchange_label(exchange: Optional[str]) -> str:
+    """'Binance' / 'Coinbase' for a stored exchange key (an unknown one is shown as stored)."""
+    ex = str(exchange or "").strip().lower()
+    return tc.CRYPTO_EXCHANGES[ex]["name"] if ex in tc.CRYPTO_EXCHANGES else str(exchange)
 
 
 def alert_market(a: Dict[str, Any]) -> tc.Market:
@@ -75,10 +84,24 @@ def alert_market(a: Dict[str, Any]) -> tc.Market:
 # Pure core: bars
 # ---------------------------------------------------------------------------
 
+def _crypto() -> bool:
+    return tc.market().key == "crypto"
+
+
 def _px(x: Optional[float]) -> Optional[float]:
     if x is None:
         return None
-    return round(x, 2) if abs(x) >= 1 else round(x, 4)
+    if abs(x) >= 1:
+        return round(x, 2)
+    if _crypto() and x != 0:   # sub-cent coins: keep 4 significant digits, as tc.fmt_price shows them
+        return round(x, max(4, 3 - int(math.floor(math.log10(abs(x))))))
+    return round(x, 4)
+
+
+def _exact(x: Any) -> float:
+    """A price as stored and compared: 4 decimals for stocks (Yahoo sends float32-ish prices such as
+    370.0399780); crypto exchanges quote exact decimals, and sub-cent coins need more than 4."""
+    return float(x) if _crypto() else round(float(x), 4)
 
 
 def slot_of(ts: float) -> int:
@@ -92,11 +115,12 @@ def normalize_bars(bars: Sequence[tc.Bar]) -> List[tc.Bar]:
 
     Yahoo may stamp the bar still forming with its last trade time (10:22:37) instead of its start
     (10:20), and sends float32-ish prices (370.0399780) - rounding keeps exact-level touches exact.
+    Crypto prices are exact decimals already (and sub-cent coins need more than 4): not rounded.
     """
     out: Dict[int, tc.Bar] = {}
     for b in sorted(bars, key=lambda x: x.ts):
         start = slot_of(b.ts)
-        o, h, l, c = (round(float(x), 4) for x in (b.open, b.high, b.low, b.close))
+        o, h, l, c = (_exact(x) for x in (b.open, b.high, b.low, b.close))
         v = float(b.volume or 0)
         cur = out.get(start)
         if cur is None:
@@ -141,7 +165,7 @@ def _quote_tick(quote: Any, now_ts: int) -> Optional[Tuple[float, int]]:
         t = int(t)
     if not (math.isfinite(price) and price > 0) or t > now_ts:
         return None
-    return round(price, 4), t
+    return _exact(price), t
 
 
 def prepare_bars(bars: Sequence[tc.Bar], quote: Any = None, now_ts: Optional[int] = None) -> List[tc.Bar]:
@@ -265,6 +289,7 @@ def make_alert(symbol: str, kind: str, ctx: Dict[str, Any], now: datetime, exist
     last = float(ctx["last"])
     a: Dict[str, Any] = {
         "id": tc.new_id("ALR", existing_ids), "symbol": symbol.upper(), "market": tc.market_for(symbol).key,
+        **({"exchange": tc.crypto_exchange()} if tc.is_crypto_symbol(symbol) else {}),   # whose prices armed it
         "kind": kind,
         "once": bool(once), "note": note, "source": source, "plan_role": plan_role,
         "rearm_pct": float(rearm_pct), "status": "active",
@@ -276,7 +301,7 @@ def make_alert(symbol: str, kind: str, ctx: Dict[str, Any], now: datetime, exist
     if kind in ("above", "below"):
         if level is None or not (math.isfinite(level) and level > 0):
             raise ValueError("the alert level must be a positive price")
-        a["level"] = round(float(level), 4)
+        a["level"] = _exact(level)
         a["legs"] = [_leg("up" if kind == "above" else "down", a["level"], last)]
     elif kind == "pct_move":
         if pct is None or not 0 < pct <= 50:
@@ -284,7 +309,7 @@ def make_alert(symbol: str, kind: str, ctx: Dict[str, Any], now: datetime, exist
         base = float(ref) if ref is not None else last
         if not (math.isfinite(base) and base > 0):
             raise ValueError("--ref must be a positive price")
-        a.update(pct=float(pct), direction=direction, ref_price=round(base, 4), ref_basis=ref_basis)
+        a.update(pct=float(pct), direction=direction, ref_price=_exact(base), ref_basis=ref_basis)
         legs = []
         if direction in ("both", "up"):
             legs.append(_leg("up", _px(base * (1 + pct / 100.0)), last))
@@ -513,7 +538,8 @@ def waiting_reason(a: Dict[str, Any]) -> str:
 def summary_row(a: Dict[str, Any]) -> Dict[str, Any]:
     d = distance_pct(a)
     last_fire = (a.get("fires") or [None])[-1]
-    return {"id": a["id"], "symbol": a["symbol"], "market": alert_market(a).key, "kind": a["kind"],
+    return {"id": a["id"], "symbol": a["symbol"], "market": alert_market(a).key,
+            **({"exchange": a["exchange"]} if a.get("exchange") else {}), "kind": a["kind"],
             "condition": condition_text(a), "status": status_text(a), "once": a["once"], "last_price": a.get("last_price"),
             "distance_pct": None if d is None else round(d, 2), "waiting_for": waiting_reason(a),
             "fire_count": a.get("fire_count", 0), "last_fired": last_fire, "note": a.get("note") or "",
@@ -682,7 +708,8 @@ def parse_symbol(raw: str) -> str:
 
 def range_for(cursor_ts: int, now_ts: int, m: Optional[tc.Market] = None) -> str:
     """Smallest 5m range that reaches back to `cursor_ts` (Yahoo's 5d/1mo/60d; crypto: whole days,
-    since every calendar day trades and Coinbase pages by 300 candles)."""
+    since every calendar day trades and the exchanges page candles - 1,000 a request on Binance,
+    300 on Coinbase)."""
     days = (now_ts - cursor_ts) / 86400.0
     if (m or tc.market()).every_day:
         return f"{min(60, max(2, int(math.ceil(days)) + 1))}d"
@@ -698,8 +725,10 @@ def fetch(symbol: str, range_: str = "5d", ttl: Optional[float] = None) -> Tuple
         bars, meta = tc.fetch_bars(symbol, "5m", range_, ttl=ttl)
     except tc.FetchError as e:
         msg = str(e)
-        if tc.is_crypto_symbol(symbol) and ("HTTP 404" in msg or "no candles" in msg):
-            raise ValueError(f"{symbol}: Coinbase has no candles for this pair (not a listed product?)") from e
+        # An unknown pair: Binance answers 400 ("has no spot pair"), Coinbase 404 or no candles.
+        if tc.is_crypto_symbol(symbol) and any(s in msg for s in ("HTTP 404", "no candles", "has no spot pair")):
+            raise ValueError(f"{symbol}: {tc.exchange_name()} has no candles for this pair (not a listed pair? "
+                             "crypto pairs look like BTC-USDT or BTC-USD)") from e
         if "HTTP 404" in msg or "Yahoo: Not Found" in msg:
             raise ValueError(f"{symbol}: Yahoo has no chart for this symbol (unknown or delisted ticker?)") from e
         raise
@@ -789,6 +818,7 @@ def _check_symbol(sym: str, group: List[Dict[str, Any]], now: datetime, ttl: Opt
     `updated` / `report`."""
     now_ts = int(now.timestamp())
     m = tc.market()
+    exchange = tc.crypto_exchange() if m.every_day else None   # crypto: whose prices this check reads
     rng = range_for(min(int(a["cursor"]) for a in group), now_ts, m)
     try:
         bars, meta = fetch(sym, rng, ttl)
@@ -803,7 +833,7 @@ def _check_symbol(sym: str, group: List[Dict[str, Any]], now: datetime, ttl: Opt
                             "last": latest_price(prepared, quote, now_ts),
                             "last_bar": prepared[-1].time if prepared else None}
     if m.every_day:
-        info["market"] = m.key
+        info["market"], info["exchange"] = m.key, exchange
     minute = now.hour * 60 + now.minute
     if (tc.is_market_open(now) and minute >= tc.MARKET_OPEN + STALE_MINUTES and prepared
             and prepared[-1].ts + BAR_SECONDS < now_ts - STALE_MINUTES * 60):
@@ -818,14 +848,23 @@ def _check_symbol(sym: str, group: List[Dict[str, Any]], now: datetime, ttl: Opt
         except tc.StateError as e:
             plan_ok = False
             report["notes"].append(f"{sym}: could not read the saved plan ({e})")
+    moved: Dict[str, List[str]] = {}       # alerts armed on the other exchange's prices, by that exchange
     for a in group:
         res = evaluate(a, prepared, quote, now)
+        if exchange:
+            was = str(a.get("exchange") or LEGACY_EXCHANGE).strip().lower()
+            if was != exchange:
+                moved.setdefault(was, []).append(a["id"])
+            res["alert"]["exchange"] = exchange
         updated[a["id"]] = res["alert"]
         report["fired"].extend(res["events"])
         report["notes"].extend(n for n in res["notes"] if n not in report["notes"])
         drift = plan_drift(res["alert"], plan) if plan_ok else None
         if drift:
             report["notes"].append(drift)
+    for was, ids in moved.items():
+        report["notes"].append(f"{sym}: {', '.join(ids)} {'was' if len(ids) == 1 else 'were'} set on "
+                               f"{exchange_label(was)} prices, now checked on {exchange_label(exchange)} prices")
 
 
 # ---------------------------------------------------------------------------
@@ -971,7 +1010,8 @@ def render_added(res: Dict[str, Any]) -> str:
         role = f" ({a['plan_role']})" if a.get("plan_role") else ""
         lines.append(f"Added {a['id']}{role} · {a['symbol']} {r['condition']}"
                      f"{' · once' if a['once'] else ''} · {r['status']}")
-        lines.append(f"  last {tc.fmt_price(a['last_price'])} · {r['waiting_for']}"
+        src = f" on {exchange_label(a['exchange'])}" if a.get("exchange") else ""   # crypto: whose price
+        lines.append(f"  last {tc.fmt_price(a['last_price'])}{src} · {r['waiting_for']}"
                      + (f" ({_away(r)} away)" if r["status"] == "armed" and r["distance_pct"] is not None
                         and a["kind"] != "vwap_cross" else ""))
         if a.get("note") and not a.get("plan_role"):
@@ -1027,7 +1067,7 @@ def cmd_add(args: argparse.Namespace) -> Dict[str, Any]:
     load_alerts()  # fail on a corrupt state file before downloading anything
     ctx, now = context_for(sym)
     if kind == "vwap_cross" and not ctx["has_volume"]:
-        src = "Coinbase" if mkt.every_day else "Yahoo"
+        src = tc.exchange_name() if mkt.every_day else "Yahoo"
         raise ValueError(f"{sym}: {src} reports no volume for it (an index or FX pair?), so there is no "
                          f"VWAP to cross - use --above/--below or --pct-move instead")
     alerts = load_alerts()
@@ -1254,13 +1294,13 @@ def watch(symbols: Optional[Sequence[str]], interval: float, max_minutes: float,
 
 def build_parser() -> argparse.ArgumentParser:
     p = tc.make_parser("Price alerts for the day-trading desk: levels, % moves and VWAP crosses, "
-                       "checked against 5-minute bars (Yahoo for stocks, Coinbase for crypto pairs, 24/7) "
-                       "so touches between checks are not missed.")
+                       "checked against 5-minute bars (Yahoo for stocks; for crypto pairs, 24/7, Binance by "
+                       "default or Coinbase) so touches between checks are not missed.")
     sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
     sub.required = True
 
     a = sub.add_parser("add", help="add an alert: --above X | --below X | --pct-move P | --vwap-cross")
-    a.add_argument("symbol", help="ticker, e.g. TSLA, or a crypto pair, e.g. BTC-USD")
+    a.add_argument("symbol", help="ticker, e.g. TSLA, or a crypto pair, e.g. BTC-USDT")
     g = a.add_mutually_exclusive_group(required=True)
     g.add_argument("--above", type=float, metavar="PRICE", help="fire when price trades at or above PRICE")
     g.add_argument("--below", type=float, metavar="PRICE", help="fire when price trades at or below PRICE")

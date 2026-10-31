@@ -3,12 +3,15 @@
 
 There is no live mode, no --live flag and no code path that contacts a real broker or an exchange
 account. The only network calls are public price data (through trader_common) used to simulate
-fills: Yahoo Finance for US stocks, Coinbase Exchange's public market data for crypto.
+fills: Yahoo Finance for US stocks; for crypto, Binance's public market data by default (or Coinbase
+Exchange's, with the crypto_exchange setting) - no account, no key.
 
-Crypto products (BTC-USD, ETH-USD, ...) trade 24/7 and their day is the UTC day: tickets can be
-confirmed on weekends too (still not past the 23:55 UTC time stop), sizes are fractional (the
-product's size step), prices sit on the product's tick, and every paper fill pays the
-crypto_fee_pct fee - trades store gross_pnl and fees, and pnl / r_multiple are net of fees.
+Crypto pairs (BTC-USDT, ETH-USDT, BTC-USD, ...) trade 24/7 and their day is the UTC day: tickets
+can be confirmed on weekends too (still not past the 23:55 UTC time stop), sizes are fractional
+(the pair's size step), prices sit on the pair's tick, and every paper fill pays the
+crypto_fee_pct fee - trades store gross_pnl and fees, and pnl / r_multiple are net of fees. Each
+crypto ticket and trade records the exchange that priced it (`exchange`) and is filled, synced and
+closed on that exchange's prices only, even after the setting changes.
 
   ticket    create a pending ticket after validating the levels and the daily budget (outside the
             session: the same checks, printed as a PREVIEW that is not saved and cannot be confirmed)
@@ -32,7 +35,7 @@ Usage:
   python3 scripts/broker.py cancel TKT-20261030-001
   python3 scripts/broker.py tickets --all
   python3 scripts/broker.py history --days 30 --json
-  python3 scripts/broker.py ticket --symbol BTC-USD --qty 0.01 --entry 101250 --stop 99000 --target 104000
+  python3 scripts/broker.py ticket --symbol BTC-USDT --qty 0.01 --entry 101250 --stop 99000 --target 104000
   python3 scripts/broker.py sync --market crypto               # the UTC clock and day for the summary
 
 Exit codes: 0 ok, 1 bad input or refused (e.g. confirm without --yes, expired ticket),
@@ -139,6 +142,113 @@ def is_crypto(row: Any) -> bool:
     return row_market(row).key == "crypto"
 
 
+# Crypto rows also belong to one exchange: the one whose public prices made the ticket. They are
+# filled, synced, marked and closed on that exchange only - never on the other one - even after the
+# crypto_exchange setting (Binance by default, or Coinbase) changes.
+LEGACY_EXCHANGE = "coinbase"      # crypto rows from before tickets recorded it (v1.1.0 priced on Coinbase)
+EXCHANGE_ENV = "DAYTRADER_CRYPTO_EXCHANGE"
+
+
+def row_exchange(row: Any) -> Optional[str]:
+    """The exchange that priced a crypto ticket, trade or sync event ('binance' | 'coinbase'): its
+    `exchange` field, else Coinbase (rows written before the field existed). None for stocks."""
+    row = row if isinstance(row, dict) else {}
+    if not is_crypto(row):
+        return None
+    return str(row.get("exchange") or LEGACY_EXCHANGE).strip().lower()
+
+
+def order_exchange(order: Dict[str, Any]) -> Optional[str]:
+    """The exchange a new crypto order is priced on: its own, else the configured one. None for stocks."""
+    if not is_crypto(order):
+        return None
+    return str(order.get("exchange") or tc.crypto_exchange()).strip().lower()
+
+
+def exchange_label(exchange: Optional[str]) -> str:
+    """'Binance' / 'Coinbase' (None: the configured exchange; an unknown name is shown as stored)."""
+    if not exchange:
+        return tc.exchange_name()
+    return tc.CRYPTO_EXCHANGES[exchange]["name"] if exchange in tc.CRYPTO_EXCHANGES else str(exchange)
+
+
+def exchange_problem(exchange: Optional[str]) -> Optional[str]:
+    """Why a row's exchange cannot be priced (an unknown name in a hand-edited ledger), else None."""
+    if exchange is None or exchange in tc.CRYPTO_EXCHANGES:
+        return None
+    return (f"ledger.json names exchange {exchange!r} - expected {' or '.join(tc.CRYPTO_EXCHANGES)}; fix it there "
+            "(a ticket can still be cancelled, a trade closed by hand with --price)")
+
+
+@contextmanager
+def exchange_scope(exchange: Optional[str]) -> Iterator[None]:
+    """Inside the block crypto prices come from `exchange` - the exchange that priced a ticket or
+    trade - whatever the crypto_exchange setting says now. It uses tc's own override
+    ($DAYTRADER_CRYPTO_EXCHANGE, restored afterwards), so every fetch still goes through tc.fetch_bars
+    and tc.quote. None (stocks, or a new order on the configured exchange): no change."""
+    if not exchange:
+        yield
+        return
+    problem = exchange_problem(exchange)
+    if problem:
+        raise tc.StateError(problem)
+    old = os.environ.get(EXCHANGE_ENV)
+    os.environ[EXCHANGE_ENV] = exchange
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop(EXCHANGE_ENV, None)
+        else:
+            os.environ[EXCHANGE_ENV] = old
+
+
+FeedKey = Tuple[str, Optional[str]]
+
+
+def feed_key(row: Dict[str, Any]) -> FeedKey:
+    """The price feed a row needs: (symbol, None) for stocks, (symbol, its exchange) for crypto."""
+    return str(row.get("symbol") or "").upper(), row_exchange(row)
+
+
+def feed_sort(item: Tuple[FeedKey, Any]) -> Tuple[str, str]:
+    return item[0][0], item[0][1] or ""
+
+
+def feed_errors(errors: Dict[FeedKey, str]) -> List[Dict[str, Any]]:
+    """JSON rows for fetch errors: {symbol, error}, plus the exchange for crypto."""
+    out = []
+    for (sym, ex), msg in sorted(errors.items(), key=feed_sort):
+        out.append({"symbol": sym, "error": msg, **({"exchange": ex} if ex else {})})
+    return out
+
+
+def quote_currency(symbol: str, exchange: Optional[str]) -> str:
+    """The currency a pair is priced in on the exchange: BTC-USD is a USDT pair on Binance."""
+    quote = tc.crypto_pair(symbol)[1]
+    return "USDT" if quote == "USD" and exchange == "binance" else quote
+
+
+def min_order_text(amount: float, symbol: str, exchange: Optional[str]) -> str:
+    """An exchange's minimum order value in the pair's quote currency: '$1.00' or '5 USDT'."""
+    quote = quote_currency(symbol, exchange)
+    return tc.fmt_money(amount) if quote == "USD" else f"{amount:g} {quote}"
+
+
+def rules_name(exchange: Optional[str]) -> str:
+    """What the exchange calls a pair's size step and price tick: 'Binance pair rules' (symbol
+    filters) or 'Coinbase product rules'."""
+    return f"{exchange_label(exchange)} {'product' if exchange == 'coinbase' else 'pair'} rules"
+
+
+def usd_pair_note(symbol: str, exchange: Optional[str]) -> Optional[str]:
+    """Binance's few USD pairs are thin: a -USD symbol is priced from its USDT pair there - say so."""
+    if exchange != "binance" or tc.crypto_pair(symbol)[1] != "USD":
+        return None
+    return (f"{symbol} is priced from Binance's {tc.binance_symbol(symbol)} pair (Binance's few USD pairs are thin; "
+            "USDT trades close to, not exactly at, $1)")
+
+
 def _positive_number(v: Any) -> Optional[float]:
     if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0:
         return None
@@ -179,9 +289,9 @@ def max_loss(side: str, entry: float, stop: float, qty: float, rate: float) -> f
 
 
 def unit_word(symbol: Any) -> str:
-    """'shares' for stocks, the base currency for crypto ('BTC' for BTC-USD)."""
+    """'shares' for stocks, the base currency for crypto ('BTC' for BTC-USDT, BTCUSDT or BTC-USD)."""
     sym = str(symbol or "").upper()
-    return sym.split("-")[0] if tc.is_crypto_symbol(sym) else "shares"
+    return tc.crypto_pair(sym)[0] if tc.is_crypto_symbol(sym) else "shares"
 
 
 def qty_text(row: Dict[str, Any]) -> str:
@@ -208,7 +318,8 @@ def default_time_stop() -> str:
 
 
 def paper_label(row: Dict[str, Any]) -> str:
-    return f"{PAPER} · Coinbase prices" if is_crypto(row) else PAPER
+    """'PAPER · REAL MONEY: OFF', plus whose prices for crypto: '· Binance prices' / '· Coinbase prices'."""
+    return f"{PAPER} · {exchange_label(row_exchange(row))} prices" if is_crypto(row) else PAPER
 
 
 def local_day(stamp: Any) -> str:
@@ -611,7 +722,8 @@ def next_trade_id(led: Dict[str, Any], day: str) -> str:
 
 def open_trade(led: Dict[str, Any], k: Dict[str, Any], price: float, ts: float) -> Dict[str, Any]:
     """Record a filled ticket as an open paper trade (and link the two). Runs in the ticket's
-    market. A crypto fill pays the ticket's fee_pct on its notional (`entry_fee`, `fees`)."""
+    market. A crypto fill pays the ticket's fee_pct on its notional (`entry_fee`, `fees`), and the
+    trade keeps the ticket's exchange: its exits are priced there too."""
     tick = row_tick(k)
     trade = {
         "id": next_trade_id(led, tc.et_date(ts)), "ticket_id": k["id"], "symbol": k["symbol"],
@@ -626,8 +738,8 @@ def open_trade(led: Dict[str, Any], k: Dict[str, Any], price: float, ts: float) 
     if is_crypto(k):
         rate = fee_rate(k)
         entry_fee = fee_amount(rate, trade["entry_price"], trade["qty"])
-        trade.update(tick=tick, fee_pct=round(rate * 100, 6), entry_fee=entry_fee, exit_fee=None,
-                     fees=entry_fee, gross_pnl=None)
+        trade.update(exchange=row_exchange(k), tick=tick, fee_pct=round(rate * 100, 6), entry_fee=entry_fee,
+                     exit_fee=None, fees=entry_fee, gross_pnl=None)
     led["trades"].append(trade)
     k.update(status="confirmed", trade_id=trade["id"], filled_at=trade["opened_at"], fill_price=trade["entry_price"])
     return trade
@@ -891,7 +1003,8 @@ def resolve_order(symbol: str, plan: Optional[Dict[str, Any]], *, today: str, si
         if off_step(float(qty), step):
             floored = floor_step(float(qty), step)
             hint = f"e.g. {tc.fmt_qty(floored)}" if floored > 0 else f"the smallest size is {step_text(step)}"
-            raise ValueError(f"--qty {qty} is not a multiple of {symbol}'s size step {step_text(step)} ({hint})")
+            typed = format(Decimal(repr(float(qty))), "f")          # 0.000015, not 1.5e-05
+            raise ValueError(f"--qty {typed} is not a multiple of {symbol}'s size step {step_text(step)} ({hint})")
         qty = float(qty)
     elif qty != int(qty) or qty < 1 or qty > MAX_QTY:
         raise ValueError(f"--qty must be a whole number of shares from 1 to {MAX_QTY:,}")
@@ -953,6 +1066,7 @@ def order_checks(order: Dict[str, Any], settings: Dict[str, Any], last: Optional
     notes: List[str] = []
     side, e, s, t, q = order["side"], order["entry"], order["stop"], order["target"], order["qty"]
     crypto = is_crypto(order)
+    ex = order_exchange(order)
     rate, fees_at_stop, loss = order_fees(order)
     notional = e * q
     acct = settings["account_size"]
@@ -965,10 +1079,11 @@ def order_checks(order: Dict[str, Any], settings: Dict[str, Any], last: Optional
     elif acct > 0 and notional > acct * settings["max_position_pct"] / 100 + 1e-9:
         warnings.append(f"notional is {notional / acct * 100:.0f}% of the account, over your "
                         f"{settings['max_position_pct']:g}% max position size")
-    min_funds = _positive_number(order.get("min_funds"))
+    min_funds = _positive_number(order.get("min_funds"))      # Coinbase min_market_funds / Binance NOTIONAL
     if crypto and min_funds and notional < min_funds:
-        warnings.append(f"notional {tc.fmt_money(notional)} is below Coinbase's {tc.fmt_money(min_funds)} minimum "
-                        f"order for {order['symbol']} - a real order this small would be rejected")
+        warnings.append(f"notional {tc.fmt_money(notional)} is below {exchange_label(ex)}'s "
+                        f"{min_order_text(min_funds, order['symbol'], ex)} minimum order for {order['symbol']} - "
+                        "a real order this small would be rejected")
     budget = acct * settings["risk_per_trade_pct"] / 100
     if budget > 0 and loss > budget * 1.01 + 0.01:
         fees = f" (incl. {tc.fmt_money(fees_at_stop)} of fees at the stop)" if fees_at_stop else ""
@@ -986,8 +1101,8 @@ def order_checks(order: Dict[str, Any], settings: Dict[str, Any], last: Optional
     if crypto:
         notes.append(fee_note(order))
         if side == "short":
-            notes.append("spot crypto cannot be sold short on Coinbase (that needs margin or derivatives); the "
-                         "paper short is simulated like a stock short")
+            notes.append(f"spot crypto cannot be sold short on {exchange_label(ex)} (that needs margin or "
+                         "derivatives); the paper short is simulated like a stock short")
     if last:
         p = last["price"]
         qd = last.get("date")
@@ -1050,8 +1165,8 @@ def preview_order(order: Dict[str, Any]) -> Dict[str, Any]:
     }
     if is_crypto(order):
         rate, fees_at_stop, loss = order_fees(order)
-        out.update(tick=order.get("tick"), qty_step=order.get("qty_step"), fee_pct=round(rate * 100, 6),
-                   fees_at_stop=round(fees_at_stop, 2), max_loss=round(loss, 2))
+        out.update(exchange=order_exchange(order), tick=order.get("tick"), qty_step=order.get("qty_step"),
+                   fee_pct=round(rate * 100, 6), fees_at_stop=round(fees_at_stop, 2), max_loss=round(loss, 2))
     return out
 
 
@@ -1069,10 +1184,10 @@ def new_ticket(led: Dict[str, Any], order: Dict[str, Any], now: datetime, settin
 
 
 def symbol_exposure(led: Dict[str, Any], symbol: str, today: str) -> List[Dict[str, Any]]:
-    """Open trades and today's working orders in `symbol`."""
-    out = [dict(kind="trade", id=t.get("id"), side=t.get("side"), qty=t.get("qty"))
+    """Open trades and today's working orders in `symbol` (crypto: with the exchange that priced them)."""
+    out = [dict(kind="trade", id=t.get("id"), side=t.get("side"), qty=t.get("qty"), exchange=row_exchange(t))
            for t in rows(led, "trades") if t.get("status") == "open" and str(t.get("symbol", "")).upper() == symbol]
-    out += [dict(kind="working order", id=k.get("id"), side=k.get("side"), qty=k.get("qty"))
+    out += [dict(kind="working order", id=k.get("id"), side=k.get("side"), qty=k.get("qty"), exchange=row_exchange(k))
             for k in working_orders(led, today) if str(k.get("symbol", "")).upper() == symbol]
     return out
 
@@ -1081,36 +1196,36 @@ def symbol_exposure(led: Dict[str, Any], symbol: str, today: str) -> List[Dict[s
 # Sync (pure apply + I/O fetch)
 # ---------------------------------------------------------------------------
 
-def sync_targets(led: Dict[str, Any], now: datetime, only: Optional[Set[str]] = None) -> Dict[str, Optional[str]]:
-    """{symbol: bar range to fetch (None = too old for 5-minute data)} for open/working items.
-    Stocks: Yahoo's 5d / 60d. Crypto: just the UTC days since the oldest item (Coinbase pages its
-    5-minute candles, 300 a time)."""
-    oldest: Dict[str, float] = {}
+def sync_targets(led: Dict[str, Any], now: datetime, only: Optional[Set[str]] = None) -> Dict[FeedKey, Optional[str]]:
+    """{(symbol, exchange): bar range to fetch (None = too old for 5-minute data)} for open/working
+    items; the exchange is None for stocks, else the one that priced the row. Stocks: Yahoo's 5d /
+    60d. Crypto: just the UTC days since the oldest item (the exchanges page their 5-minute candles)."""
+    oldest: Dict[FeedKey, float] = {}
     items = [(k, "confirmed_at") for k in rows(led, "tickets") if k.get("status") == "working"]
     items += [(t, "opened_at") for t in rows(led, "trades") if t.get("status") == "open"]
     for row, field in items:
         if only is not None and str(row.get("id", "")).upper() not in only:
             continue
         ts = parse_ts(row.get(field))
-        sym = str(row.get("symbol") or "").upper()
-        if ts is None or not sym:
+        key = feed_key(row)
+        if ts is None or not key[0]:
             continue
-        oldest[sym] = min(oldest.get(sym, ts), ts)
-    out: Dict[str, Optional[str]] = {}
-    for sym, ts in oldest.items():
-        with tc.market_scope(sym):
+        oldest[key] = min(oldest.get(key, ts), ts)
+    out: Dict[FeedKey, Optional[str]] = {}
+    for key, ts in oldest.items():
+        with tc.market_scope(key[0]):
             age = (tc.to_et(now.timestamp()).date() - tc.to_et(ts).date()).days
             if tc.market().key == "crypto":
-                out[sym] = f"{max(age, 0) + 2}d" if age <= MAX_SYNC_AGE_DAYS else None
+                out[key] = f"{max(age, 0) + 2}d" if age <= MAX_SYNC_AGE_DAYS else None
             else:
-                out[sym] = "5d" if age <= 4 else ("60d" if age <= MAX_SYNC_AGE_DAYS else None)
+                out[key] = "5d" if age <= 4 else ("60d" if age <= MAX_SYNC_AGE_DAYS else None)
     return out
 
 
 @contextmanager
 def same_instant(now: Optional[datetime]) -> Iterator[None]:
     """Pin a naive $DAYTRADER_NOW (read in each active market's own zone: ET, UTC for crypto) to
-    the command's instant while another market's bars are fetched, so a replay's Coinbase candles
+    the command's instant while another market's bars are fetched, so a replay's crypto candles
     stop at the same 'now' as the command (e.g. a US-view sync of a crypto trade)."""
     old = os.environ.get("DAYTRADER_NOW")
     if old is None or now is None:
@@ -1123,33 +1238,39 @@ def same_instant(now: Optional[datetime]) -> Iterator[None]:
         os.environ["DAYTRADER_NOW"] = old
 
 
-def fetch_sync_data(targets: Dict[str, Optional[str]], now: Optional[datetime] = None
-                    ) -> Tuple[Dict[str, Tuple[List[tc.Bar], Dict[str, Any]]], Dict[str, str]]:
-    data: Dict[str, Tuple[List[tc.Bar], Dict[str, Any]]] = {}
-    errors: Dict[str, str] = {}
-    for sym, rng in sorted(targets.items()):
-        with same_instant(now), tc.market_scope(sym):
+def fetch_sync_data(targets: Dict[FeedKey, Optional[str]], now: Optional[datetime] = None
+                    ) -> Tuple[Dict[FeedKey, Tuple[List[tc.Bar], Dict[str, Any]]], Dict[FeedKey, str]]:
+    """5-minute bars per feed: stocks from Yahoo, crypto from the exchange that priced the rows."""
+    data: Dict[FeedKey, Tuple[List[tc.Bar], Dict[str, Any]]] = {}
+    errors: Dict[FeedKey, str] = {}
+    for key, rng in sorted(targets.items(), key=feed_sort):
+        sym, ex = key
+        if exchange_problem(ex):
+            errors[key] = exchange_problem(ex)  # type: ignore[assignment]
+            continue
+        with same_instant(now), tc.market_scope(sym), exchange_scope(ex):
             if rng is None:
-                errors[sym] = (f"opened more than {MAX_SYNC_AGE_DAYS} days ago - "
+                errors[key] = (f"opened more than {MAX_SYNC_AGE_DAYS} days ago - "
                                + ("too old to replay from 5-minute bars" if tc.market().key == "crypto" else
                                   "Yahoo keeps only 60 days of 5-minute bars")
                                + "; close it by hand with --price")
                 continue
             try:
                 bars, meta = tc.fetch_bars(sym, "5m", rng)
-                data[sym] = (normalize_bars(bars), meta or {})
+                data[key] = (normalize_bars(bars), meta or {})
             except tc.FetchError as e:
-                errors[sym] = str(e)
+                errors[key] = str(e)
     return data, errors
 
 
-def apply_sync(led: Dict[str, Any], data: Dict[str, Tuple[List[tc.Bar], Dict[str, Any]]], now: datetime,
+def apply_sync(led: Dict[str, Any], data: Dict[FeedKey, Tuple[List[tc.Bar], Dict[str, Any]]], now: datetime,
                only: Optional[Set[str]] = None) -> Dict[str, Any]:
     """Fill working orders and close open trades in `led` (mutated) from pre-fetched bars. Pure.
 
     Each row is replayed in its own market (a crypto order's session is its UTC day), whatever
-    market the command runs in. With `only` (ids), a working order in it that fills brings its new
-    trade along, so the trade's exits are applied in the same pass."""
+    market the command runs in, on the bars of its own feed (`feed_key`: a crypto row only ever
+    sees the candles of the exchange that priced it). With `only` (ids), a working order in it that
+    fills brings its new trade along, so the trade's exits are applied in the same pass."""
     now_ts = now.timestamp()
     out: Dict[str, Any] = {"events": [], "open": [], "working": [], "issues": []}
     only = None if only is None else set(only)
@@ -1169,26 +1290,27 @@ def apply_sync(led: Dict[str, Any], data: Dict[str, Tuple[List[tc.Bar], Dict[str
         except (KeyError, TypeError, ValueError):
             out["issues"].append({"id": k.get("id"), "symbol": sym, "issue": "malformed working order - cancel it"})
             return
-        if sym not in data:
+        if feed_key(k) not in data:
             return
-        bars, meta = data[sym]
+        bars, meta = data[feed_key(k)]
         r = walk_working(side, limit, conf, bars, now_ts, t_stop, session_end_minute(meta, tc.et_date(conf)),
                          row_tick(k))
         mkt = row_market(k).key
+        src = {"exchange": row_exchange(k)} if is_crypto(k) else {}
         if r["status"] == "filled":
             trade = open_trade(led, k, r["price"], r["ts"])
             if only is not None:
                 only.add(trade["id"].upper())
             out["events"].append({"kind": "filled", "ticket_id": k["id"], "trade_id": trade["id"], "symbol": sym,
-                                  "market": mkt, "side": side, "qty": trade["qty"], "price": trade["entry_price"],
-                                  "at": trade["opened_at"], "bar": iso(r["bar"])})
+                                  "market": mkt, **src, "side": side, "qty": trade["qty"],
+                                  "price": trade["entry_price"], "at": trade["opened_at"], "bar": iso(r["bar"])})
         elif r["status"] == "expired":
             k.update(status="expired", expired_at=iso(r["ts"]))
-            out["events"].append({"kind": "expired", "ticket_id": k["id"], "symbol": sym, "market": mkt, "side": side,
-                                  "qty": k.get("qty"), "price": limit, "at": k["expired_at"]})
+            out["events"].append({"kind": "expired", "ticket_id": k["id"], "symbol": sym, "market": mkt, **src,
+                                  "side": side, "qty": k.get("qty"), "price": limit, "at": k["expired_at"]})
         else:
             k["synced_at"] = iso(now_ts)
-            out["working"].append({"ticket_id": k["id"], "symbol": sym, "market": mkt, "side": side,
+            out["working"].append({"ticket_id": k["id"], "symbol": sym, "market": mkt, **src, "side": side,
                                    "qty": k.get("qty"), "limit": limit,
                                    "checked_through": r["checked_through"] and iso(r["checked_through"])})
 
@@ -1206,16 +1328,17 @@ def apply_sync(led: Dict[str, Any], data: Dict[str, Tuple[List[tc.Bar], Dict[str
             out["issues"].append({"id": t.get("id"), "symbol": sym,
                                   "issue": "malformed trade - fix it in ledger.json or close it with --price"})
             return
-        if sym not in data:
+        if feed_key(t) not in data:
             return
-        bars, meta = data[sym]
+        bars, meta = data[feed_key(t)]
         r = walk_position(side, fill, stop, target, opened, bars, now_ts, t_stop,
                           session_end_minute(meta, tc.et_date(opened)), row_tick(t))
         mkt = row_market(t).key
+        src = {"exchange": row_exchange(t)} if is_crypto(t) else {}
         if r["status"] == "closed":
             close_trade(t, r["price"], iso(r["ts"]), r["reason"], r["ambiguous"])
-            ev = {"kind": "closed", "trade_id": t["id"], "symbol": sym, "market": mkt, "side": side, "qty": t["qty"],
-                  "reason": r["reason"], "price": t["exit_price"], "at": t["closed_at"],
+            ev = {"kind": "closed", "trade_id": t["id"], "symbol": sym, "market": mkt, **src, "side": side,
+                  "qty": t["qty"], "reason": r["reason"], "price": t["exit_price"], "at": t["closed_at"],
                   "bar": iso(r["ts"] - BAR), "pnl": t["pnl"],
                   "r_multiple": t["r_multiple"], "ambiguous": r["ambiguous"]}
             if is_crypto(t):
@@ -1227,8 +1350,8 @@ def apply_sync(led: Dict[str, Any], data: Dict[str, Tuple[List[tc.Bar], Dict[str
             out["issues"].append({"id": t["id"], "symbol": sym, "issue": r["issue"]})
         else:
             t["synced_at"] = iso(now_ts)
-            out["open"].append({"trade_id": t["id"], "symbol": sym, "market": mkt, "side": side, "qty": t["qty"],
-                                "entry_price": fill, "stop": stop, "target": target,
+            out["open"].append({"trade_id": t["id"], "symbol": sym, "market": mkt, **src, "side": side,
+                                "qty": t["qty"], "entry_price": fill, "stop": stop, "target": target,
                                 "checked_through": r["checked_through"] and iso(r["checked_through"])})
 
     for k in rows(led, "tickets"):
@@ -1242,14 +1365,14 @@ def apply_sync(led: Dict[str, Any], data: Dict[str, Tuple[List[tc.Bar], Dict[str
     return out
 
 
-def prefetch_sync(now: datetime, only: Optional[Set[str]] = None) -> Tuple[Dict[str, Any], Dict[str, str]]:
+def prefetch_sync(now: datetime, only: Optional[Set[str]] = None) -> Tuple[Dict[FeedKey, Any], Dict[FeedKey, str]]:
     """Fetch bars for open/working items outside the ledger lock (network can be slow)."""
     return fetch_sync_data(sync_targets(load_ledger(), now, only), now)
 
 
-def sync_notes(res: Dict[str, Any], errors: Dict[str, str]) -> List[str]:
+def sync_notes(res: Dict[str, Any], errors: Dict[FeedKey, str]) -> List[str]:
     out = [f"sync: {event_text(e)}" for e in res["events"]]
-    out += [f"could not sync {sym}: {msg}" for sym, msg in sorted(errors.items())]
+    out += [f"could not sync {e['symbol']}: {e['error']}" for e in feed_errors(errors)]
     out += [f"{i['id']} {i['symbol']}: {i['issue']}" for i in res["issues"]]
     return out
 
@@ -1300,8 +1423,9 @@ def best_effort_quote(symbol: str) -> Tuple[Optional[Dict[str, Any]], Optional[s
 
 
 def product_rules(symbol: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Coinbase's size step and price tick for a crypto product (public data, cached a day), or
-    (None, why) when it cannot be reached."""
+    """The configured exchange's size step, price tick and minimum order for a crypto pair (public
+    data, cached a day; Binance LOT_SIZE / PRICE_FILTER / NOTIONAL, Coinbase base_increment /
+    quote_increment / min_market_funds), or (None, why) when it cannot be reached."""
     try:
         return tc.product_info(symbol), None
     except tc.FetchError as e:
@@ -1316,6 +1440,7 @@ def cmd_ticket(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     sym = parse_symbol(args.symbol)
     market = tc.use_market_for(sym)            # crypto: the UTC clock, 24/7, fractional sizes, fees
     crypto = market.key == "crypto"
+    ex = tc.crypto_exchange() if crypto else None   # the exchange this ticket is priced on, for its whole life
     now = tc.now_et()
     today = now.strftime("%Y-%m-%d")
     settings = load_settings()
@@ -1335,12 +1460,15 @@ def cmd_ticket(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
         if info:
             tick, step, min_funds = info["quote_increment"], info["base_increment"], info.get("min_market_funds")
             if info.get("trading_disabled") or str(info.get("status") or "online").lower() != "online":
-                pre_warnings.append(f"Coinbase lists {sym} as {info.get('status') or 'unknown'}"
+                pre_warnings.append(f"{exchange_label(ex)} lists {sym} as {info.get('status') or 'unknown'}"
                                     + (" with trading disabled" if info.get("trading_disabled") else "")
                                     + " - its prices may be stale")
         else:
-            pre_notes.append(f"Coinbase product rules unavailable ({info_err}): size step "
+            pre_notes.append(f"{rules_name(ex)} unavailable ({info_err}): size step "
                              f"{step_text(tc.qty_step())} assumed, prices not checked against {sym}'s tick")
+        usd = usd_pair_note(sym, ex)
+        if usd:
+            pre_notes.append(usd)
     quote, quote_err = best_effort_quote(sym)
     if args.order_type == "market" and args.entry is None and args.stop is not None and quote is None:
         raise tc.FetchError(f"a market ticket without --entry needs the current price: {quote_err}")
@@ -1349,10 +1477,17 @@ def cmd_ticket(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
                           time_stop=args.time_stop, last_price=quote["price"] if quote else None,
                           tick=tick, step=step, fee_pct=tc.fee_pct(market, settings))
     if crypto:
+        order["exchange"] = ex
         try:
             order["min_funds"] = float(min_funds) if min_funds is not None else None
         except (TypeError, ValueError):
             order["min_funds"] = None
+        sizing = plan.get("sizing") if isinstance(plan, dict) else None
+        sized_on = sizing.get("exchange") if isinstance(sizing, dict) else None
+        if order["qty_source"] == "plan sizing" and sized_on and sized_on != ex:
+            pre_warnings.append(f"the saved {sym} sizing was made for {exchange_label(sized_on)} (its size step and "
+                                f"fee); this ticket uses {exchange_label(ex)} prices - re-size it: risk.py size "
+                                f"--symbol {sym} --save")
     early = early_close_today(sym, today) if quote is not None else None   # no 2nd slow retry when offline
     cutoff = effective_time_stop(order["time_stop_min"], early)
     # Outside the session (weekend, pre-open, past the time stop) everything is still checked, but
@@ -1382,8 +1517,9 @@ def cmd_ticket(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
                 tc.save_ledger(led)
                 raise ValueError(f"you have a {x['side']} {sym} {x['kind']} ({x['id']}); a {order['side']} "
                                  "ticket would net against it in a real account - close or cancel it first")
+            other = f", priced on {exchange_label(x['exchange'])}" if crypto and x["exchange"] != ex else ""
             warnings.append(f"adds to your {x['side']} {sym} {x['kind']} ({x['id']}, "
-                            f"{qty_text(dict(x, symbol=sym))} {unit_word(sym)})")
+                            f"{qty_text(dict(x, symbol=sym))} {unit_word(sym)}{other})")
         budget = check_budget(led, risk, settings, today)
         res: Dict[str, Any] = {"action": "ticket", "preview": bool(closed), "mode": "paper", "real_money": False,
                                "last_price": quote["price"] if quote else None, "budget": budget,
@@ -1456,7 +1592,9 @@ def cmd_confirm(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     if window:
         raise ValueError(f"{tid} not confirmed: {window}")
     sym = str(k0["symbol"]).upper()
-    quote = get_quote(sym)                                   # FetchError -> exit 2
+    ex = row_exchange(k0)                     # crypto: filled on the exchange the ticket was priced on, only
+    with exchange_scope(ex):
+        quote = get_quote(sym)                               # FetchError -> exit 2
     if quote["date"] and quote["date"] != today:
         raise ValueError(f"{tid} not confirmed: the latest {sym} price is from {quote['date']}, not today "
                          "(market holiday, halt or stale data) - no paper fill")
@@ -1467,6 +1605,10 @@ def cmd_confirm(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
                          f"{tc.tz_label()} time stop{early_close_note(early)} - no paper fill after it")
     warnings: List[str] = []
     notes: List[str] = []
+    if ex and ex != tc.crypto_exchange():
+        notes.append(f"{tid} was made on {exchange_label(ex)} prices, so it fills and is managed on "
+                     f"{exchange_label(ex)} (at its {fee_rate(k0) * 100:g}% fee); the crypto_exchange setting now "
+                     f"says {exchange_label(None)}, which new tickets use")
     qts = parse_ts(quote["time"])
     if qts is not None and now_ts - qts > STALE_QUOTE_SECONDS:
         warnings.append(f"the last {sym} trade was {int((now_ts - qts) // 60)} min ago - thin or halted?")
@@ -1483,7 +1625,7 @@ def cmd_confirm(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
         target = None if k.get("target") is None else float(k["target"])
         qty = row_qty(k)
         tick = row_tick(k)
-        rate = tc.fee_pct(row_market(k), settings) / 100.0     # the fee this fill pays (0 for stocks)
+        rate = fill_fee_rate(k, settings)                     # the fee this fill pays (0 for stocks)
         price = quote["price"]
         if k.get("type") == "market":
             fill: Optional[float] = px(price, tick)
@@ -1526,6 +1668,17 @@ def cmd_confirm(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     return res, 0
 
 
+def fill_fee_rate(k: Dict[str, Any], settings: Dict[str, Any]) -> float:
+    """The paper fee (a fraction) a ticket's fill pays: 0 for stocks; crypto the crypto_fee_pct
+    setting - unless the ticket was priced on another exchange than the setting names now: then the
+    fee the ticket was made with, so its prices and its fees come from the same exchange."""
+    if not is_crypto(k):
+        return 0.0
+    if row_exchange(k) != tc.crypto_exchange():
+        return fee_rate(k)
+    return tc.fee_pct(tc.CRYPTO, settings) / 100.0
+
+
 def refuse_unless_pending(k: Dict[str, Any], status: str) -> None:
     tid = k.get("id")
     if status == "pending":
@@ -1555,7 +1708,7 @@ def cmd_sync(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     led0 = load_ledger()
     targets = sync_targets(led0, now)
     data, errors = fetch_sync_data(targets, now)
-    fetch_errors = [errors[s] for s, rng in sorted(targets.items()) if rng is not None and s in errors]
+    fetch_errors = [errors[k] for k, rng in sorted(targets.items(), key=feed_sort) if rng is not None and k in errors]
     if fetch_errors and not data:
         raise tc.FetchError(fetch_errors[0])         # nothing could be checked at all
     with ledger_lock():
@@ -1564,7 +1717,7 @@ def cmd_sync(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
         expired = expire_pending(led, now.timestamp())
         tc.save_ledger(led)
     res.update(ok=True, action="sync", as_of=iso(now.timestamp()), expired_tickets=expired,
-               errors=[{"symbol": s, "error": m} for s, m in sorted(errors.items())],
+               errors=feed_errors(errors),
                summary=safe_summary(led, now.strftime("%Y-%m-%d")), disclaimer=tc.DISCLAIMER)
     return res, 0
 
@@ -1596,10 +1749,11 @@ def cmd_close(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     if t0.get("status") != "open":
         raise ValueError(f"{tid} is already closed ({t0.get('exit_reason')} at {tc.fmt_price(t0.get('exit_price'))})")
     sym = str(t0.get("symbol", "")).upper()
+    feed = feed_key(t0)                       # crypto: its bars and quote come from the exchange that priced it
     notes: List[str] = []
     data, errors = prefetch_sync(now, {tid})
     if errors:
-        notes.append(f"could not check stops/targets first: {errors.get(sym, next(iter(errors.values())))}")
+        notes.append(f"could not check stops/targets first: {errors.get(feed, next(iter(errors.values())))}")
     preview = copy.deepcopy(load_ledger())
     apply_sync(preview, data, now, {tid})
     pt = find(preview, "trades", tid)
@@ -1607,7 +1761,7 @@ def cmd_close(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     if pt is not None and pt.get("status") == "open" and args.price is not None:
         # A manual exit records real-looking P&L, and realized profit widens today's loss budget, so
         # the price must be one that traded since the fill (checked whenever the bars are available).
-        span = traded_range(data.get(sym, ([], {}))[0], parse_ts(pt.get("opened_at")), now_ts)
+        span = traded_range(data.get(feed, ([], {}))[0], parse_ts(pt.get("opened_at")), now_ts)
         slack = row_tick(t0) / 2 if is_crypto(t0) else 0.005       # half a tick (stocks: half a cent)
         if span is None:
             notes.append(f"--price {tc.fmt_price(args.price)} not checked against traded prices "
@@ -1618,7 +1772,8 @@ def cmd_close(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
                              f"{tc.et_hhmm(now_ts)} {tc.tz_label()}) - a manual exit must be at a price that "
                              "traded; omit --price to close at the current price")
     if pt is not None and pt.get("status") == "open" and args.price is None:
-        quote = get_quote(sym)                                    # FetchError -> exit 2
+        with exchange_scope(feed[1]):
+            quote = get_quote(sym)                                # FetchError -> exit 2
         if quote["date"] and quote["date"] != now.strftime("%Y-%m-%d"):
             notes.append(f"the latest {sym} price is from {quote['date']}")
         if not tc.is_market_open(now):
@@ -1692,19 +1847,26 @@ def cmd_positions(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     led = load_ledger()
     open_trades = [t for t in rows(led, "trades") if t.get("status") == "open"]
     working = [k for k in rows(led, "tickets") if k.get("status") == "working"]
-    quotes: Dict[str, Dict[str, Any]] = {}
-    errors: Dict[str, str] = {}
-    for sym in sorted({str(r.get("symbol", "")).upper() for r in open_trades + working}):
-        with tc.market_scope(sym or tc.market()):
+    quotes: Dict[FeedKey, Dict[str, Any]] = {}
+    errors: Dict[FeedKey, str] = {}
+    for key in sorted({feed_key(r) for r in open_trades + working}, key=lambda k: (k[0], k[1] or "")):
+        sym, ex = key                       # crypto: quoted on the exchange that priced the trade
+        problem = exchange_problem(ex)
+        if problem:
+            errors[key] = problem
+            continue
+        with tc.market_scope(sym or tc.market()), exchange_scope(ex):
             q, err = best_effort_quote(sym)
         if q:
-            quotes[sym] = q
+            quotes[key] = q
         else:
-            errors[sym] = err or "no quote"
+            errors[key] = err or "no quote"
     positions, warnings = [], []
     for t in open_trades:
         row = dict(t)
-        q = quotes.get(str(t.get("symbol", "")).upper())
+        if is_crypto(t):
+            row["exchange"] = row_exchange(t)            # whose quote this is (a row from v1.1.0: Coinbase)
+        q = quotes.get(feed_key(t))
         row.update(last=None, unrealized=None, unrealized_r=None, initial_risk=None)
         try:
             risk = tc.trade_initial_risk(t)
@@ -1734,16 +1896,15 @@ def cmd_positions(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
         positions.append(row)
     work_rows = []
     for k in working:
-        q = quotes.get(str(k.get("symbol", "")).upper())
-        work_rows.append(dict(k, last=q["price"] if q else None))
+        q = quotes.get(feed_key(k))
+        work_rows.append(dict(k, last=q["price"] if q else None, **({"exchange": row_exchange(k)} if is_crypto(k) else {})))
     pending = [k for k in rows(led, "tickets") if ticket_status(k, now_ts) == "pending"]
     tot_unreal = [p["unrealized"] for p in positions if p["unrealized"] is not None]
     res = {"ok": True, "action": "positions", "as_of": iso(now_ts), "positions": positions, "working": work_rows,
            "pending_tickets": [k["id"] for k in pending],
            "working_risk": safe_working_risk(working_orders(led, today)),
            "unrealized_total": round(sum(tot_unreal), 2) if tot_unreal and len(tot_unreal) == len(positions) else None,
-           "summary": safe_summary(led, today), "warnings": warnings,
-           "errors": [{"symbol": s, "error": m} for s, m in sorted(errors.items())],
+           "summary": safe_summary(led, today), "warnings": warnings, "errors": feed_errors(errors),
            "mode": "paper", "real_money": False, "disclaimer": tc.DISCLAIMER}
     return res, 0
 
@@ -2005,8 +2166,9 @@ def render_positions(res: Dict[str, Any]) -> str:
                                      "OPENED"]))
         if res["unrealized_total"] is not None:
             lines.append(f"Unrealized total {tc.fmt_money(res['unrealized_total'], signed=True)}")
-        if any(is_crypto(p) for p in res["positions"]):
-            lines.append("Crypto P&L is net of the paper fees of both fills (Coinbase prices).")
+        sources = sorted({exchange_label(row_exchange(p)) for p in res["positions"] if is_crypto(p)})
+        if sources:              # each crypto trade is marked on the exchange that priced it
+            lines.append(f"Crypto P&L is net of the paper fees of both fills ({' and '.join(sources)} prices).")
     else:
         lines.append("No open paper positions.")
     if res["working"]:
@@ -2101,7 +2263,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     t = add("ticket", "create a pending paper order ticket (validates levels and the daily budget); outside "
                       "the session it prints a preview that cannot be confirmed")
-    t.add_argument("--symbol", required=True, help="ticker, e.g. TSLA, or a Coinbase product, e.g. BTC-USD")
+    t.add_argument("--symbol", required=True, help="ticker, e.g. TSLA, or a crypto pair, e.g. BTC-USDT (BTC-USD "
+                                                   "works too; prices from the crypto_exchange setting)")
     t.add_argument("--qty", type=qty_arg, help="shares; crypto: a fractional size such as 0.01 (default: the "
                                                 "plan's sizing from the risk skill)")
     t.add_argument("--side", choices=("long", "short"), help="default: the plan's side, else inferred from the levels")

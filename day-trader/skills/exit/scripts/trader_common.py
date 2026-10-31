@@ -8,7 +8,7 @@ its own. Edit the canonical copy, then run `python3 tools/sync_common.py`.
 
 Data sources (all free, no API key):
   * Yahoo Finance chart API  - US stocks: daily and intraday OHLCV bars, last price
-  * Coinbase Exchange public market data - crypto (BTC-USD, ETH-USD, ...): candles, ticker, products
+  * Binance (default) or Coinbase public market data - crypto (BTC-USDT, ETH-USD, ...): candles, ticker, products
   * Nasdaq Trader symbol directory - every US-listed symbol
   * SEC EDGAR - ticker -> CIK map, company filings
   * House Clerk financial disclosures - congressional trade reports (pelosi skill)
@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DISCLAIMER = (
     "Not financial advice. Paper trading only - nothing here can place a real order. "
     "Simulations and backtests are not guarantees."
@@ -114,7 +114,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "max_consecutive_losses": 3,    # tilt guard
     "min_reward_risk": 1.0,         # warn below this reward:risk
     "ticket_ttl_minutes": 15,       # unconfirmed paper tickets expire
-    "crypto_fee_pct": 0.6,          # paper fee per crypto fill, % of notional (Coinbase's entry taker tier)
+    "crypto_exchange": "binance",   # where crypto prices come from: binance | coinbase (public data only)
+    "crypto_fee_pct": 0.1,          # paper fee per crypto fill, % of notional; unset = the exchange's
+                                    # entry-tier taker fee (Binance 0.1%, Coinbase 0.6%)
     "contact_email": "",            # sent to SEC EDGAR in the User-Agent, as SEC asks
 }
 
@@ -131,6 +133,12 @@ def load_settings() -> Dict[str, Any]:
     s = dict(DEFAULT_SETTINGS)
     stored = _load_object("settings.json") or {}
     s.update({k: v for k, v in stored.items() if k in DEFAULT_SETTINGS})
+    try:
+        s["crypto_exchange"] = crypto_exchange(stored)
+    except ValueError:   # reported when a crypto command actually needs the exchange; stocks run on
+        s["crypto_exchange"] = DEFAULT_SETTINGS["crypto_exchange"]
+    if "crypto_fee_pct" not in stored:   # follow the exchange unless the user set their own fee
+        s["crypto_fee_pct"] = CRYPTO_EXCHANGES[s["crypto_exchange"]]["fee_pct"]
     return s
 
 
@@ -141,7 +149,14 @@ def save_settings(updates: Dict[str, Any]) -> Dict[str, Any]:
     stored = _load_object("settings.json") or {}
     for k, v in updates.items():
         default = DEFAULT_SETTINGS[k]
-        if isinstance(default, bool):
+        if v is None:   # back to the default (crypto_fee_pct then follows the exchange again)
+            stored.pop(k, None)
+            continue
+        if k == "crypto_exchange":
+            v = str(v).strip().lower()
+            if v not in CRYPTO_EXCHANGES:
+                raise ValueError(f"crypto_exchange must be one of: {', '.join(CRYPTO_EXCHANGES)}")
+        elif isinstance(default, bool):
             v = v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes", "on")
         elif isinstance(default, int):
             v = int(v)
@@ -291,8 +306,9 @@ def get_text(url: str, ttl: float = 0, **kw: Any) -> str:
 # Markets and time
 #
 # Two markets share the desk. US stocks (the default) trade 09:30-16:00 US/Eastern on weekdays,
-# priced from Yahoo Finance. Crypto (symbols like BTC-USD) trades 24/7: a "session" is a UTC
-# calendar day, prices come from Coinbase Exchange's public API, and sizes are fractional.
+# priced from Yahoo Finance. Crypto (symbols like BTC-USDT) trades 24/7: a "session" is a UTC
+# calendar day, prices come from Binance's (default) or Coinbase's public market data, and sizes
+# are fractional.
 # The *active* market decides what "now", "today", "the session" and HH:MM mean below; scripts
 # switch it with use_market_for(symbol). The historical names (to_et, now_et, et_hhmm,
 # in_regular_session, ...) follow the active market, so in crypto mode they are UTC.
@@ -306,6 +322,30 @@ except Exception:  # pragma: no cover - depends on platform
     ET = None
 
 
+CRYPTO_EXCHANGES: Dict[str, Dict[str, Any]] = {
+    "binance": {"name": "Binance", "full_name": "Binance", "host": "data-api.binance.vision", "fee_pct": 0.1},
+    "coinbase": {"name": "Coinbase", "full_name": "Coinbase Exchange", "host": "api.exchange.coinbase.com",
+                 "fee_pct": 0.6},
+}
+
+
+def crypto_exchange(stored: Optional[Dict[str, Any]] = None) -> str:
+    """Where crypto prices come from: $DAYTRADER_CRYPTO_EXCHANGE, else the crypto_exchange setting."""
+    value = os.environ.get("DAYTRADER_CRYPTO_EXCHANGE")
+    if not value:
+        stored = stored if stored is not None else (_load_object("settings.json") or {})
+        value = stored.get("crypto_exchange") or DEFAULT_SETTINGS["crypto_exchange"]
+    value = str(value).strip().lower()
+    if value not in CRYPTO_EXCHANGES:
+        raise ValueError(f"crypto exchange must be one of: {', '.join(CRYPTO_EXCHANGES)} (got {value!r})")
+    return value
+
+
+def exchange_name() -> str:
+    """'Binance' or 'Coinbase' - the crypto price source, for labels."""
+    return CRYPTO_EXCHANGES[crypto_exchange()]["name"]
+
+
 @dataclass(frozen=True)
 class Market:
     key: str            # "us" | "crypto"
@@ -316,20 +356,48 @@ class Market:
     every_day: bool     # trades on weekends too
     time_stop: str      # default "flat by" time, local HH:MM
     fractional: bool    # position sizes may be fractional
-    source: str         # where prices come from
+    source_name: str    # where prices come from (crypto: see the source property)
+
+    @property
+    def source(self) -> str:
+        """'Yahoo Finance' for stocks; the configured crypto exchange ('Binance', 'Coinbase Exchange')."""
+        if self.key == "crypto":
+            return CRYPTO_EXCHANGES[crypto_exchange()]["full_name"]
+        return self.source_name
 
 
 US = Market("us", "US stocks", "ET", 9 * 60 + 30, 16 * 60, False, "15:55", False, "Yahoo Finance")
-CRYPTO = Market("crypto", "Crypto", "UTC", 0, 24 * 60, True, "23:55", True, "Coinbase Exchange")
+CRYPTO = Market("crypto", "Crypto", "UTC", 0, 24 * 60, True, "23:55", True, "Binance or Coinbase public data")
 MARKETS = {"us": US, "crypto": CRYPTO}
 
-CRYPTO_QUOTES = ("USD", "USDC", "USDT", "EUR", "GBP", "BTC", "ETH", "DAI")
-_CRYPTO_SYMBOL = re.compile(r"[A-Z0-9]{2,12}-(?:%s)" % "|".join(CRYPTO_QUOTES))
+CRYPTO_QUOTES = ("USD", "USDC", "USDT", "FDUSD", "EUR", "GBP", "BTC", "ETH", "DAI")
+_COIN = r"(?:[^\W_]){1,20}"   # letters and digits in any script: A, BTC, 1INCH, 币安人生
+_CRYPTO_SYMBOL = re.compile(r"(%s)-(%s)" % (_COIN, "|".join(CRYPTO_QUOTES)))
+_CRYPTO_COMPACT = re.compile(r"((?:[^\W_]){1,15}?)(USDT|USDC|FDUSD)")   # Binance style: BTCUSDT
 
 
 def is_crypto_symbol(symbol: Optional[str]) -> bool:
-    """'BTC-USD', 'ETH-USDC', 'SOL-EUR' -> True; stock tickers (including 'BRK-B') -> False."""
-    return bool(_CRYPTO_SYMBOL.fullmatch((symbol or "").strip().upper()))
+    """'BTC-USD', 'BTC-USDT', 'BTCUSDT', 'SOL-EUR' -> True; stock tickers (incl. 'BRK-B') -> False."""
+    s = (symbol or "").strip().upper()
+    return bool(_CRYPTO_SYMBOL.fullmatch(s) or _CRYPTO_COMPACT.fullmatch(s))
+
+
+def canonical_symbol(symbol: str) -> str:
+    """'btcusdt' -> 'BTC-USDT' (one spelling per crypto pair); stocks -> upper case."""
+    s = (symbol or "").strip().upper()
+    if is_crypto_symbol(s):
+        base, quote_ccy = crypto_pair(s)
+        return f"{base}-{quote_ccy}"
+    return s
+
+
+def crypto_pair(symbol: str) -> Tuple[str, str]:
+    """'BTC-USDT' / 'BTCUSDT' -> ('BTC', 'USDT')."""
+    s = symbol.strip().upper()
+    m = _CRYPTO_SYMBOL.fullmatch(s) or _CRYPTO_COMPACT.fullmatch(s)
+    if not m:
+        raise ValueError(f"{symbol!r} is not a crypto pair (e.g. BTC-USDT)")
+    return m.group(1), m.group(2)
 
 
 def market_for(symbol: Optional[str] = None) -> Market:
@@ -575,9 +643,10 @@ def parse_yahoo_chart(payload: Dict[str, Any]) -> Tuple[List[Bar], Dict[str, Any
 
 def fetch_bars(symbol: str, interval: str = "5m", range_: str = "60d", prepost: bool = False,
                ttl: Optional[float] = None) -> Tuple[List[Bar], Dict[str, Any]]:
-    """OHLCV bars. Stocks from Yahoo (1m: last ~7d, 5m/15m: last 60d); crypto from Coinbase."""
+    """OHLCV bars. Stocks from Yahoo (1m: last ~7d, 5m/15m: last 60d); crypto from the configured
+    exchange (Binance by default, or Coinbase)."""
     if is_crypto_symbol(symbol):
-        return coinbase_bars(symbol, interval, range_, ttl)
+        return crypto_bars(symbol, interval, range_, ttl)
     if ttl is None:
         ttl = 30 if interval.endswith("m") else 900
     params = urllib.parse.urlencode(
@@ -595,9 +664,9 @@ def fetch_bars(symbol: str, interval: str = "5m", range_: str = "60d", prepost: 
 
 
 def quote(symbol: str) -> Dict[str, Any]:
-    """Latest price and basics (stocks: Yahoo regular session; crypto: Coinbase ticker)."""
+    """Latest price and basics (stocks: Yahoo regular session; crypto: the exchange's ticker)."""
     if is_crypto_symbol(symbol):
-        return coinbase_quote(symbol)
+        return crypto_quote(symbol)
     bars, meta = fetch_bars(symbol, "1m", "1d", ttl=15)
     price = meta.get("regularMarketPrice") or (bars[-1].close if bars else None)
     if price is None:
@@ -628,13 +697,16 @@ def group_sessions(bars: Iterable[Bar], regular_only: bool = True) -> Dict[str, 
 
 
 # ---------------------------------------------------------------------------
-# Crypto prices (Coinbase Exchange public market data - no account, no API key)
+# Crypto prices: Binance (default) or Coinbase public market data - no account, no API key.
+# The crypto_exchange setting (or $DAYTRADER_CRYPTO_EXCHANGE) picks the source; the functions
+# without an exchange prefix (crypto_bars, crypto_quote, product_info, crypto_symbols) dispatch.
 # ---------------------------------------------------------------------------
 
 COINBASE_API = "https://api.exchange.coinbase.com"
 COINBASE_GRANULARITY = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "60m": 3600, "6h": 21600, "1d": 86400}
 COINBASE_MAX_CANDLES = 300      # per request
-STABLECOINS = {"USDT", "USDC", "DAI", "PYUSD", "EURC", "GUSD", "USDP", "PAX", "BUSD", "TUSD", "FDUSD", "USDS"}
+STABLECOINS = {"USDT", "USDC", "DAI", "PYUSD", "EURC", "GUSD", "USDP", "PAX", "BUSD", "TUSD", "FDUSD", "USDS",
+               "EURI", "AEUR", "EUR", "USD1", "USDE", "RLUSD", "XUSD", "BFUSD"}
 
 
 def range_seconds(range_: str) -> int:
@@ -706,7 +778,7 @@ def _cache_fresh(url: str, ttl: float) -> bool:
 def coinbase_bars(symbol: str, interval: str = "5m", range_: str = "60d",
                   ttl: Optional[float] = None) -> Tuple[List[Bar], Dict[str, Any]]:
     """Coinbase candles for a product such as BTC-USD (paginated, ~0.15 s between requests)."""
-    product = symbol.strip().upper()
+    product = coinbase_product(symbol)
     now_ts = now_et().timestamp()
     live_ttl = ttl if ttl is not None else (30 if interval.endswith("m") else 300)
     gran = COINBASE_GRANULARITY.get(interval) or 0
@@ -739,7 +811,7 @@ def coinbase_bars(symbol: str, interval: str = "5m", range_: str = "60d",
 
 def coinbase_quote(symbol: str) -> Dict[str, Any]:
     """Last trade, bid and ask from the Coinbase ticker; previous_close = price 24 h ago."""
-    product = symbol.strip().upper()
+    product = coinbase_product(symbol)
     base, _, quote_ccy = product.partition("-")
     t = get_json(f"{COINBASE_API}/products/{urllib.parse.quote(product)}/ticker", ttl=10)
     try:
@@ -774,9 +846,14 @@ def coinbase_products(ttl: float = 86400) -> List[Dict[str, Any]]:
     return [p for p in data if isinstance(p, dict) and p.get("id")]
 
 
-def product_info(symbol: str) -> Dict[str, Any]:
+def coinbase_product(symbol: str) -> str:
+    base, quote_ccy = crypto_pair(symbol)
+    return f"{base}-{quote_ccy}"
+
+
+def coinbase_product_info(symbol: str) -> Dict[str, Any]:
     """Coinbase product rules: base_increment (size step) and quote_increment (price tick)."""
-    product = symbol.strip().upper()
+    product = coinbase_product(symbol)
     for p in coinbase_products():
         if str(p["id"]).upper() == product:
             def inc(key: str, default: float) -> float:
@@ -792,7 +869,8 @@ def product_info(symbol: str) -> Dict[str, Any]:
     raise FetchError(f"{product} is not a Coinbase product")
 
 
-def crypto_symbols(quote: str = "USD", include_stable: bool = False, ttl: float = 86400) -> List[Dict[str, Any]]:
+def coinbase_crypto_symbols(quote: str = "USD", include_stable: bool = False,
+                            ttl: float = 86400) -> List[Dict[str, Any]]:
     """Tradable Coinbase products quoted in `quote` (stablecoin bases dropped by default)."""
     out = []
     for p in coinbase_products(ttl):
@@ -805,6 +883,209 @@ def crypto_symbols(quote: str = "USD", include_stable: bool = False, ttl: float 
             continue
         out.append({"symbol": str(p["id"]).upper(), "name": base, "exchange": "Coinbase", "etf": False})
     return sorted(out, key=lambda r: r["symbol"])
+
+
+BINANCE_API = "https://data-api.binance.vision/api/v3"   # Binance's public market-data host
+BINANCE_INTERVALS = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "60m": "1h", "6h": "6h", "1d": "1d"}
+BINANCE_MAX_CANDLES = 1000      # per request
+_LEVERAGED_TOKEN = re.compile(r".+(UP|DOWN|BULL|BEAR)$")
+
+
+def binance_symbol(symbol: str) -> str:
+    """'BTC-USDT' / 'BTCUSDT' -> 'BTCUSDT'. Binance's few coin/USD pairs trade thinly (BTCUSD about
+    $0.1M a day against about $1B for BTCUSDT), so 'BTC-USD' is priced from 'BTCUSDT'."""
+    base, quote_ccy = crypto_pair(symbol)
+    return base + ("USDT" if quote_ccy == "USD" else quote_ccy)
+
+
+def binance_candle_windows(symbol: str, interval: str, range_: str,
+                           now_ts: float) -> List[Tuple[str, int, int]]:
+    """The kline requests covering `range_` up to `now_ts`: [(url, first_start, last_start)],
+    aligned to multiples of 1,000 candles so closed windows keep a stable, cacheable URL."""
+    if interval not in BINANCE_INTERVALS:
+        raise ValueError(f"unsupported crypto interval {interval!r} (use {', '.join(BINANCE_INTERVALS)})")
+    gran = COINBASE_GRANULARITY[interval]
+    end = (int(now_ts) // gran) * gran
+    start = end - range_seconds(range_) + gran
+    chunk = gran * BINANCE_MAX_CANDLES
+    pair = binance_symbol(symbol)
+    out = []
+    a = (start // chunk) * chunk
+    while a <= end:
+        last = min(a + chunk - gran, end)
+        url = (f"{BINANCE_API}/klines?symbol={pair}&interval={BINANCE_INTERVALS[interval]}"
+               f"&startTime={a * 1000}&endTime={last * 1000}&limit={BINANCE_MAX_CANDLES}")
+        out.append((url, a, last))
+        a += chunk
+    return out
+
+
+def parse_binance_klines(rows: Any) -> List[Bar]:
+    """[[open_time_ms, open, high, low, close, volume, ...], ...] -> bars, oldest first."""
+    if not isinstance(rows, list):
+        detail = rows.get("msg") if isinstance(rows, dict) else str(rows)[:120]
+        raise FetchError(f"unexpected Binance klines response: {detail}")
+    by_ts: Dict[int, Bar] = {}
+    for r in rows:
+        if not isinstance(r, (list, tuple)) or len(r) < 6:
+            continue
+        try:
+            t = float(r[0]) / 1000.0
+            op, hi, lo, cl, vol = (float(x) for x in r[1:6])
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(x) and x > 0 for x in (lo, hi, op, cl)) or not math.isfinite(t):
+            continue
+        by_ts[int(t)] = Bar(int(t), op, max(hi, op, cl), min(lo, op, cl), cl,
+                            max(vol, 0.0) if math.isfinite(vol) else 0.0)
+    return [by_ts[k] for k in sorted(by_ts)]
+
+
+def _binance_get(url: str, ttl: float, symbol: str) -> Any:
+    try:
+        return get_json(url, ttl)
+    except FetchError as e:
+        if "HTTP 400" in str(e):   # Binance answers an unknown pair with 400 {"msg": "Invalid symbol."}
+            raise FetchError(f"{symbol}: Binance has no spot pair {binance_symbol(symbol)} "
+                             f"(crypto pairs look like BTC-USDT)") from e
+        raise FetchError(f"{symbol}: {e}") from e
+
+
+def binance_bars(symbol: str, interval: str = "5m", range_: str = "60d",
+                 ttl: Optional[float] = None) -> Tuple[List[Bar], Dict[str, Any]]:
+    """Binance spot klines for a pair such as BTC-USDT (paginated, 1,000 candles per request)."""
+    pair = binance_symbol(symbol)
+    now_ts = now_et().timestamp()
+    live_ttl = ttl if ttl is not None else (30 if interval.endswith("m") else 300)
+    windows = binance_candle_windows(symbol, interval, range_, now_ts)
+    gran = COINBASE_GRANULARITY[interval]
+    range_start = (int(now_ts) // gran) * gran - range_seconds(range_) + gran
+    by_ts: Dict[int, Bar] = {}
+    jobs = [(url, 7 * 86400 if last + gran <= now_ts else live_ttl) for url, _first, last in windows]
+
+    def fetch(job: Tuple[str, float]) -> Any:
+        return _binance_get(job[0], job[1], symbol)
+
+    if len(jobs) > 1:   # a cold 60-day 5-minute history is ~18 requests: 4 at a time, well inside limits
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            pages = list(pool.map(fetch, jobs))
+    else:
+        pages = [fetch(j) for j in jobs]
+    for rows in pages:
+        for b in parse_binance_klines(rows):
+            if range_start <= b.ts <= now_ts:   # aligned windows reach back past the range
+                by_ts[b.ts] = b
+    bars = [by_ts[k] for k in sorted(by_ts)]
+    if not bars:
+        raise FetchError(f"{symbol}: Binance returned no candles for {pair}")
+    base, quote_ccy = crypto_pair(pair)
+    meta = {"symbol": pair, "currency": quote_ccy, "exchangeName": "Binance",
+            "fullExchangeName": "Binance (spot)", "regularMarketPrice": bars[-1].close,
+            "regularMarketTime": bars[-1].ts, "dataGranularity": interval, "market": "crypto",
+            "shortName": base}
+    return bars, meta
+
+
+def binance_quote(symbol: str) -> Dict[str, Any]:
+    """Last trade, bid and ask from Binance's 24 h ticker; previous_close = price 24 h ago."""
+    pair = binance_symbol(symbol)
+    base, quote_ccy = crypto_pair(pair)
+    t = _binance_get(f"{BINANCE_API}/ticker/24hr?symbol={pair}", 10, symbol)
+
+    def num(key: str) -> Optional[float]:
+        try:
+            v = float(t[key])
+            return v if math.isfinite(v) and v > 0 else None
+        except (KeyError, TypeError, ValueError):
+            return None
+    price = num("lastPrice") if isinstance(t, dict) else None
+    if price is None:
+        raise FetchError(f"{symbol}: unexpected Binance ticker response")
+    when = t.get("closeTime")
+    return {"symbol": pair, "price": price, "previous_close": num("openPrice"),
+            "time": float(when) / 1000.0 if isinstance(when, (int, float)) else None,
+            "currency": quote_ccy, "exchange": "Binance", "name": base,
+            "bid": num("bidPrice"), "ask": num("askPrice")}
+
+
+def _binance_filters(sym: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    return {f.get("filterType"): f for f in sym.get("filters") or [] if isinstance(f, dict)}
+
+
+def binance_product_info(symbol: str) -> Dict[str, Any]:
+    """Binance pair rules: LOT_SIZE stepSize (size step), PRICE_FILTER tickSize, NOTIONAL minimum."""
+    pair = binance_symbol(symbol)
+    data = _binance_get(f"{BINANCE_API}/exchangeInfo?symbol={pair}", 86400, symbol)
+    syms = data.get("symbols") if isinstance(data, dict) else None
+    if not isinstance(syms, list) or not syms or not isinstance(syms[0], dict):
+        raise FetchError(f"{pair} is not a Binance spot pair")
+    sym, flt = syms[0], _binance_filters(syms[0])
+
+    def inc(ftype: str, key: str, default: float) -> float:
+        try:
+            v = float((flt.get(ftype) or {}).get(key))
+            return v if v > 0 else default
+        except (TypeError, ValueError):
+            return default
+    status = str(sym.get("status") or "").upper()
+    min_funds = (flt.get("NOTIONAL") or flt.get("MIN_NOTIONAL") or {}).get("minNotional")
+    return {"symbol": pair, "base_increment": inc("LOT_SIZE", "stepSize", 1e-8),
+            "quote_increment": inc("PRICE_FILTER", "tickSize", 0.01),
+            "status": "online" if status == "TRADING" else status.lower(),
+            "trading_disabled": status != "TRADING" or sym.get("isSpotTradingAllowed") is False,
+            "min_market_funds": min_funds}
+
+
+def binance_crypto_symbols(quote: str = "USD", include_stable: bool = False,
+                           ttl: float = 86400) -> List[Dict[str, Any]]:
+    """Trading Binance spot pairs quoted in `quote` ('USD' means USDT on Binance)."""
+    quote = "USDT" if quote.upper() == "USD" else quote.upper()
+    data = get_json(f"{BINANCE_API}/exchangeInfo?permissions=SPOT&symbolStatus=TRADING", ttl)
+    syms = data.get("symbols") if isinstance(data, dict) else None
+    if not isinstance(syms, list):
+        raise FetchError("unexpected Binance exchangeInfo response")
+    listed = {str(s.get("baseAsset", "")).upper() for s in syms if isinstance(s, dict)}
+
+    def leveraged(base: str) -> bool:   # BTCUP / BTCDOWN-style tokens: the root is a listed coin
+        m = _LEVERAGED_TOKEN.fullmatch(base)
+        return bool(m) and base[: -len(m.group(1))] in listed
+
+    out = []
+    for s in syms:
+        if not isinstance(s, dict) or str(s.get("quoteAsset", "")).upper() != quote:
+            continue
+        if str(s.get("status", "")).upper() != "TRADING" or s.get("isSpotTradingAllowed") is False:
+            continue
+        base = str(s.get("baseAsset", "")).upper()
+        if not base or leveraged(base) or (not include_stable and base in STABLECOINS):
+            continue
+        out.append({"symbol": f"{base}-{quote}", "name": base, "exchange": "Binance", "etf": False})
+    return sorted(out, key=lambda r: r["symbol"])
+
+
+def crypto_bars(symbol: str, interval: str = "5m", range_: str = "60d",
+                ttl: Optional[float] = None) -> Tuple[List[Bar], Dict[str, Any]]:
+    """Candles from the configured crypto exchange (Binance by default)."""
+    if crypto_exchange() == "coinbase":
+        return coinbase_bars(symbol, interval, range_, ttl)
+    return binance_bars(symbol, interval, range_, ttl)
+
+
+def crypto_quote(symbol: str) -> Dict[str, Any]:
+    return coinbase_quote(symbol) if crypto_exchange() == "coinbase" else binance_quote(symbol)
+
+
+def product_info(symbol: str) -> Dict[str, Any]:
+    """Size step (base_increment) and price tick (quote_increment) of a crypto pair."""
+    return coinbase_product_info(symbol) if crypto_exchange() == "coinbase" else binance_product_info(symbol)
+
+
+def crypto_symbols(quote: str = "USD", include_stable: bool = False, ttl: float = 86400) -> List[Dict[str, Any]]:
+    """Tradable pairs on the configured crypto exchange (stablecoin bases dropped by default)."""
+    if crypto_exchange() == "coinbase":
+        return coinbase_crypto_symbols(quote, include_stable, ttl)
+    return binance_crypto_symbols(quote, include_stable, ttl)
 
 
 def fee_pct(m: Optional[Market] = None, settings: Optional[Dict[str, Any]] = None) -> float:
@@ -1059,7 +1340,8 @@ def sec_recent_filings(ticker: str, forms: Optional[Iterable[str]] = None, limit
 # ---------------------------------------------------------------------------
 
 def _safe_symbol(symbol: str) -> str:
-    return re.sub(r"[^A-Z0-9._-]", "_", symbol.strip().upper())
+    """File-name key for a symbol: BTCUSDT and BTC-USDT share one plan; non-Latin names survive."""
+    return re.sub(r"[^\w.-]", "_", canonical_symbol(symbol))
 
 
 def validate_levels(side: str, entry: float, stop: float, target: Optional[float]) -> List[str]:

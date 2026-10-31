@@ -15,11 +15,13 @@ Usage:
   python3 scripts/time_machine.py TSLA --at 10:15 --paths 20000 --seed 7
   python3 scripts/time_machine.py TSLA --side short --entry 364.18 --stop 368.00 --target 356.50
   python3 scripts/time_machine.py TSLA --svg tsla_replays.svg --save --json
-  python3 scripts/time_machine.py BTC-USD --save               # crypto: UTC days, to the 23:55 time stop
+  python3 scripts/time_machine.py BTC-USDT --save              # crypto: UTC days, to the 23:55 time stop
 
-Crypto (a Coinbase product such as BTC-USD) trades 24/7: a session is a UTC day of 288 five-minute
-slots, the library is the past ~59 UTC days, the replays run to the plan's time stop (23:55 UTC by
-default) and the paper broker's fees are shown in R (the verdict counts them).
+Crypto (a pair such as BTC-USDT; BTC-USD works too) trades 24/7: a session is a UTC day of 288
+five-minute slots, the library is the past ~59 UTC days, the replays run to the plan's time stop
+(23:55 UTC by default) and the paper broker's fees are shown in R (the verdict counts them). Prices
+come from Binance's public market data by default, or Coinbase's (the crypto_exchange setting, or
+$DAYTRADER_CRYPTO_EXCHANGE); the fee per fill defaults to that exchange's entry-tier taker fee.
 
 Exit codes: 0 ok, 1 bad input (or not enough history), 2 data source unreachable.
 """
@@ -988,7 +990,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = tc.make_parser("Replay the rest of the session thousands of times from the stock's own past "
                        "5-minute bars and show the odds of target first, stop first or neither. "
                        "Simulation only - not financial advice.")
-    p.add_argument("symbol", help="ticker, e.g. TSLA, or a Coinbase product such as BTC-USD")
+    p.add_argument("symbol", help="ticker, e.g. TSLA, or a crypto pair such as BTC-USDT (Binance prices by "
+                   "default, or Coinbase)")
     p.add_argument("--entry", type=_price, help="fill price (default: the saved plan's entry)")
     p.add_argument("--stop", type=_price, help="stop price (default: the saved plan's stop)")
     p.add_argument("--target", type=_price, help="target price (default: the saved plan's target)")
@@ -1098,8 +1101,27 @@ def finished_trigger_note(plan: Mapping[str, Any], sym: str, entry: float, today
 
 
 def _not_found(err: Exception) -> bool:
+    """An unknown symbol: Yahoo 'Not Found', Coinbase 404, Binance 400 ('has no spot pair')."""
     msg = str(err)
-    return any(s in msg for s in ("HTTP 404", "Yahoo: Not Found", "No data found"))
+    return any(s in msg for s in ("HTTP 404", "Yahoo: Not Found", "No data found", "has no spot pair"))
+
+
+def price_source_note(sym: str, meta: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """Crypto: a note when the exchange prices `sym` from a pair in another currency (Binance has
+    few, thin USD pairs, so BTC-USD comes from BTCUSDT). None for stocks and pairs priced as typed."""
+    m = meta or {}
+    if not _crypto() or not m.get("symbol") or not m.get("currency"):
+        return None
+    try:
+        quote = tc.crypto_pair(sym)[1]
+    except ValueError:
+        return None
+    ccy = str(m["currency"]).upper()
+    if ccy == quote:
+        return None
+    name = tc.exchange_name()
+    return (f"{sym} is priced from {name}'s {m['symbol']} pair, quoted in {ccy} "
+            f"({name}'s few {quote} pairs are thin)")
 
 
 def plan_path(sym: str) -> str:
@@ -1169,7 +1191,7 @@ def plan_time_stop(plan: Mapping[str, Any]) -> Tuple[int, str]:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     sym = parse_symbol(args.symbol)
-    tc.use_market_for(sym)               # crypto (BTC-USD): UTC days, 24/7, Coinbase prices
+    tc.use_market_for(sym)               # crypto (BTC-USDT): UTC days, 24/7, Binance or Coinbase prices
     crypto = _crypto()
     now = tc.now_et()
     now_ts = now.timestamp()
@@ -1194,9 +1216,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except tc.FetchError as e:
         if _not_found(e):
             if crypto:
-                raise ValueError(f"Coinbase has no product {sym} - check the symbol (e.g. BTC-USD)") from e
+                raise ValueError(f"{tc.exchange_name()} has no pair {sym} - check the symbol (e.g. BTC-USDT)") from e
             raise ValueError(f"Yahoo Finance has no data for {sym} - check the symbol") from e
         raise
+    src_note = price_source_note(sym, meta)   # crypto: BTC-USD priced from BTCUSDT on Binance
+    if src_note:
+        notes.append(src_note)
     groups = tc.group_sessions(raw)
     today_bars = [b for b in groups.get(today, []) if b.ts <= now_ts]
     horizon_end = None
@@ -1221,7 +1246,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         notes.append(f"skipped {len(thin)} past {'day' if crypto else 'session'}(s) with under an hour of "
                      f"5-minute bars ({', '.join(thin)})")
     if len(use) < args.sessions and crypto:
-        notes.append(f"Coinbase returned {len(use)} usable past days (UTC) of 5-minute candles "
+        notes.append(f"{tc.exchange_name()} returned {len(use)} usable past days (UTC) of 5-minute candles "
                      f"(asked for {args.sessions}) - a recent listing?")
     elif len(use) < args.sessions and args.sessions == DEFAULT_SESSIONS:
         notes.append(f"Yahoo returned {len(use)} usable past sessions (5-minute data only goes back ~60 days)")

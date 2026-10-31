@@ -14,10 +14,11 @@ from unittest import mock
 # Works both with `unittest discover -s tests` and `python3 -m unittest tests.test_exit`.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from helpers import (ROOT, SKILLS, TempHomeTestCase, bars_from_closes, et_ts, fake_bars,  # noqa: E402
+from helpers import (ROOT, SKILLS, TempHomeTestCase, bars_from_closes, et_ts, fake_bars, fake_http,  # noqa: E402
                      load_skill_module, random_walk_history, run_cli, skill_script, tc,
-                     trading_days, utc_ts, write_coinbase_fixtures, write_coinbase_products,
-                     write_coinbase_quote, write_fixture, yahoo_chart_url, yahoo_payload)
+                     trading_days, utc_ts, write_binance_fixtures, write_binance_products, write_binance_quote,
+                     write_coinbase_fixtures, write_coinbase_products, write_coinbase_quote, write_fixture,
+                     yahoo_chart_url, yahoo_payload)
 
 ep = load_skill_module("exit", "exit_plan")
 SCRIPT = skill_script("exit", "exit_plan.py")
@@ -764,20 +765,105 @@ class CryptoCliTests(TempHomeTestCase):
         self.assertNotIn("Traceback", p.stderr)
 
 
+class BinanceCliTests(TempHomeTestCase):
+    """The real script against Binance fixtures (the default exchange) on a Saturday, 04:40 UTC: the
+    same tape as CryptoCliTests, with Binance's 0.1% entry-tier taker fee instead of Coinbase's 0.6%."""
+    NOW = f"{SAT}T04:40"
+
+    def setUp(self):
+        super().setUp()
+        self.fx = self.home / "fixtures"
+        bars = []
+        for day in ("2026-10-26", "2026-10-27", "2026-10-28", "2026-10-29", FRI):
+            bars += utc_flat(day, 288, price=100.0, wick=0.5)
+        bars += utc_flat(SAT, 57, price=100.0, wick=0.5)                    # 00:00 .. 04:40 (forming)
+        # Binance's few USD pairs are thin: BTC-USDT and BTC-USD both read the BTCUSDT klines and ticker.
+        write_binance_fixtures(self.fx, "BTC-USDT", bars, "5m", "5d", now_ts=utc_ts(SAT, "04:40"))
+        write_binance_quote(self.fx, "BTC-USDT", 100.0, when_ts=utc_ts(SAT, "04:40"))
+        write_binance_products(self.fx)
+        self.env = {"DAYTRADER_HOME": str(self.home), "DAYTRADER_FIXTURES": str(self.fx), "DAYTRADER_NOW": self.NOW,
+                    "DAYTRADER_CRYPTO_EXCHANGE": "binance"}
+
+    def cli(self, *args):
+        return run_cli(SCRIPT, *args, env=self.env)
+
+    def test_json_text_and_save_with_binance_fees(self):
+        p = self.cli("BTC-USDT", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        r = json.loads(p.stdout)
+        self.assertEqual((r["entry"], r["entry_source"], r["stop"], r["target"]), (100.0, "current price", 98.5, 103.0))
+        self.assertEqual((r["time_stop"], r["atr"], r["atr_info"]["source"]), ("23:55", 1.0, "today"))
+        self.assertEqual((r["fees"]["fee_pct"], r["fees"]["round_trip_r"]), (0.1, 0.133))   # 0.1% x 2 x 100 / 1.50
+        self.assertFalse(any("paper fees" in w for w in r["warnings"]), r["warnings"])    # under 0.25R: the row is enough
+        self.assertEqual(r["notes"], [])                                    # no BTC-USD note for a USDT pair
+        p = self.cli("BTC-USDT", "--entry", "100", "--pct", "10", "--rr", "1.5", "--save")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("THE PLAN — BTC-USDT LONG · percent stop (10%)", p.stdout)
+        self.assertIn("ENTRY 100.00 / STOP 90.00 / TARGET 115.00 / R:R 1.5", p.stdout)
+        self.assertIn("Fees 0.02R round trip at 0.1% per fill (paper broker) · break-even win rate after fees "
+                      "40.8%", " ".join(p.stdout.split()))                  # (1 + 0.019) / (1.5 - 0.0215 + 1.019)
+        self.assertNotIn("Coinbase", p.stdout + p.stderr)
+        saved = json.loads((self.home / "plans" / "BTC-USDT.json").read_text())
+        self.assertEqual((saved["stop"], saved["target"], saved["exit_plan"]["time_stop"]), (90.0, 115.0, "23:55"))
+
+    def test_btc_usd_is_priced_from_btcusdt_and_a_set_fee_wins(self):
+        p = self.cli("BTC-USD", "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        r = json.loads(p.stdout)
+        self.assertEqual((r["symbol"], r["entry"], r["stop"], r["target"]), ("BTC-USD", 100.0, 98.5, 103.0))
+        self.assertIn("BTC-USD is priced from Binance's BTCUSDT pair, quoted in USDT (Binance's few USD pairs are thin)",
+                      r["notes"])
+        tc.save_settings({"crypto_fee_pct": 0.25})                          # the user's own fee beats the default
+        r = json.loads(self.cli("BTC-USDT", "--json").stdout)
+        self.assertEqual(r["fees"]["fee_pct"], 0.25)
+
+    def test_unknown_pair_is_bad_input_even_with_an_explicit_entry(self):
+        # A percent plan needs no bars, but a pair Binance does not list must not get a plan.
+        os.environ["DAYTRADER_CRYPTO_EXCHANGE"] = "binance"                  # temp_home restores it
+        with fake_http({"klines": tc.FetchError("HTTP 400 for https://data-api.binance.vision/api/v3/klines?symbol=NOPEUSDT")}):
+            with self.assertRaises(ValueError) as cm:
+                ep.main(["NOPE-USDT", "--entry", "1.5", "--pct", "2"])
+        self.assertEqual(str(cm.exception), "Binance has no pair NOPE-USDT - check the symbol (e.g. BTC-USDT)")
+
+    def test_unreachable_binance_is_a_data_error_naming_the_host(self):
+        empty = self.home / "empty"
+        empty.mkdir()
+        p = run_cli(SCRIPT, "BTC-USDT", env=dict(self.env, DAYTRADER_FIXTURES=str(empty)))
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("data-api.binance.vision", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+
 class CryptoDeskRunDocTests(unittest.TestCase):
     def test_desk_run_says_crypto_works_the_same(self):
         sec = desk_run_section("exit")
         line = [ln for ln in sec.splitlines() if ln.startswith("Crypto works the same way")]
         self.assertEqual(len(line), 1, sec)
-        for word in ("Coinbase", "`BTC-USD`", "UTC", "UTC day", "fractional", "fees"):
+        for word in ("`BTC-USDT`", "`BTC-USD` works too", "Binance by default (or Coinbase)", "UTC", "UTC day",
+                     "fractional", "fees"):
             self.assertIn(word, line[0])
         self.assertEqual(sec, desk_run_section("time-machine"))
         for skill in ("entry", "exit", "time-machine"):
             text = (SKILLS / skill / "SKILL.md").read_text(encoding="utf-8")
             desc = " ".join(re.search(r"^description: >-\n(.*?)^---", text, re.M | re.S).group(1).split())
             self.assertIn('"paper trade BTC"', desc, skill)
-            self.assertIn('"plan a trade on BTC-USD"', desc, skill)
+            self.assertIn('"plan a trade on BTC-USDT"', desc, skill)
+            self.assertIn("Binance", desc, skill)
             self.assertLessEqual(len(desc), 1024, skill)
+
+    def test_coinbase_is_never_the_only_crypto_source(self):
+        # The user did not want Coinbase: these docs name Binance (the default) wherever Coinbase appears.
+        for skill in ("entry", "exit", "time-machine"):
+            for name in ("SKILL.md", "reference.md"):
+                path = SKILLS / skill / name
+                if not path.exists():
+                    continue
+                text = path.read_text(encoding="utf-8")
+                self.assertNotIn("Coinbase product", text, path)
+                blocks = re.split(r"\n\s*\n|\n(?=\s*(?:[-*]|\d+\.) )", text)   # paragraphs and list items
+                for block in blocks:
+                    if "coinbase" in block.lower():
+                        self.assertIn("binance", block.lower(), f"{path}: {block[:120]}")
 
 
 if __name__ == "__main__":

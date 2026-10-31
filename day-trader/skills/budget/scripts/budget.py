@@ -7,12 +7,13 @@ trade's risk (run it before every ticket), `set` changes the limits and `history
 days. Everything is read from the local paper ledger; only `status --mark` fetches prices.
 
 "Today" is the calendar day of the market being checked: US/Eastern for stocks, the UTC day for
-crypto (`check --symbol BTC-USD`, or `--market crypto`). Crypto risk includes the paper fees of
-both fills at the stop (the crypto_fee_pct setting), as the broker counts it.
+crypto (`check --symbol BTC-USDT`, or `--market crypto`). Crypto risk includes the paper fees of
+both fills at the stop (the crypto_fee_pct setting), as the broker counts it. `status --mark` prices
+each crypto position on the exchange that priced the trade (Binance by default, or Coinbase).
 
 Usage:
   python3 scripts/budget.py status                          # RISKED SO FAR card for today
-  python3 scripts/budget.py status --mark                   # + live P&L of open positions (Yahoo)
+  python3 scripts/budget.py status --mark                   # + live P&L of open positions
   python3 scripts/budget.py status --date 2026-10-29        # how a past day ended
   python3 scripts/budget.py check --risk 46.88              # exit 0 = OK, 3 = BLOCKED
   python3 scripts/budget.py check --entry 364.18 --stop 358.32 --qty 8
@@ -22,7 +23,7 @@ Usage:
   python3 scripts/budget.py history --days 10
   python3 scripts/budget.py status --json                   # --json on any command
   python3 scripts/budget.py status --market crypto          # the UTC day (crypto trades 24/7)
-  python3 scripts/budget.py check --symbol BTC-USD --risk 34.52
+  python3 scripts/budget.py check --symbol BTC-USDT --risk 24.50
 
 Exit codes: 0 ok (check: OK) · 1 bad input or state · 2 data source down (status --mark only)
 · 3 check BLOCKED.
@@ -37,8 +38,9 @@ import trader_common as tc  # noqa: E402
 import argparse  # noqa: E402
 import math  # noqa: E402
 import re  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
 from datetime import datetime, timedelta  # noqa: E402
-from typing import Any, Dict, List, Optional, Sequence, Tuple  # noqa: E402
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple  # noqa: E402
 
 EXIT_OK, EXIT_BLOCKED = 0, 3
 EPS = 1e-9
@@ -171,6 +173,38 @@ def row_market(row: Dict[str, Any]) -> tc.Market:
     if sym:
         return tc.market_for(sym)
     return tc.MARKETS.get(str(row.get("market") or "").strip().lower()) or tc.market_for(None)
+
+
+LEGACY_EXCHANGE = "coinbase"   # crypto rows written before tickets recorded their exchange (v1.1.0)
+EXCHANGE_ENV = "DAYTRADER_CRYPTO_EXCHANGE"
+
+
+def row_exchange(row: Dict[str, Any]) -> Optional[str]:
+    """The exchange whose prices a crypto ticket or trade uses ('binance' | 'coinbase'), as the broker
+    recorded it; rows from before the field existed were priced on Coinbase. None for stocks.
+    (`fetch_marks` refuses a name it does not know; the budget's numbers never depend on it.)"""
+    if row_market(row).key != "crypto":
+        return None
+    return str(row.get("exchange") or LEGACY_EXCHANGE).strip().lower()
+
+
+@contextmanager
+def exchange_scope(exchange: Optional[str]) -> Iterator[None]:
+    """Inside the block, crypto prices come from `exchange` (the one that priced a trade), whatever the
+    crypto_exchange setting says now - through tc's own $DAYTRADER_CRYPTO_EXCHANGE override, so the
+    quote is fetched exactly as tc.quote does it. None (stocks): no change."""
+    if not exchange:
+        yield
+        return
+    old = os.environ.get(EXCHANGE_ENV)
+    os.environ[EXCHANGE_ENV] = exchange
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop(EXCHANGE_ENV, None)
+        else:
+            os.environ[EXCHANGE_ENV] = old
 
 
 def fee_rate(row: Dict[str, Any], settings: Optional[Dict[str, Any]] = None) -> float:
@@ -495,6 +529,9 @@ def position_row(t: Dict[str, Any]) -> Dict[str, Any]:
            "setup": t.get("setup")}
     if "stop_price" in t:
         row.update(market="crypto", fee_pct=t.get("fee_pct"), fees_at_stop=t.get("fees_at_stop"))
+    ex = row_exchange(t)
+    if ex:                       # crypto: the exchange that priced it (and that --mark asks)
+        row.update(market="crypto", exchange=ex)
     return row
 
 
@@ -561,12 +598,14 @@ def floor_step(x: float, step: float) -> float:
     return round(math.floor(x / step + 1e-9) * step, decimals)
 
 
-def mark_positions(positions: Sequence[Dict[str, Any]], prices: Dict[str, float]) -> List[Dict[str, Any]]:
-    """Unrealized P&L of open positions at `prices`, flagging any already through stop/target."""
+def mark_positions(positions: Sequence[Dict[str, Any]], prices: Dict[str, float],
+                   key: Optional[Callable[[Dict[str, Any]], str]] = None) -> List[Dict[str, Any]]:
+    """Unrealized P&L of open positions at `prices` (filed by symbol, or by `key(position)`),
+    flagging any already through stop/target."""
     out = []
     for p in positions:
         row = dict(p)
-        last = prices.get(p["symbol"])
+        last = prices.get(key(p) if key else p["symbol"])
         row["last"] = last
         if last is None:
             row.update(unrealized=None, r_now=None, note="no price")
@@ -981,7 +1020,8 @@ def build_parser() -> argparse.ArgumentParser:
     st = sub.add_parser("status", help="the RISKED SO FAR card: P&L, open risk, budget left, status")
     st.add_argument("--date", type=_date, help="show how a past day ended (YYYY-MM-DD); default today")
     st.add_argument("--mark", action="store_true",
-                    help="also fetch live prices (Yahoo; Coinbase for crypto) for open positions' unrealized P&L")
+                    help="also fetch live prices for open positions' unrealized P&L (Yahoo; crypto from the "
+                         "exchange that priced each trade, Binance or Coinbase)")
     _market_flag(st)
     tc.add_json_flag(st)
     ck = sub.add_parser("check", help="OK / BLOCKED for a new trade's risk (exit 0 OK, 3 BLOCKED)")
@@ -990,7 +1030,7 @@ def build_parser() -> argparse.ArgumentParser:
     ck.add_argument("--stop", type=_price, help="stop price")
     ck.add_argument("--qty", type=_qty_arg, help="shares")
     ck.add_argument("--symbol", type=_symbol,
-                    help="ticker (or crypto product, e.g. BTC-USD: its UTC day and fees); without --risk, "
+                    help="ticker (or a crypto pair, e.g. BTC-USDT: its UTC day and fees); without --risk, "
                          "missing levels/shares come from its saved plan")
     _market_flag(ck)
     tc.add_json_flag(ck)
@@ -1062,17 +1102,35 @@ def _today_view(settings: Dict[str, Any], norm: Dict[str, Any], day: Optional[st
     return day, view, assess(view, settings, day)
 
 
+def mark_key(p: Dict[str, Any], positions: Sequence[Dict[str, Any]]) -> str:
+    """Where a position's live price is filed in `marks.prices`: its symbol, or e.g. 'BTC-USD (Coinbase)'
+    when the same pair is also open on the other exchange (each is marked on its own exchange)."""
+    ex = p.get("exchange")
+    if ex and any(q["symbol"] == p["symbol"] and q.get("exchange") != ex for q in positions):
+        return f"{p['symbol']} ({tc.CRYPTO_EXCHANGES[ex]['name'] if ex in tc.CRYPTO_EXCHANGES else ex})"
+    return p["symbol"]
+
+
 def fetch_marks(positions: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Live prices for the open positions: stocks from Yahoo, crypto from the exchange that priced
+    each trade (never the other one, whatever the crypto_exchange setting says now)."""
     prices: Dict[str, float] = {}
     errors: List[str] = []
-    for sym in sorted({p["symbol"] for p in positions}):
+    feeds: Dict[str, Tuple[str, Optional[str]]] = {}
+    for p in positions:
+        feeds.setdefault(mark_key(p, positions), (p["symbol"], p.get("exchange")))
+    for key, (sym, ex) in sorted(feeds.items()):
+        if ex and ex not in tc.CRYPTO_EXCHANGES:
+            errors.append(f"{sym}: ledger.json names exchange {ex!r} (expected {' or '.join(tc.CRYPTO_EXCHANGES)})")
+            continue
         try:
-            prices[sym] = float(tc.quote(sym)["price"])
+            with exchange_scope(ex):
+                prices[key] = float(tc.quote(sym)["price"])
         except tc.FetchError as e:
             errors.append(str(e))
     if positions and not prices:
         raise tc.FetchError(errors[0] if errors else "no prices")
-    rows = mark_positions(positions, prices)
+    rows = mark_positions(positions, prices, key=lambda p: mark_key(p, positions))
     tot = round(sum(m["unrealized"] for m in rows if m.get("unrealized") is not None), 2)
     return {"positions": rows, "unrealized_total": tot, "errors": errors, "prices": prices}
 
@@ -1164,6 +1222,9 @@ def resolve_risk(args: argparse.Namespace, settings: Optional[Dict[str, Any]] = 
         fees = rate * (entry + stop) * qty
         out.update(new_risk=per * qty + fees, per_share=per + rate * (entry + stop),
                    fees_at_stop=round(fees, 2), fee_pct=round(rate * 100, 6))
+        step = _num(sizing.get("step"))
+        if step and step > 0 and sizing.get("exchange") == tc.crypto_exchange():
+            out["step"] = step       # the pair's size step on this exchange, as the risk skill saved it
         notes.append(f"includes {tc.fmt_money(fees)} of paper fees at the stop ({rate * 100:g}% per fill, entry "
                      "and exit), as the broker counts it")
     return out
@@ -1176,14 +1237,14 @@ def cmd_check(args: argparse.Namespace) -> int:
     day, view, _ = _today_view(settings, norm)
     crypto = market.key == "crypto"
     r = check_new_risk(view, settings, day, risk["new_risk"], risk["per_share"],
-                       tc.qty_step(market) if crypto else None)
+                       (risk.get("step") or tc.qty_step(market)) if crypto else None)
     per = risk["per_share"]
     r.update(symbol=args.symbol, market=market.key, date=day, as_of=tc.iso_now(), risk_source=risk["source"],
              risk_per_share=None if per is None else round(per, 4), notes=risk["notes"],
              exit_code=EXIT_OK if r["ok"] else EXIT_BLOCKED,
              disclaimer=tc.DISCLAIMER)
     if crypto:
-        r["unit"] = args.symbol.split("-")[0] if args.symbol else "units"
+        r["unit"] = tc.crypto_pair(args.symbol)[0] if args.symbol else "units"     # BTC for BTC-USDT / BTCUSDT
         for k in ("fees_at_stop", "fee_pct"):
             if k in risk:
                 r[k] = risk[k]

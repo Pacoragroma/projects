@@ -8,8 +8,8 @@ description: >-
   --new-only show only headlines you have not seen yet. Use when the user asks "any news on
   TSLA?", "why is NVDA moving?", "what's the catalyst?", "check headlines before I trade",
   "did AAPL file an 8-K?", "earnings news for my watchlist", "anything new since last time?",
-  or wants to keep an eye on breaking news for a ticker. Crypto pairs (BTC-USD, ETH-USD) work too:
-  Yahoo headlines only (SEC does not apply), times in UTC.
+  or wants to keep an eye on breaking news for a ticker. Crypto pairs (BTC-USDT, ETH-USDT, BTC-USD)
+  work too: Yahoo headlines for the coin (SEC does not apply), times in UTC.
 ---
 # News
 
@@ -32,7 +32,7 @@ python3 scripts/news.py TSLA --tags EARNINGS,GUIDANCE,DEAL
 python3 scripts/news.py TSLA --tags HIGH            # only high-impact items
 python3 scripts/news.py TSLA NVDA --new-only        # only what you have not been shown yet
 python3 scripts/news.py TSLA --json                 # machine-readable, for chaining
-python3 scripts/news.py BTC-USD ETH-USD --since 12h # crypto pairs: Yahoo news, times in UTC
+python3 scripts/news.py BTC-USDT ETH-USDT --since 12h  # crypto: Yahoo news for the coin, in UTC
 ```
 
 * `--since`: `90m`, `24h` (default), `2d`, `1w`, `today`, a clock time today (`09:30`), or an ET
@@ -54,9 +54,13 @@ python3 scripts/news.py BTC-USD ETH-USD --since 12h # crypto pairs: Yahoo news, 
   * SEC EDGAR filings (`www.sec.gov`, `data.sec.gov`). These become headlines like
     `8-K: Results of operations (earnings)`, timed by EDGAR's acceptance time (ET). ETFs and
     indexes have no EDGAR filer, so SEC shows as `n/a` for them, which is not an error.
-  * **Crypto pairs** (`BTC-USD`, `ETH-USD`, ...): the two Yahoo feeds are asked for the pair's
-    symbol. SEC EDGAR does not apply to crypto, so it is not asked at all and shows as `n/a`
-    (JSON `not_applicable`) - never as a failure, and never a reason to say filings are missing.
+  * **Crypto pairs** (`BTC-USDT`, `ETH-USDT`, `BTCUSDT`, `BTC-USD`, ...): the two Yahoo feeds are
+    asked for the coin in Yahoo's spelling, `BTC-USD` for `BTC-USDT` or `BTCUSDT` (a `Yahoo symbols`
+    line says so; JSON `yahoo_symbols`): news is about the coin, not the exchange that prices it
+    (Binance by default, or Coinbase) or the quote currency. Spellings of one coin count as one
+    ticker and share the `--new-only` memory. SEC EDGAR does not apply to crypto, so it is not asked
+    at all and shows as `n/a` (JSON `not_applicable`) - never as a failure, and never a reason to
+    say filings are missing.
 * **Dedupe**: copies count as one story when they share a link (ignoring tracking parameters) or a
   normalized headline within 12 hours. A merged story keeps the earliest time, every ticker and
   source it came from, and the real publisher name. SEC filings merge only on the same filing URL.
@@ -92,7 +96,7 @@ HIGH  Oct 29 16:05 ET  18h 09m ago  TSLA  SEC EDGAR · EARNINGS
   FDA means gap and volatility risk, OFFERING can mean dilution pressure, and ANALYST moves are
   usually smaller and fade.
 * Read the `Sources:` line and any `!` warnings. If a source failed, say the list may be
-  incomplete. If SEC EDGAR failed with `HTTP 403` or the warning mentions a contact email /
+  incomplete. A `Yahoo symbols` line (crypto) names the coin whose news was read: say so. If SEC EDGAR failed with `HTTP 403` or the warning mentions a contact email /
   `DAYTRADER_CONTACT`, see the SEC rule below.
 * With `--new-only`, "No new headlines" means nothing new since the last check. It does not mean
   "no news today". With `--tags`, "No headlines tagged X" means none matched the tag filter; the

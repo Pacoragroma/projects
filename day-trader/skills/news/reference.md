@@ -32,7 +32,8 @@
   "skipped": {"undated": 0, "older": 1, "future": 0, "seen": 0, "tag_filter": 0},
   "sources": [{"source": "yahoo-rss", "ok": ["TSLA"], "failed": {}, "not_applicable": [], "items": 4}],
   "warnings": [],
-  "disclaimer": "..."
+  "disclaimer": "...",
+  "yahoo_symbols": {"BTC-USDT": "BTC-USD"}   // only for crypto pairs Yahoo knows by another symbol
 }
 ```
 
@@ -90,6 +91,10 @@ last 60 minutes.
 * Yahoo search: `https://query1.finance.yahoo.com/v1/finance/search?q={SYM}&quotesCount=0&newsCount=20`
   returns `news[]` with `title, publisher, link, providerPublishTime (unix), relatedTickers`.
   The nested `content{...}` shape is also accepted.
+* `{SYM}` is the Yahoo spelling (`BRK.B` -> `BRK-B`). A crypto pair is asked for as its coin in
+  dollars, as Yahoo lists it: `BTC-USDT`, `BTCUSDT`, `BTC-EUR` -> `BTC-USD`. Related tickers are
+  compared the same way, so a `BTC-USD` story counts for `BTC-USDT`. The exchange that prices the
+  pair elsewhere on the desk (Binance by default, or Coinbase) plays no part in news.
 * SEC: `tc.sec_recent_filings(sym, forms={"8-K","8-K/A","6-K"}, since=<date>)`. The
   submissions JSON is refreshed at most every 60 s (the shared helper's default cache is 15 min).
   EDGAR's `acceptanceDateTime` ends in `Z` but holds Eastern wall-clock time, so it is read as ET.
