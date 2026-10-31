@@ -23,9 +23,10 @@ day-trader/
   tools/sync_common.py               # copy shared/trader_common.py into every skill (--check for CI)
   tools/package_skills.py            # build dist/<skill>.zip for the Claude apps; --check validates SKILL.md
   tools/smoke_live.py                # 17 live checks across the 9 data hosts, through the skills' own parsers
-  tools/desk_snapshot.py             # the desk as one JSON file (feeds the dashboard); exits 1 if an input is missing
-  tools/desk_backup.py               # the desk state as one JSON (the dashboard's private backup)
-  tools/desk_restore.py              # a backup back into $DAYTRADER_HOME; refuses to overwrite a desk
+  tools/desk_snapshot.py             # the desk (and the shadow account) as one JSON file for the dashboard
+  tools/desk_backup.py               # one account's state as one JSON (the dashboard's private backup)
+  tools/desk_restore.py              # a backup back into $DAYTRADER_HOME; refuses to overwrite any desk file
+  tools/paper_autotrade.py           # ticket and confirm paper trades under the owner's standing order
 .github/workflows/day-trader.yml     # CI: sync check, tests, SKILL.md check on Python 3.9 and 3.12 (via uv)
 .gitignore                           # also blocks stray *.json at the root and in day-trader/ (desk outputs carry the ledger)
 ```
@@ -82,10 +83,18 @@ time-machine → risk → budget → broker, then stop and wait for the yes.
   pnl (net of fees), gross_pnl, fees, r_multiple, opened_at, closed_at, market, exchange`.
 - `alerts.json`, `news_seen.json`, `desk_log.jsonl` (written by `tools/desk_snapshot.py --event`),
   `cache/` (closed candle windows are cached for 7 days).
-- Outside the container: `tools/desk_backup.py` packs settings, ledger, alerts, plans, the desk
-  log and the last candidates into one JSON, kept in the dashboard's private store.
-  `tools/desk_restore.py` writes it back. It refuses a home that already holds a desk, so an
-  older backup never rolls back newer local state.
+- **Two accounts, one code base.** The bot keeps two homes: the desk (`/root/.day-trader`) and the
+  shadow account (`/root/.day-trader-shadow`). Every tool works on whichever home
+  `$DAYTRADER_HOME` names. `desk_snapshot.py --shadow-home` reads the second one for the
+  dashboard without switching the active home.
+- Outside the container: `tools/desk_backup.py` packs one account's settings, ledger, alerts,
+  plans, desk log and last candidates into one JSON. It is kept in the dashboard's private store:
+  `desk_state` for the desk, `shadow_state` for the shadow. `tools/desk_restore.py` writes it
+  back.
+  - The restore refuses a home that holds any desk file, so an older backup never rolls back or
+    mixes with newer local state.
+  - The backup refuses a home without `desk_log.jsonl`: that one was never restored (a recycled
+    container), and its backup would replace the real one.
 
 ## Safety by construction
 
@@ -98,7 +107,12 @@ time-machine → risk → budget → broker, then stop and wait for the yes.
   (5-minute bars, within half a tick), so a made-up price can't book fake profit. With no bars
   available, the check is skipped with a note.
 - SKILL.md rules tell Claude: show the ticket, stop, and confirm only after the owner's explicit
-  yes in a later message, for that ticket id.
+  yes in a later message, for that ticket id. That is the product's default.
+- **This deployment runs under the owner's standing order (2026-10-31):** paper trades need no
+  per-ticket yes. `tools/paper_autotrade.py` does the confirming. It calls the skills' own CLIs as
+  subprocesses, so the budget check, previews, expiry and the 10-second minimum between ticket and
+  confirm all still apply. It needs `--standing-order` to run, and it writes a desk-log line for
+  every trade it confirms.
 
 ## Tests
 
@@ -110,8 +124,10 @@ time-machine → risk → budget → broker, then stop and wait for the yes.
   checked against real runs of these.
 - 945 tests, all offline, about 2 minutes. `tools/smoke_live.py` is the live counterpart: 17
   checks across 9 hosts, all passing on 2026-10-31.
-- `test_desk_snapshot.py` covers the desk tools: snapshot rows, a missing input exits 1, ORB hits
-  keep their order, and backup → restore round-trips without rolling back a newer desk.
+- `test_desk_snapshot.py` covers the dashboard data: snapshot rows, all-time results, the shadow
+  rows, equity, stale tickets, ORB order, a missing input exits 1, and the backup → restore round
+  trip. `test_desk_backup.py` covers the restore and backup guards. `test_paper_autotrade.py`
+  covers the auto-trader: default and saved plans, skips, the 10-second confirm, the desk log.
 
 ## The video's original pack (installed alongside, not part of this repo)
 

@@ -4,7 +4,9 @@
 "can we implement this". We rebuilt it from scratch, then added 24/7 crypto, then switched crypto
 prices to Binance at the owner's request, then installed the video's original pack alongside.
 First full live run on 2026-10-31: 6,420 charts scanned, 10 candidates checked, no trade worth
-taking. Then the handoff docs for a session transfer, checked by a cold-start rehearsal.**
+taking. Then the handoff docs for a session transfer, checked by two rounds of rehearsal and
+audit. Then the owner made it an autonomous paper bot: a two-week test of the desk against a
+shadow account that takes every idea.**
 
 ## The video (the spec)
 
@@ -174,7 +176,7 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
   | Found | Fix |
   |---|---|
   | The pass-to-ticket path failed: the throwaway home's plan never reached the real desk, so the budget check and the ticket exited 1 | `risk.py size --save`, then copy the plan to `~/.day-trader/plans/`. Verified live in throwaway homes, and fixed in both stored task prompts |
-  | The alert watcher would die after 30 minutes (the default background limit) | Start it with `timeout: 7200000`. A PID file shows whether one is already running (`pgrep -f` matched the shell running the check, so it always said yes) |
+  | The alert watcher would die after 30 minutes (the default background limit) | Start it with `timeout: 7200000` |
   | The old session would keep acting after the handoff | Wait until it is idle, disable its tasks by id, then tell it "Handoff done" and ask the owner about archiving it |
   | Relative output paths would put desk files (with the ledger) in the public repo | Absolute scratchpad paths everywhere, plus a `.gitignore` backstop |
   | No way to build the backup | `tools/desk_backup.py` and `tools/desk_restore.py`. The restore refuses to roll back a newer desk |
@@ -192,11 +194,70 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
 
   The stablecoin fix is the only change to how the skills behave. It shipped as v1.2.1.
 
+### 2026-10-31 afternoon: the BTC trigger
+
+- 11:49 UTC: the BTC-USDT alert fired on a wick to 77,679.58. No 5-minute bar closed above
+  77,654.44, so it was a watch, not a trade.
+- The desk tested a long at the level with three stops: 1.5 × ATR, a structure stop below the
+  3-hour swing, and 4 × ATR. All leaned against: −2.00R, −0.63R and −0.93R after fees, and
+  negative even before fees.
+- 12:40 UTC: a real close above the level (77,674, 1.9 × volume). The same three stops tested
+  worse: −2.42R, −0.83R and −1.10R after fees. Only 17-20% of past days hit the target first at
+  that hour. Skipped.
+- The 12:40 crypto re-scan: 507 pairs, 3 setups, none a liquid long of 60+.
+
+### 2026-10-31 afternoon: the autonomous paper bot
+
+- **The owner:** "give me a link where I can see what exactly you're saying. If you're going to
+  trade something, you don't need my permission. You trade on your own with paper money. Run the
+  bot for however long we need to see the results later, if we're profitable in the long or short
+  term, or how it exactly works."
+- **Pushed back on one point first:** the desk had approved none of 13 ideas, so a desk-only bot
+  might show no results at all.
+- **Owner's choices:**
+  - **desk + shadow account:** the desk trades only passes; a shadow account trades every idea the
+    desk checks, with the default plan, so the filter's value can be measured;
+  - **two weeks**, verdict on Saturday 2026-11-14; the bot keeps running afterwards until the
+    owner says stop.
+- **Built:**
+  - `tools/paper_autotrade.py`: ticket and confirm under the standing order, through the skills'
+    own CLIs (budget, previews and the 10-second confirm guard still apply);
+  - all-time results, the shadow rows and an equity series in `desk_snapshot.py`;
+  - a "Two-week paper test" section on the dashboard: desk vs shadow, and an equity chart;
+  - the shadow account: $250,000 at 0.02% risk, so each trade is sized like the desk's ($50 risk,
+    $6,250 cap);
+  - the jobs now run with no end date: crypto every 2 hours at :10 UTC, a US stock sweep every
+    weekday at 09:50 ET.
+- **A second verification round of the handoff** (a cold-start rehearsal, a rehearsal of both
+  jobs, a consistency audit, a red team). Before it started, the old session found a bug in its own
+  fix: the watcher guard `pgrep -f` matched the shell running the check, so it always said a watcher was running and none
+  would ever start. Now a PID file. The round kept 21 findings, 6 of them major:
+
+  | Found | Fix |
+  |---|---|
+  | The new session restored while the old one could still act, and "idle" can't be read reliably from outside | The old session stands down first: disables its tasks, stops its background tasks, and writes final backups ending in "Old session stood down". The new session checks that before restoring |
+  | `entry.py` stops looking at 02:00 UTC for crypto without `--cutoff` | Always `--cutoff 23:55` (crypto) or `--cutoff 15:55` (stocks) |
+  | A new session not in Auto mode stalls every unattended run on permission prompts | The handoff prompt and RUNBOOK say Auto mode |
+  | `$THROWAWAY_HOME` was never defined, and `mktemp` homes are forgotten between shell calls | Fixed paths `$OUT/homes/<SYM>-<stop>` |
+  | After a recycled container, an owner message could write before the restore, and the next backup would replace the real one | Restore first, every turn. The restore refuses any existing desk file; the backup refuses a home without its log |
+  | A bare "yes" could confirm the wrong ticket | Moot: there is no per-ticket yes any more |
+
+  Smaller fixes:
+  - sync before every snapshot, so dead tickets disappear;
+  - ORB hits ranked by `pct_over`;
+  - the original pack runs from a clone pinned to the audited commit;
+  - Reg SHO Rule 201 described correctly;
+  - `.gitignore` covers stray desk files;
+  - a Yahoo 429 or an SEC 403 doesn't block a takeover;
+  - `PR review digest` stays enabled;
+  - the news check uses extended web search.
+
 ## Decisions that shaped the design
 
 - **Paper only, always.** No live mode exists, and nothing calls an order endpoint. "Nothing
   goes through without your yes" is enforced in code (confirm `--yes`, ticket expiry, budget
-  re-check) and in every broker rule.
+  re-check) and in every broker rule. The owner's standing order (2026-10-31) lifts the
+  per-ticket yes for this paper deployment only; the code's guards still run.
 - **Honest odds over action.** The Time Machine judges crypto after fees. Candidates are skipped
   unless the edge survives fees, noise and a skeptic.
 - **Stdlib only**, so it runs in the Claude apps' sandbox, on 3.9 through 3.13, with no installs.
