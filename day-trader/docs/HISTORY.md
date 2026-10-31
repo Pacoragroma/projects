@@ -6,7 +6,8 @@ prices to Binance at the owner's request, then installed the video's original pa
 First full live run on 2026-10-31: 6,420 charts scanned, 10 candidates checked, no trade worth
 taking. Then the handoff docs for a session transfer, checked by two rounds of rehearsal and
 audit. Then the owner made it an autonomous paper bot: a two-week test of the desk against a
-shadow account that takes every idea.**
+shadow account that takes every idea. The same afternoon the bot moved to a new session for the
+first time; the next move is planned for Sunday 2026-11-01, before Monday's US open.**
 
 ## The video (the spec)
 
@@ -252,6 +253,60 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
   - `PR review digest` stays enabled;
   - the news check uses extended web search.
 
+### 2026-10-31 afternoon: the first session transfer
+
+- **The stand-down held.** The old session turned both jobs off at 14:07 UTC and wrote final
+  backups of both accounts ending in "Old session stood down". The new session checked both
+  before it restored anything.
+- **The takeover, 14:09 to 14:49 UTC:**
+  - the network check passed 16 of 17 (SEC's 403 for a missing contact email, a known
+    non-blocker);
+  - both accounts restored; limits, sizes and alerts matched the backups;
+  - both jobs re-created from the old prompts, and the copies checked by machine: identical,
+    5,348 and 3,449 characters. The old pair and the retired Monday task stay off;
+  - the alert watcher restarted, then the scans: 507 Binance pairs (2 setups, no idea), 5,907 US
+    stocks (645 setups on Friday's close), the original pack's daily (470 setups);
+  - the dashboard refreshed and both accounts backed up, with "New session took over" in both
+    logs. Still no trades in either account.
+- **Lessons, now in the RUNBOOK:**
+  - the 14:10 crypto run fell between the sessions (old jobs off at 14:07, new ones on at 14:12).
+    The manual re-scan covered it, and there was nothing to trade. Start a stand-down right after
+    a crypto run instead (§6);
+  - the restored logs end with "Old session stood down", which stops the jobs, so "New session
+    took over" must reach both logs before the next run. `desk_snapshot.py --event` writes only
+    the desk's (§6);
+  - check copied job prompts by machine, not by eye (§6);
+  - Binance's own public feeds answer "have withdrawals reopened?" in seconds. The deep web check
+    (six agents, extended search) took 31 minutes, and its search results lagged Binance's own
+    posts (§11);
+  - the download cache keeps every day's Binance daily candles, about 46 MB a day: prune it in a
+    long-running session (§9).
+- **Binance at 14:47 UTC**, checked against its own feeds:
+  - withdrawals still off on all 1,447 networks; deposits on;
+  - Recovery Update #3 (14:25 UTC): 90% of the stolen amount replaced with company funds, the top
+    ten tokens "fully backed 100%", and withdrawals "on track" to start reopening on Sunday
+    2026-11-01, asset by asset and subject to security checks;
+  - not independently confirmed: the zero-knowledge proof of reserves is due 2026-11-03;
+  - as reported: Elliptic counts $2.85B frozen on-chain (frozen, not returned); TRM Labs says
+    about $2.4B in stolen BTC and ETH "will never be recovered"; CoinDesk found the drained wallet
+    counted in Binance's Oct 1 proof of reserves.
+
+  Sources:
+  - [Binance: Recovery Update #3](https://www.binance.com/en/support/announcement/detail/1fdf1f61559c401da0435895ffcccb62)
+  - [Binance: Security Incident Update #2](https://www.binance.com/en/support/announcement/detail/d3306d9dca5243548c813b605e1d1751)
+  - [Reuters via Yahoo Finance](https://finance.yahoo.com/markets/crypto/articles/tether-circle-freeze-2-38-222607515.html)
+  - [CoinDesk: reserve data](https://www.coindesk.com/business/2026/10/30/binance-hack-drained-wallets-backing-customer-assets-reserve-data-shows)
+  - [Elliptic](https://www.elliptic.co/insights/binance-largest-hack-in-history/)
+  - [NBC News](https://www.nbcnews.com/business/markets/binance-pledges-cover-billions-stolen-assets-hack-rcna606517)
+- **The owner: how often should the bot switch sessions?** Recommendation given: not on a timer.
+  The bot's memory is the accounts on disk, their backups, the docs and the job prompts, not the
+  chat, and the chat compacts itself near 900k tokens. What grows is the cost per run (each run
+  re-reads the whole conversation) and the download cache. Switch on a tripwire (failed runs, a
+  lost session, a new model after the test), at most weekly, right after a crypto run.
+- **Owner's choice:** hand the whole project to a fresh session on Sunday 2026-11-01, before
+  Monday's US open, so a clean session runs the first stock sweep (Monday 09:50 ET, which is
+  14:50 UTC once US clocks go back on Nov 1).
+
 ## Decisions that shaped the design
 
 - **Paper only, always.** No live mode exists, and nothing calls an order endpoint. "Nothing
@@ -283,3 +338,8 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
   stale plan when the copy from the throwaway home was skipped.
 - `desk_snapshot.py`: show crypto positions' unrealized P&L net of fees, and include crypto fees and
   working orders in open risk, as `budget.py status` does.
+- The crypto job: check Binance's status each run (RUNBOOK §11) and push-notify the owner when
+  withdrawals reopen or the reimbursement is independently confirmed. Offered 2026-10-31, not
+  chosen yet.
+- The crypto job: prune the download cache (files older than 2 days, RUNBOOK §9). Offered
+  2026-10-31, not chosen yet; a fresh session starts with an empty cache anyway.

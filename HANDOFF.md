@@ -83,9 +83,10 @@ The full steps are in
 This must be a claude.ai cloud session in **Auto mode**: scheduled runs happen with nobody
 watching, and in other modes they stall on permission prompts.
 
-1. **The owner tells the old session to stand down.** It disables its two tasks, stops its
-   background tasks, and writes final backups of both accounts whose last log line is "Old session
-   stood down".
+1. **The owner tells the old session to stand down, right after a crypto run has finished**
+   (about :20 past an even UTC hour), so no run falls between the two sessions. It disables its
+   two tasks, stops its background tasks, and writes final backups of both accounts whose last log
+   line is "Old session stood down".
 2. **The new session syncs and reads.** `git fetch origin && git checkout claude/day-trader-skills
    && git pull --ff-only`, then `CLAUDE.md`, this file and the RUNBOOK.
 3. **It sets up the container** ([RUNBOOK §1](day-trader/docs/RUNBOOK.md#1-set-up-a-fresh-container)):
@@ -93,17 +94,20 @@ watching, and in other modes they stall on permission prompts.
 4. **It checks the stand-down:** both old tasks disabled, and both backups end with "Old session
    stood down". Until then: no restore, no jobs, no watcher.
 5. **It restores both accounts** (only where `settings.json` is missing).
-6. **It re-creates the two jobs** from the old prompts (`get_trigger`, then `create_trigger`).
-   Then it checks `list_triggers`.
+6. **It re-creates the two jobs** from the old prompts (`get_trigger`, then `create_trigger`) and
+   checks the copies by machine against the originals. Then it checks `list_triggers`.
 7. **It starts the alert watcher:** a PID-file check first, then Bash `run_in_background: true`,
    `timeout: 7200000`.
 8. **It re-runs the scans** ([RUNBOOK §2](day-trader/docs/RUNBOOK.md#2-scan-for-setups)): crypto and
    US daily into the scratchpad, the original pack's daily in `/home/user/original-desk`.
-9. **It re-checks the Binance news:** `news.py BTC-USDT --since 24h`, then WebSearch in
-   extended mode (standard mode missed it on 2026-10-31).
+9. **It re-checks the Binance news:** Binance's own status feeds first
+   ([RUNBOOK §11](day-trader/docs/RUNBOOK.md#11-the-binance-hack-checking-the-status)), then
+   `news.py BTC-USDT --since 24h` and WebSearch in extended mode (standard mode missed it on
+   2026-10-31).
 10. **It syncs, refreshes the dashboard and backs up both accounts**
-    ([RUNBOOK §4](day-trader/docs/RUNBOOK.md#4-the-dashboard-and-the-backups)), with an Activity
-    entry "New session took over".
+    ([RUNBOOK §4](day-trader/docs/RUNBOOK.md#4-the-dashboard-and-the-backups)), with "New session
+    took over" in **both** accounts' logs before the next :10 run
+    ([RUNBOOK §6](day-trader/docs/RUNBOOK.md#6-scheduled-jobs-and-taking-them-over-after-a-session-transfer)).
 11. **It tells the owner** in a few lines, in the `CLAUDE.md` style:
     - what is live;
     - both accounts' results;
@@ -138,8 +142,10 @@ watching, and in other modes they stall on permission prompts.
 - **The two-week verdict** is due on Saturday 2026-11-14, from the first crypto run after 12:00 UTC
   ([RUNBOOK §10](day-trader/docs/RUNBOOK.md#10-the-two-week-test-and-the-verdict)). The question:
   is the bot profitable, and does the desk's filter add money?
-- **Binance customer funds:** the owner asked whether they are safe. Each crypto run checks the
-  news. Tell the owner when reimbursement is confirmed and withdrawals have reopened. Until then,
+- **Binance customer funds:** the owner asked whether they are safe. Check with
+  [RUNBOOK §11](day-trader/docs/RUNBOOK.md#11-the-binance-hack-checking-the-status) at each
+  session transfer and when the owner asks; the jobs don't check it on their own. Tell the owner
+  when the reimbursement is independently confirmed and withdrawals have reopened. Until then,
   paper only.
 - The original pack's broker plus an Alpaca paper account is optional. Offered, not chosen.
 - Our scanner has no intraday opening-range sweep. The original pack's `scan.py orb` covers it.

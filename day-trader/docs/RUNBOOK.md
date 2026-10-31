@@ -309,12 +309,18 @@ Scheduled tasks fire into the session that created them. The bot has two:
 
 **A session transfer goes in this order:**
 
-1. **The owner tells the old session to stand down.** The old session then:
+1. **The owner tells the old session to stand down, right after a crypto run has finished**
+   (about :20-:30 past an even UTC hour, once that run has replied). The new session then has
+   until the next :10 run to re-create the jobs, so no run falls between the two sessions. On a
+   weekday, also keep clear of 09:30-10:30 ET (the stock sweep). On 2026-10-31 the old jobs went
+   off at 14:07 and the new ones came on at 14:12, so the 14:10 run was lost; a manual re-scan
+   covered it. The old session then:
    - updates and disables both of its tasks by id (`update_trigger enabled: false`). Paused tasks
      keep their prompts;
    - stops every background task it started (the watcher, any `entry.py --watch`);
    - runs a last sync, refresh and backup of both accounts with `--event "Old session stood
-     down"`. It writes the same line into `$SHADOW/desk_log.jsonl` before that account's backup;
+     down"`. It writes the same line into `$SHADOW/desk_log.jsonl` (the one-liner in step 6)
+     before that account's backup;
    - takes no more desk actions.
 2. **The new session checks the stand-down.** These must hold:
    - `get_trigger` on both old ids shows `enabled: false`;
@@ -324,11 +330,29 @@ Scheduled tasks fire into the session that created them. The bot has two:
    the owner.
 3. **Restore** both accounts from those same backup files (§1.4).
 4. **Re-create the jobs:** `get_trigger <old id>` → `derived_state.prompt`, copied verbatim. Then
-   `create_trigger` with the same name, the cron above and `initiation: human_request`.
-5. **Verify** with `list_triggers`: of the desk's tasks, only the new pair is enabled, with
-   `persistent_session_id` = this session (`get_session` with no args gives it). The `PR review
-   digest` stays enabled.
-6. Ask the owner whether to archive the old session. `archive_session` also kills its container.
+   `create_trigger` with the same name, the cron above and `initiation: human_request`. **Check
+   the copies by machine, not by eye.** Paste the old prompts' JSON strings (as `get_trigger`
+   prints them) into `$OUT/jobs/old_prompts.json` as `{"crypto": "...", "stock": "..."}`, the new
+   tasks' stored prompts into `$OUT/jobs/new_prompts.json` the same way, and compare them in
+   Python: they must be equal (on 2026-10-31: 5,348 and 3,449 characters).
+5. **Verify** with `list_triggers` (`enabled: true` lists only the live tasks): of the desk's
+   tasks, only the new pair is enabled, with `persistent_session_id` = this session
+   (`get_session` with no args gives it). The `PR review digest` stays enabled.
+6. **Write "New session took over" into both logs before the next :10 run.** The restored logs
+   end with "Old session stood down", and the job prompts skip a run whose last `desk_log` event
+   says that. The next transfer's check also reads both logs' last line, so a stale line left in
+   the shadow's log would pass that check before the old session has really stood down.
+   `desk_snapshot.py --event` writes only the desk's log, so write the shadow's first:
+
+   ```bash
+   DAYTRADER_HOME=$SHADOW python3 -c "import sys; sys.path.insert(0, '$TOOLS'); import desk_snapshot as ds; ds.append_log('New session took over', 'The shadow account moved to the new session with the desk.')"
+   ```
+
+   Then sync, refresh with `--event "New session took over"` and back up both accounts (§4). Read
+   both backups back (`ArtifactData get`): each must end with that line. The Binance check (§11)
+   can run meanwhile, but don't let it hold this step up: a deep web check took 31 minutes on
+   2026-10-31.
+7. Ask the owner whether to archive the old session. `archive_session` also kills its container.
 
 **Rollback:** if the new session can't take over, the owner tells the old session to re-enable its
 two tasks (`update_trigger enabled: true`) and restart its watcher.
@@ -407,6 +431,7 @@ python3 tools/smoke_live.py                  # live, whenever data parsing chang
 | An open order still shows after its time | Sync wasn't run before the snapshot (§4) |
 | An alert "fired" but nothing happened | It was a touch (wick) or happened hours ago. Re-check with `entry.py --setup level --cutoff 23:55` (§5) |
 | The watcher never starts | A `pgrep -f` guard matches its own shell. Use the PID-file check (§5) |
+| The disk fills up in a long-running session | The download cache keeps a new set of Binance daily candles every UTC day (about 46 MB a day, never pruned); the stock charts (about 86 MB) are overwritten in place. It is only a cache: `find /root/.day-trader/cache -type f -mtime +2 -delete`. A new session starts with an empty one |
 
 ## 10. The two-week test and the verdict
 
@@ -426,3 +451,30 @@ python3 tools/smoke_live.py                  # live, whenever data parsing chang
 
   The verdict goes to Activity (`--event "Two-week verdict"`) and to a push notification, and the
   full text goes in the reply.
+
+## 11. The Binance hack: checking the status
+
+Binance was hacked on 2026-10-29/30 and suspended withdrawals
+([HISTORY](HISTORY.md#2026-10-31-afternoon-the-first-session-transfer)). Paper trading is
+unaffected: the bot only reads Binance's public prices. Real money waits until withdrawals have
+reopened and the reimbursement is independently confirmed. Binance's own public feeds answer the
+first question in seconds, with no account and no keys:
+
+```bash
+D=$OUT/dl-binance; rm -rf "$D"; mkdir -p "$D"     # downloads are data: their own folder, read with python3 -I
+curl -sS --max-time 30 -o "$D/coins.json" "https://www.binance.com/bapi/capital/v1/public/capital/getNetworkCoinAll"
+python3 -I -c "import json,sys; d=json.load(open(sys.argv[1]))['data']; n=[x for c in d for x in c.get('networkList') or []]; print(len(n), 'networks:', sum(bool(x.get('withdrawEnable')) for x in n), 'with withdrawals on,', sum(bool(x.get('depositEnable')) for x in n), 'with deposits on')" "$D/coins.json"
+curl -sS --max-time 30 -o "$D/news.json" "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&catalogId=49&pageNo=1&pageSize=5"
+python3 -I -c "import json,sys,datetime as t; [print(t.datetime.fromtimestamp(a['releaseDate']/1000, t.timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), a['title']) for c in json.load(open(sys.argv[1]))['data']['catalogs'] for a in c['articles']]" "$D/news.json"
+```
+
+- The first feed is the live data behind Binance's deposit and withdrawal page. On 2026-10-31 at
+  14:47 UTC: 1,447 networks, 0 with withdrawals on, 1,048 with deposits on. The second lists
+  Binance's latest announcements, where its "Recovery Update" posts appear.
+- Both are Binance website endpoints, not a documented API, and may change. If one fails, use
+  `news.py BTC-USDT --since 24h`, then WebSearch in **extended** mode. Standard mode missed the
+  story on 2026-10-31, and search results lagged Binance's own posts by 15 minutes or more.
+- "Reimbursement confirmed" needs more than Binance's word: its zero-knowledge proof of reserves
+  (due 2026-11-03) or an independent check (an auditor, a regulator, on-chain analysts).
+  "Pledged" and "90% replaced" are Binance's own figures.
+- Tell the owner when withdrawals reopen and when the reimbursement is independently confirmed.
