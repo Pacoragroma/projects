@@ -6,8 +6,9 @@ autonomous paper bot in a two-week test (2026-10-31 to 2026-11-14). The desk tra
 that pass its rules. A shadow account trades every idea, so the two can be compared. The owner's
 standing order: paper trades need no per-ticket yes. Nothing here can place a real order.**
 
-State as of **Saturday 2026-10-31, about 14:00 UTC**, version 1.2.1, the latest commit on
-`claude/day-trader-skills`.
+State as of **Sunday 2026-11-01, about 11:30 UTC**, version 1.2.1, the latest commit on
+`claude/day-trader-skills`. The bot moved to a second session on 2026-10-31 (HISTORY); the owner
+plans the next move for Sunday 2026-11-01, before Monday's US open.
 
 Read in this order:
 
@@ -31,7 +32,7 @@ dashboard's link, the old session's id and the scheduled tasks' ids.
 | The bot's tools | `day-trader/tools/` | `paper_autotrade.py` (ticket and confirm under the standing order), `desk_snapshot.py` (the dashboard data), `desk_backup.py`, `desk_restore.py`, `smoke_live.py` |
 | The video's original pack, v2.0.0 | github.com/Jakeschincariol/day-trader-skill (MIT, Jake Schincariol) | US stocks only; its ORB sweep feeds the stock runs. The jobs run a clone pinned to the audited commit `3d0f4ef6986f4984b7c6bd46f7ff4f87744c3abd` at `/home/user/day-trader-skill/` |
 | **The desk** (main paper account) | `/root/.day-trader/` in the container | Trades only the ideas that pass the desk's rules |
-| **The shadow account** | `/root/.day-trader-shadow/` in the container | Trades every idea the desk checks, with the default plan. Same $50 risk and $6,250 cap per trade |
+| **The shadow account** | `/root/.day-trader-shadow/` in the container | Trades every idea the desk checks, with the default plan (3R target). Same $250 risk and $25,000 cap per trade |
 | Backups of both | The dashboard's private store: collection `data/users/me`, docs `desk_state` and `shadow_state` | Lost containers are restored from these ([RUNBOOK §1.4](day-trader/docs/RUNBOOK.md#1-set-up-a-fresh-container)) |
 | The live dashboard | A claude.ai artifact named **"Paper Trading Desk"** (Dashboard type) | The two-week test (desk vs shadow, equity chart), scans, candidates, trades, Activity. Private to the owner |
 | The original pack's workspace | `/home/user/original-desk/trader/` in the container (`universe.txt`, `watchlist.json`) | Rebuilt by running its scanner; not in the repo |
@@ -40,29 +41,34 @@ dashboard's link, the old session's id and the scheduled tasks' ids.
 
 - **Money:**
   - the desk: $25,000 paper;
-  - the shadow: $250,000 paper at 0.02% risk, so every trade is sized like the desk's;
-  - no trades yet in either.
-- **Limits (owner's choice, the desk):** $50 risk per trade (0.2%), max 20 trades a day, $1,000
-  daily max loss, $500 max open risk, tilt guard at 20 losses in a row, max position 25% of the
-  account. The shadow's limits are set high so they never stop an idea.
+  - the shadow: $250,000 paper at 0.1% risk, so every trade is sized like the desk's;
+  - results below.
+- **The owner's 3:1 rule (2026-11-01, both accounts):** every target is 3 × the risk, and the desk
+  enters only at +0.2R or better after fees
+  ([RUNBOOK §3](day-trader/docs/RUNBOOK.md#3-ideas-the-shadow-takes-each-one-the-desk-only-the-ones-that-pass)).
+- **Limits (owner's choice, the desk):** $250 risk per trade (1%), max position 100% of the account
+  (no borrowing), max 20 trades a day, $1,250 daily max loss, $1,250 max open risk, tilt guard at
+  20 losses in a row. The shadow's limits are set high so they never stop an idea.
 - **Crypto prices:** Binance public data (`data-api.binance.vision`), no account and no keys.
   Paper fee 0.1% per fill. Coinbase stays selectable.
-- **Alerts** (`once`): ETH-USDT above 2,262.49 and ZAMA-USDT above 0.0699 are armed.
-  - BTC-USDT above 77,654.44 fired at 11:49 UTC on a wick and is spent.
-  - A real 5-minute close above it came at 12:40 UTC. The desk tested it with three stops and
-    skipped it: the odds leaned against every time (best −0.83R after fees).
-  - Alerts fire on a touch, so re-check live before acting
-    ([RUNBOOK §5](day-trader/docs/RUNBOOK.md#5-alerts-and-the-watcher)).
+- **Alerts:** none armed. All three of 2026-10-31's one-shot alerts fired (BTC, ETH, ZAMA). The
+  owner chose no new alerts (2026-11-01), so ideas come from the scans. If one is ever set again:
+  alerts fire on a touch, so re-check live before acting
+  ([RUNBOOK §5](day-trader/docs/RUNBOOK.md#5-alerts-and-the-watcher)).
 - **Results so far:**
-  - 13 ideas checked on 2026-10-31, **none traded**: none had an edge after fees and noise.
-  - The shadow account started at about 13:00 UTC, so its first trades come with the next live
-    idea.
-  - Details are in
-    [HISTORY](day-trader/docs/HISTORY.md#2026-10-31-the-first-full-scan-and-candidate-check).
+  - the desk: no trades. It passed none of the ideas it checked on 2026-10-31 (13 that morning,
+    then ETH at 22:05 UTC); none had an edge after fees;
+  - the shadow: 1 closed trade, the ETH long the desk skipped, stopped out in 5 minutes for
+    −$20.57 (of which $12.49 fees), under the old 2R/$50 rules;
+  - a separate demo account (not in the test) took one forced BTC trade for the owner to watch:
+    −$24.37. Details are in
+    [HISTORY](day-trader/docs/HISTORY.md#2026-11-01-the-owners-31-rule).
 - **News to know:** Binance was hacked on Oct 29-30 (about $6.3B, the largest crypto theft on
-  record). Binance pledges to cover users from its SAFU reserve and its own funds. Completion is
-  not confirmed, and withdrawals were suspended. Paper trading is unaffected. Real money should
-  wait. Sources are in [HISTORY](day-trader/docs/HISTORY.md#2026-10-31-the-owners-questions-and-choices).
+  record). It pledges to cover users with its own funds and says about 95% is replaced (top ten
+  tokens 100%), not yet independently verified (a zero-knowledge proof of reserves is due Nov 3).
+  Withdrawals began reopening in phases on 2026-11-01 (14 of 1,447 networks at 10:12 UTC). Paper
+  trading is unaffected. Real money should wait. Check with
+  [RUNBOOK §11](day-trader/docs/RUNBOOK.md#11-the-binance-hack-checking-the-status).
 
 ## What is scheduled
 

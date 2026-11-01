@@ -129,6 +129,17 @@ class CryptoAutoTradeTests(AutoTradeTestCase):
         led = tc.load_ledger()
         self.assertEqual((len(led["tickets"]), len(led["trades"]), len(self.log())), (1, 1, 1))
 
+    def test_default_plan_takes_the_rr_target(self):
+        bars = self.pair("BTC-USDT", 100_000.0, seed=7)
+        entry = round(bars[-1].close + 10, 2)
+        out = self.run_json("--plan", "default", "BTC-USDT", "--side", "long", "--entry", str(entry),
+                            "--setup", "level", "--rr", "3")
+        [r] = out["results"]
+        self.assertEqual(r["status"], "filled")
+        self.assertAlmostEqual(r["target"], entry + 3 * (entry - r["stop"]), delta=0.0051)   # 3R, not the default 2R
+        plan = self.plan("BTC-USDT")
+        self.assertEqual((plan["target"], plan["exit_plan"]["params"]), (r["target"], {"atr_mult": 1.5}))
+
     def test_batch_skips_shorts_repeats_and_a_budget_refusal_at_the_yes(self):
         tc.save_settings({"max_trades_per_day": 2})
         btc = self.pair("BTC-USDT", 100_000.0, seed=7)
@@ -260,6 +271,10 @@ class InputAndDataTests(AutoTradeTestCase):
                 (["--home", home, "--standing-order", ORDER, "--plan", "default", "BTC-USDT", "--side", "long"],
                  "needs the idea's entry"),
                 (["--home", home, "--standing-order", ORDER, "--plan", "saved", "BTC-USDT"], "--side"),
+                (["--home", home, "--standing-order", ORDER, "--plan", "saved", "BTC-USDT", "--side", "long",
+                  "--rr", "3"], "--rr is for --plan default"),
+                (["--home", home, "--standing-order", ORDER, "--plan", "default", "BTC-USDT", "--side", "long",
+                  "--entry", "1", "--rr", "0"], "--rr must be above 0"),
                 (["--home", home, "--standing-order", ORDER, "--plan", "saved", "--ideas",
                   self.ideas([{"symbol": "--yes", "side": "long"}], "flag.json")], "not a ticker"),
                 (["--home", home, "--standing-order", ORDER, "--plan", "default", "--ideas",

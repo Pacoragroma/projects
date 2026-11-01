@@ -73,10 +73,10 @@ ORIG=/home/user/day-trader-skill/                 # the video's pack, pinned to 
 
    `desk_restore.py` refuses a home that holds any desk file (settings, ledger, alerts, log or a
    plan) unless `--force`. Then check:
-   - `python3 $SK/risk/scripts/risk.py show`: desk $25,000, $50 a trade, 20 trades, $1,000 daily
-     max loss, $500 open risk, tilt guard 20;
-   - `DAYTRADER_HOME=$SHADOW python3 $SK/risk/scripts/risk.py show`: $250,000 at 0.02% = $50 a
-     trade, max position 2.5% = $6,250, limits set so they never block (§7);
+   - `python3 $SK/risk/scripts/risk.py show`: desk $25,000, 1% = $250 a trade, max position 100%
+     = $25,000, 20 trades, $1,250 daily max loss, $1,250 open risk, tilt guard 20;
+   - `DAYTRADER_HOME=$SHADOW python3 $SK/risk/scripts/risk.py show`: $250,000 at 0.1% = $250 a
+     trade, max position 10% = $25,000, limits set so they never block (§7);
    - `python3 $SK/alerts/scripts/alerts.py list`: it matches the backup. Don't re-arm a fired
      alert without asking.
 5. **The original pack's workspace** (for stock sweeps): `mkdir -p /home/user/original-desk && cd
@@ -119,12 +119,16 @@ detail, levels, key_level}]`, `last`, `change_pct`, `rvol`, `atr_pct`, `dollar_v
   start. That is 02:00 UTC for crypto and 11:30 ET for stocks, and any later cross reads EXPIRED.
   Use `--cutoff 23:55` for crypto and `--cutoff 15:55` for stocks.
 
-**The shadow first, at once** (every live idea, the desk's default plan: a 1.5 × ATR stop, a 2R
+**The owner's 3:1 rule (2026-11-01), for both accounts:** every target is 3 × the risk
+(`--rr 3`), each trade risks $250, and the desk enters only when the replays clearly pay at 3:1
+(the pass rules below). A low win rate is fine; a trade expected to lose is not.
+
+**The shadow first, at once** (every live idea, the default plan: a 1.5 × ATR stop, a 3R
 target, the default time stop):
 
 ```bash
 python3 $TOOLS/paper_autotrade.py --home $SHADOW --standing-order "owner 2026-10-31: no per-ticket yes for paper" \
-  --plan default SYM --side long --entry <trigger price> --setup "<setup>" --json
+  --plan default --rr 3 SYM --side long --entry <trigger price> --setup "<setup>" --json
 # a batch (the stock sweep): --ideas $OUT/ideas-<date>.json  with [{"symbol", "side", "entry", "setup"}]
 ```
 
@@ -138,7 +142,7 @@ standard stops:
 python3 $SK/news/scripts/news.py SYM --since 72h                  # what moved it; crypto reads Yahoo as BTC-USD
 python3 $SK/analyst/scripts/analyst.py brief SYM                  # trend, levels, ATR, rel. volume, SEC (stocks)
 python3 $SK/entry/scripts/entry.py SYM --setup orb|vwap|level|pdh|pdl [--level X] --side long --cutoff 23:55 --save   # stocks: --cutoff 15:55
-python3 $SK/exit/scripts/exit_plan.py SYM --entry E --side long <stop flags> --rr 2 --save
+python3 $SK/exit/scripts/exit_plan.py SYM --entry E --side long <stop flags> --rr 3 --save
 python3 $SK/time-machine/scripts/time_machine.py SYM --save --json   # stocks out of hours: next session from the open; --at 10:00 for later fills
 python3 $SK/risk/scripts/risk.py size --symbol SYM --save --json     # --save: the ticket takes its size from the plan
 ```
@@ -147,7 +151,10 @@ python3 $SK/risk/scripts/risk.py size --symbol SYM --save --json     # --save: t
 
 - a live entry now (above);
 - Time Machine verdict is not `ODDS LEAN AGAINST YOU` (crypto verdicts are judged after fees);
-- expected R after fees above +0.05;
+- expected R after fees of at least +0.2 at the 3R target (it was +0.05 at 2R until 2026-11-01).
+  At 3:1 that means the target comes first in roughly a third of the replays. A 3R trade's
+  verdict often reads `CLOSE TO A COIN FLIP` even when it pays, because the stop is hit first
+  more often than the far target; the expected R is what decides;
 - liquid: our size is trivial against the daily dollar volume;
 - no red-flag news;
 - crypto: **long only** (spot cannot be shorted);
@@ -156,6 +163,9 @@ python3 $SK/risk/scripts/risk.py size --symbol SYM --save --json     # --save: t
   national best bid for the rest of that day and all of the next trading day. Skip a short if the
   prior day's low was 10%+ under the close before it, or today's low (a gap counts) is 10%+ under
   the prior close.
+
+No vetoes beyond these rules: a reviewer's doubt is recorded in the candidate's reason, not
+used to skip a pass.
 
 **A pass becomes a desk trade:**
 
@@ -334,7 +344,7 @@ Scheduled tasks fire into the session that created them. The bot has two:
    the copies by machine, not by eye.** Paste the old prompts' JSON strings (as `get_trigger`
    prints them) into `$OUT/jobs/old_prompts.json` as `{"crypto": "...", "stock": "..."}`, the new
    tasks' stored prompts into `$OUT/jobs/new_prompts.json` the same way, and compare them in
-   Python: they must be equal (on 2026-10-31: 5,348 and 3,449 characters).
+   Python: they must be equal (since the 3:1 rule of 2026-11-01: 5,642 and 3,706 characters).
 5. **Verify** with `list_triggers` (`enabled: true` lists only the live tasks): of the desk's
    tasks, only the new pair is enabled, with `persistent_session_id` = this session
    (`get_session` with no args gives it). The `PR review digest` stays enabled.
@@ -362,12 +372,13 @@ two tasks (`update_trigger enabled: true`) and restart its watcher.
 | Setting | Desk (`$DESK`) | Shadow (`$SHADOW`) | Change with |
 |---|---|---|---|
 | Paper account | $25,000 | $250,000 | `risk.py config --account N` |
-| Risk per trade | 0.2% ($50) | 0.02% ($50) | `risk.py config --risk-pct X` |
-| Max position | 25% ($6,250) | 2.5% ($6,250) | `risk.py config --max-position-pct X` |
+| Risk per trade | **1% ($250)** (owner, 2026-11-01) | 0.1% ($250) | `risk.py config --risk-pct X` |
+| Max position | **100% ($25,000)**, no borrowing | 10% ($25,000) | `risk.py config --max-position-pct X` |
+| Target | **3R** (owner's 3:1 rule) | 3R | `exit_plan.py --rr 3`; the shadow: `paper_autotrade.py --rr 3` |
 | Min reward:risk warning | 1.0 | 1.0 | `risk.py config --min-rr X` |
 | Max trades a day | **20** (owner) | 500 | `budget.py set --max-trades N` |
-| Daily max loss | **$1,000** (owner) | $25,000 | `budget.py set --daily-max-loss X` |
-| Max open risk | **$500** (owner) | $25,000 | `budget.py set --max-open-risk X` |
+| Daily max loss | **$1,250** (owner: 5 full losses) | $25,000 | `budget.py set --daily-max-loss X` |
+| Max open risk | **$1,250** (owner) | $25,000 | `budget.py set --max-open-risk X` |
 | Tilt guard | **20** losses in a row (owner) | 1,000 | `budget.py set --max-losses N` |
 | Crypto exchange | Binance (default) | Binance | `risk.py config --crypto-exchange binance\|coinbase`, or `$DAYTRADER_CRYPTO_EXCHANGE` |
 | Crypto paper fee | 0.1% per fill (follows the exchange; Coinbase 0.6%) | same | `risk.py config --crypto-fee-pct X` |
@@ -375,8 +386,13 @@ two tasks (`update_trigger enabled: true`) and restart its watcher.
 | SEC contact | not set | not set | `$DAYTRADER_CONTACT` or `contact_email` in `settings.json`. **Ask the owner first**: it would also ride in the private backup |
 
 The shadow's account is ten times larger at a tenth of the risk percentage. That way every trade
-is sized exactly like the desk's ($50 risk, $6,250 cap), and the shadow can hold many positions at
+is sized exactly like the desk's ($250 risk, $25,000 cap), and the shadow can hold many positions at
 once. Its limits are set high so they never stop an idea.
+
+The position cap matters as much as the risk: a position's size is the smaller of risk ÷ stop
+distance and the cap. On 2026-10-31 the old 25% cap ($6,250) left a BTC trade with a 0.19% stop
+only about $12 at risk instead of $50; with the whole account as the cap, a stop of 1% or wider
+gets the full $250, and tighter stops still get less (no borrowing).
 
 Environment variables:
 
@@ -438,8 +454,10 @@ python3 tools/smoke_live.py                  # live, whenever data parsing chang
 - **Dates:** Saturday 2026-10-31 to Saturday 2026-11-14. The bot keeps running afterwards until the
   owner says stop.
 - **The question:** is the bot profitable, and does the desk's filter add money? The desk trades
-  only passes; the shadow trades every idea with the default plan. Both use the same $50 risk per
-  trade, and both are judged net of paper fees.
+  only passes; the shadow trades every idea with the default plan. Both use the same risk per
+  trade, and both are judged net of paper fees. **The rules changed on day 2** (2026-11-01, the
+  owner's 3:1 rule: 3R targets, $250 a trade, a +0.2R bar); trades before that used 2R and $50.
+  Report the two periods separately.
 - **Each day** (the first crypto run after 00:00 UTC): an Activity line `Day <n> results` with both
   accounts' all-time P&L, closed trades and win rate.
 - **The verdict** (the first crypto run after 2026-11-14 12:00 UTC, once):

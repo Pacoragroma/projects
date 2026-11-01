@@ -13,9 +13,9 @@ Per idea, in order (after one broker.py sync when the ledger has open trades or 
   1. a crypto short is skipped (spot crypto is long only);
   2. a symbol with an open trade, or a pending or working ticket, in the desk's ledger is skipped;
   3. --plan default builds the desk's default plan: exit_plan.py SYMBOL --entry E --side S --save
-     (1.5 x ATR stop, 2R target, the default time stop) with the idea's setup label, then risk.py
-     size --save; --plan saved trades the plan the desk saved in --home (risk.py size --save only
-     when it carries no sizing for its levels);
+     (1.5 x ATR stop, a target of --rr R, default 2R, the default time stop) with the idea's setup
+     label, then risk.py size --save; --plan saved trades the plan the desk saved in --home
+     (risk.py size --save only when it carries no sizing for its levels);
   4. broker.py ticket: a preview (market closed, past the time stop) or a budget block is a skip.
 Then, once every ticket of the batch exists: one wait until the newest is 10 seconds old (a replay
 with $DAYTRADER_NOW does not sleep: its confirmations run 11 seconds later on the replay clock),
@@ -63,6 +63,7 @@ REPLAY_STEP = MIN_CONFIRM_SECONDS + 1  # a replay confirms this many seconds aft
 WAIT_MARGIN = 1.0                     # ticket stamps are whole seconds
 CALL_TIMEOUT = 600                    # seconds per skill command (data fetches retry with back-off)
 EXIT_DATA, EXIT_BLOCKED = 2, 3        # the skills' exit codes: data source down, refused by the budget
+DEFAULT_RR = 2.0                      # --plan default's target in R unless --rr says otherwise
 SPOT_LONG_ONLY = "crypto spot is long only"
 IN_A_TRADE = "already in a trade or order"
 STOCK = re.compile(r"[A-Z][A-Z0-9.\-]{0,9}")   # the tickers broker.py accepts
@@ -271,10 +272,10 @@ def size(sym, res):
     return True
 
 
-def default_plan(idea, res):
+def default_plan(idea, res, rr=DEFAULT_RR):
     sym = idea["symbol"]
     code, out, err = call(EXIT_PLAN, sym, "--entry", price_arg(idea["entry"]), "--side", idea["side"],
-                          "--save", "--json")
+                          "--rr", f"{rr:g}", "--save", "--json")
     if code != 0 or not out.get("saved"):
         return fail(res, code, err)
     take_levels(res, out)
@@ -309,14 +310,14 @@ def saved_plan(idea, res):
     return True if sized(plan) else size(sym, res)
 
 
-def prepare(idea, res, plan_mode):
+def prepare(idea, res, plan_mode, rr=DEFAULT_RR):
     """Steps 1-4: the pending ticket to confirm, or None (`res` says why not)."""
     sym, side = idea["symbol"], idea["side"]
     if side == "short" and tc.is_crypto_symbol(sym):
         return skip(res, SPOT_LONG_ONLY)
     if busy(sym):
         return skip(res, IN_A_TRADE)
-    if not (default_plan(idea, res) if plan_mode == "default" else saved_plan(idea, res)):
+    if not (default_plan(idea, res, rr) if plan_mode == "default" else saved_plan(idea, res)):
         return None
     args = ["ticket", "--symbol", sym, "--side", side, "--json"]
     if idea["setup"]:
@@ -460,9 +461,23 @@ def build_parser():
     p.add_argument("--side", type=str.lower, choices=("long", "short"))
     p.add_argument("--entry", metavar="E", help="the idea's entry price (required for --plan default)")
     p.add_argument("--setup", metavar="LABEL", help="setup label for the plan and the journal, e.g. orb")
+    p.add_argument("--rr", type=float, metavar="R",
+                   help=f"--plan default only: target = entry +/- R x risk (default {DEFAULT_RR:g}); "
+                        "a saved plan keeps its own target")
     p.add_argument("--note", metavar="TEXT", help="kept with the result")
     p.add_argument("--json", action="store_true", help="print machine-readable JSON")
     return p
+
+
+def target_rr(args):
+    """--rr for --plan default, checked before anything trades."""
+    if args.rr is None:
+        return DEFAULT_RR
+    if args.plan != "default":
+        raise ValueError("--rr is for --plan default (a saved plan keeps its own target)")
+    if not (math.isfinite(args.rr) and 0 < args.rr <= 50):
+        raise ValueError(f"--rr must be above 0 and at most 50, not {args.rr:g}")
+    return args.rr
 
 
 def main():
@@ -470,6 +485,7 @@ def main():
     order = " ".join((args.standing_order or "").split())
     if not order:
         raise ValueError("--standing-order is empty - name the owner's standing order this run trades under")
+    rr = target_rr(args)
     home = desk_home(args.home)
     ideas = load_ideas(args)
     if os.environ.get("DAYTRADER_NOW"):
@@ -482,7 +498,7 @@ def main():
         res = new_result(idea)
         results.append(res)
         try:
-            k = prepare(idea, res, args.plan)
+            k = prepare(idea, res, args.plan, rr)
         except (ValueError, tc.StateError, OSError) as e:
             k = fail(res, 1, str(e))
         if k:

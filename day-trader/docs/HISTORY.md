@@ -307,6 +307,53 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
   Monday's US open, so a clean session runs the first stock sweep (Monday 09:50 ET, which is
   14:50 UTC once US clocks go back on Nov 1).
 
+### 2026-11-01: the owner's 3:1 rule
+
+- **The rest of day 1 (2026-10-31, the first rules: 2R targets, $50 a trade):**
+  - the first unattended runs in the new session went through cleanly (16:10 to 22:10 UTC);
+  - **a demo trade for the owner** ("go into a trade so we can see how the bot works"), in a
+    separate paper account outside the test: a forced BTC long at 77,712 with a 3:1 target. The
+    replays gave it +0.23R before fees but −0.82R after Binance's 0.1% fees on a 0.19% stop. It
+    was stopped out after 65 minutes: −$24.37, of which $12.49 fees;
+  - the same trade replayed with wider stops: a tight stop makes the fees bigger than the risk,
+    and a wide one puts a 3R target out of a day's reach (after fees: 0.5% stop −0.43R, 1% −0.24R,
+    2% −0.11R);
+  - **ETH, 22:05 UTC:** its alert level got a real 5-minute close (7.4× volume). The shadow bought
+    it with its default plan; the desk skipped it (all three stops lean against, best −0.35R after
+    fees). The shadow was stopped out in the next bar for −$20.57: the desk's first measurable
+    save;
+  - ZAMA's alert fired on a wick at 21:44 and never closed above its level;
+  - the container restarted once (about 22:40 UTC). The disk survived, only a background watch was
+    lost and re-created, and no idea was missed.
+- **Day 1 results:** desk $0 (no trades); shadow −$20.57 (1 trade, 0 wins).
+- **The owner:** "allow the bots to risk more ... We're not looking for trades with a really,
+  really slight edge. We're looking for trades where we have 3-to-1 risk ratio to actually enter."
+  Pushed back first, with numbers: the desk had skipped trades expected to lose, not small edges
+  (7 of the morning's 10 were negative after fees); 3:1 alone isn't an edge (it needs a win rate
+  above about 25% plus fees); and the 25% position cap, not the risk setting, held the risk down
+  on tight stops.
+- **Owner's choice ("go"), both accounts, from 2026-11-01 about 11:30 UTC:**
+  - 3R targets: `exit_plan.py --rr 3`, and the shadow through the new `paper_autotrade.py --rr 3`;
+  - the desk enters only at +0.2R or better after fees (was +0.05R), with no vetoes beyond the
+    written rules;
+  - $250 a trade: the desk at 1% with the position cap at the whole account (no borrowing) and
+    $1,250 for both the daily max loss and the open risk; the shadow at 0.1% with a $25,000 cap;
+  - no new alerts: ideas come from the scans;
+  - the changes pushed to `claude/day-trader-skills`.
+
+  The verdict reports the two periods separately (RUNBOOK §10).
+- **Other venues, checked from this server** (public data only, paper only): Binance's futures, main
+  API and Spot Testnet answer 451 (restricted location) and Bybit 403; OKX and Kraken futures data
+  answer. Futures would add shorts, lower fees (0.02% maker / 0.05% taker at the entry tier, per
+  secondary sources) and leverage, but they are a real build. Recommended waiting for a week of
+  shadow data; not chosen.
+- **Binance, 2026-11-01:** Recovery Update #4 (04:08 UTC) reopens withdrawals in phases, about 15
+  networks in phase one: 1 network was open at 06:12 UTC, 7 at 08:12 and 14 at 10:12. Binance says
+  about 95% of the stolen amount is now replaced (top ten tokens 100%), still not independently
+  verified. Source: [Binance: Recovery Update #4](https://www.binance.com/en/support/announcement/detail/73911fb819b240f88b88256bdd318eda)
+- **Live data:** Binance's public market-data stream (`data-stream.binance.vision`, WebSocket)
+  works from this server; the main stream (`stream.binance.com`) does not.
+
 ## Decisions that shaped the design
 
 - **Paper only, always.** No live mode exists, and nothing calls an order endpoint. "Nothing
@@ -343,3 +390,8 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
   chosen yet.
 - The crypto job: prune the download cache (files older than 2 days, RUNBOOK §9). Offered
   2026-10-31, not chosen yet; a fresh session starts with an empty cache anyway.
+- Paper futures on OKX (Kraken as the backup): shorts, lower fees and leverage, for crypto setups
+  that spot can't take (TRX and XPL scored 60+ as shorts on 2026-10-31 and 11-01). Offered, not
+  chosen yet.
+- A "rejected ideas" line on the dashboard: the shadow's P&L on just the ideas the desk skipped.
+  Offered 2026-10-31.
