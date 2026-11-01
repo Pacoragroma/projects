@@ -496,3 +496,22 @@ python3 -I -c "import json,sys,datetime as t; [print(t.datetime.fromtimestamp(a[
   (due 2026-11-03) or an independent check (an auditor, a regulator, on-chain analysts).
   "Pledged" and "90% replaced" are Binance's own figures.
 - Tell the owner when withdrawals reopen and when the reimbursement is independently confirmed.
+
+## 12. Watch Binance live
+
+When the owner asks what is happening on Binance right now, listen to its public live stream:
+
+```bash
+python3 $TOOLS/binance_live.py                                       # 15 s of BTC-USDT and ETH-USDT
+python3 $TOOLS/binance_live.py --symbols SOL-USDT,ZAMA-USDT --seconds 30 --json
+```
+
+- Per pair it shows the trades, the dollars traded and how much of that was buyers lifting the
+  ask, the price range, the last price and the biggest trade. For the first pair it also shows the
+  forming 1-minute candle and the best bid and ask with the size on the top five levels.
+- It reads `data-stream.binance.vision`, the public market-data WebSocket: no account, no keys,
+  nothing that can place an order. From this server the main stream (`stream.binance.com`), the
+  main API and the Spot Testnet answer 451 (restricted location).
+- The dashboard can't show it live: claude.ai pages block every outside connection, WebSockets
+  included. A live reading reaches the owner in chat, or on the dashboard at the next refresh.
+- Exit codes as everywhere: 0 ok, 1 bad input, 2 the stream is unreachable.

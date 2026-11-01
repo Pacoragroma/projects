@@ -456,6 +456,7 @@ python3 tools/smoke_live.py                 # live check of every data source (n
 python3 tools/desk_snapshot.py --symbol BTC-USDT --out desk.json   # the desk as one JSON file (for a dashboard)
 python3 tools/desk_backup.py --out state.json   # one desk's state as one JSON; tools/desk_restore.py puts it back
 python3 tools/paper_autotrade.py --help     # ticket AND confirm paper trades, for an owner who waived the per-ticket yes (paper only)
+python3 tools/binance_live.py               # 15 s of Binance's live public stream: trades, buy/sell flow, 1-min candle, order book
 python3 tools/sync_common.py                # after editing shared/trader_common.py: refresh every copy
 python3 tools/sync_common.py --check        # fail if any skill's copy is stale (CI)
 python3 tools/package_skills.py --check     # validate every SKILL.md frontmatter (CI)

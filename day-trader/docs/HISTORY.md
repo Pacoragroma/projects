@@ -351,8 +351,13 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
   networks in phase one: 1 network was open at 06:12 UTC, 7 at 08:12 and 14 at 10:12. Binance says
   about 95% of the stolen amount is now replaced (top ten tokens 100%), still not independently
   verified. Source: [Binance: Recovery Update #4](https://www.binance.com/en/support/announcement/detail/73911fb819b240f88b88256bdd318eda)
-- **Live data:** Binance's public market-data stream (`data-stream.binance.vision`, WebSocket)
-  works from this server; the main stream (`stream.binance.com`) does not.
+- **The owner: "try connecting to the Binance network so we can actually see what is
+  happening."** No account or keys: Binance's main API, main stream and Spot Testnet all answer 451
+  from this server, and paper only stays the rule. Its public market-data stream
+  (`data-stream.binance.vision`, WebSocket) does work, so `tools/binance_live.py` (standard library,
+  read-only) now listens to it on demand (RUNBOOK §12). The first reading, 11:27 UTC: BTC at
+  78,006.77 with 45 trades worth $173k in 16 seconds, a $0.01 spread, and a $100k ETH buy at
+  2,269.75. The dashboard can't stream it: claude.ai pages block every outside connection.
 
 ## Decisions that shaped the design
 
