@@ -358,6 +358,10 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
   read-only) now listens to it on demand (RUNBOOK §12). The first reading, 11:27 UTC: BTC at
   78,006.77 with 45 trades worth $173k in 16 seconds, a $0.01 spread, and a $100k ETH buy at
   2,269.75. The dashboard can't stream it: claude.ai pages block every outside connection.
+- **The second transfer:** the owner asked for the stand-down at 12:17 UTC, right after the 12:10
+  crypto run (the 12:10 run was the first under the 3:1 rule: 507 pairs, no idea), so the next run
+  (14:10) falls to the new session with no gap. Both jobs were turned off, no background task was
+  running, and both final backups end in "Old session stood down".
 
 ## Decisions that shaped the design
 

@@ -6,9 +6,10 @@ autonomous paper bot in a two-week test (2026-10-31 to 2026-11-14). The desk tra
 that pass its rules. A shadow account trades every idea, so the two can be compared. The owner's
 standing order: paper trades need no per-ticket yes. Nothing here can place a real order.**
 
-State as of **Sunday 2026-11-01, about 11:30 UTC**, version 1.2.1, the latest commit on
-`claude/day-trader-skills`. The bot moved to a second session on 2026-10-31 (HISTORY); the owner
-plans the next move for Sunday 2026-11-01, before Monday's US open.
+State as of **Sunday 2026-11-01, about 12:20 UTC**, version 1.2.1, the latest commit on
+`claude/day-trader-skills`. The bot moved to a second session on 2026-10-31 and to a third on
+2026-11-01, right after the 12:10 UTC crypto run (HISTORY). The first crypto run in the new session
+is due at 14:10 UTC; the first stock sweep under the 3:1 rule is Monday 09:50 ET (14:50 UTC).
 
 Read in this order:
 
