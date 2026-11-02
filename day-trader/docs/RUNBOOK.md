@@ -147,6 +147,22 @@ python3 $SK/time-machine/scripts/time_machine.py SYM --save --json   # stocks ou
 python3 $SK/risk/scripts/risk.py size --symbol SYM --save --json     # --save: the ticket takes its size from the plan
 ```
 
+**Scripted, for a batch:** `tools/desk_check.py` runs exactly that sequence (entry, the three stops,
+Time Machine, sizing) in those throwaway homes for every idea at once, three ideas at a time with one
+shared download cache, and prints one row per idea: the trigger and whether it is live, the best
+stop, its odds and which numeric rules failed. About 15 s per idea; ten ideas in about a minute. It
+checks no news and places no order:
+
+```bash
+python3 $TOOLS/desk_check.py --home $DESK --out $OUT/homes --ideas $OUT/ideas-<date>.json \
+  --candidates $OUT/candidates.json --json > $OUT/check-<date>.json      # or one idea: SYM --setup orb
+```
+
+`--ideas` takes the same rows as `paper_autotrade.py` (`symbol`, `side`, `setup`, plus `level` for a
+level setup, and an optional `entry` that is replayed only while there is no trigger yet). A row that
+reads `pass (numbers; news pending)` becomes a desk trade once the news rule below is checked: copy
+that idea's best `plan_file` into `$DESK/plans/` and run `paper_autotrade.py --plan saved`.
+
 **Pass rules. The best of the three stops (by expected R after fees) must meet all of these:**
 
 - a live entry now (above);
@@ -448,6 +464,7 @@ python3 tools/smoke_live.py                  # live, whenever data parsing chang
 | An alert "fired" but nothing happened | It was a touch (wick) or happened hours ago. Re-check with `entry.py --setup level --cutoff 23:55` (§5) |
 | The watcher never starts | A `pgrep -f` guard matches its own shell. Use the PID-file check (§5) |
 | The disk fills up in a long-running session | The download cache keeps a new set of Binance daily candles every UTC day (about 46 MB a day, never pruned); the stock charts (about 86 MB) are overwritten in place. It is only a cache: `find /root/.day-trader/cache -type f -mtime +2 -delete`. A new session starts with an empty one |
+| `smoke_live.py` fails `nasdaq-symbols` ("well-known symbols missing: JPM") and the ORB universe comes out at about 3,400 symbols | Nasdaq Trader published an empty `otherlisted.txt` (NYSE and AMEX; 131 bytes, header only). Happened 2026-11-02. Rebuild offline from a mirror of Nasdaq's own screener (updated daily): download `https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/{nyse,amex}/{nyse,amex}_full_tickers.json`, write their `symbol` and `name` into a pipe file with the header `ACT Symbol\|Security Name\|Exchange\|CQS Symbol\|ETF\|Round Lot Size\|Test Issue\|NASDAQ Symbol` (exchange N or A, ETF N, lot 100, test N) next to a fresh `nasdaqlisted.txt`, then `scan.py universe --offline <that folder>` in `/home/user/original-desk`. Gave 5,898 symbols against 5,942 from the real files. Re-run the normal `scan.py universe` once the file is back |
 
 ## 10. The two-week test and the verdict
 

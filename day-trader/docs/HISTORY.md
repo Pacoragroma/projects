@@ -363,6 +363,41 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
   (14:10) falls to the new session with no gap. Both jobs were turned off, no background task was
   running, and both final backups end in "Old session stood down".
 
+### 2026-11-02: the fourth session, the pre-market study and the scripted desk check
+
+- **The third transfer, Monday 09:05-09:21 UTC.** The old session had stood down at 12:18 UTC on
+  Sunday; the new one only started Monday morning, so the bot was off for 21 hours (ten crypto runs
+  missed, nothing open). The stand-down held, both accounts restored, both jobs re-created from
+  byte-identical prompts, "New session took over" in both logs before the 10:10 run. The session had
+  to be switched to Auto mode by hand first (`get_session` showed no `permission_mode`).
+- **Nasdaq Trader published an empty `otherlisted.txt`** (the NYSE and AMEX list) that morning, so
+  the smoke test failed `nasdaq-symbols` and the ORB universe came out at 3,443 Nasdaq-only symbols.
+  Rebuilt at 09:36 UTC from a daily mirror of Nasdaq's screener: 5,898 symbols (RUNBOOK §9).
+- **Binance, 09:08 UTC:** 29 of 1,448 networks with withdrawals open (BTC, ETH, SOL, XRP, TRX, DOGE,
+  BNB; USDT on 6 chains, USDC on 8). Binance says about 95% replaced; the zero-knowledge proof of
+  reserves due Nov 3 is not out, CertiK said it needed more information, and no independent party
+  has confirmed the figures. Trackers report about $3.6B of net outflows since the reopening.
+- **The owner: "get the bot ready for whatever the stock market opens ... sub-agents to look at the
+  trades, the charts, study from the charts ... other sub-agents to check out the news ... make the
+  bot better."** Nothing new had been added to the account, so "the included skill" is our own pack.
+  Done the same morning, within the test's rules (the ideas and the pass rules unchanged):
+  - **a pre-market study** by 18 sub-agents over 78 liquid names from both weekend scans: per group of
+    ten, one chart agent (brief, levels, the replay odds of the three standard stops at 3R from the
+    open) and one news agent (72 h headlines, web search, earnings dates, events, red flags with
+    sources), plus a macro agent and a synthesis into a brief. It took two hours: the container has
+    4 CPUs, so a workflow runs two agents at a time. Result: 12 of 78 charts replay "good" (FANG,
+    MNST, ROP, WMT the cleanest), 37 poor (every semiconductor and the crypto-linked names), 8 red
+    flags (TSEM, PURR, CCXI, CACC, ATEC, SKYW, FTNT, SFM), ISM at 10:00 ET ten minutes after the
+    sweep, midterms on Tuesday;
+  - **`tools/desk_check.py`:** the runbook's three-stop check for a batch of ideas, scripted (entry,
+    exit plan, Time Machine, sizing in throwaway homes, three ideas at a time, one shared download
+    cache), with the numeric pass rules applied and a candidate row per idea. A trigger stays live
+    for 15 minutes, and ten hand-run checks did not fit in that window. About 15 s per idea; 12
+    offline tests. The news rule and the trade stay with the main session.
+- **Proposed, not yet decided by the owner:** the same structure in the jobs (news agents alongside
+  the scripted check in the stock sweep and the crypto run), a pre-market job at 08:05 ET, a written
+  red-flag definition in RUNBOOK §3, and the universe fallback as a tool.
+
 ## Decisions that shaped the design
 
 - **Paper only, always.** No live mode exists, and nothing calls an order endpoint. "Nothing
