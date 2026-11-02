@@ -440,10 +440,10 @@ the main session applies §3's rules. The rules themselves did not change.
    the copies by machine, not by eye.** Paste the old prompts' JSON strings (as `get_trigger`
    prints them) into `$OUT/jobs/old_prompts.json` as `{"crypto": "...", "stock": "..."}`, the new
    tasks' stored prompts into `$OUT/jobs/new_prompts.json` the same way, and compare them in
-   Python: they must be equal (since the batch of 2026-11-02: 6,924 characters for the crypto run and
-   5,034 for the stock sweep; the pre-market study's prompt is listed in HANDOFF when it exists).
+   Python: they must be equal (since the batch of 2026-11-02: 6,924 characters for the crypto run,
+   5,034 for the stock sweep and 3,815 for the pre-market study).
 5. **Verify** with `list_triggers` (`enabled: true` lists only the live tasks): of the desk's
-   tasks, only the new pair is enabled, with `persistent_session_id` = this session
+   tasks, only the new three are enabled, with `persistent_session_id` = this session
    (`get_session` with no args gives it). The `PR review digest` stays enabled.
 6. **Write "New session took over" into both logs before the next :10 run.** The restored logs
    end with "Old session stood down", and the job prompts skip a run whose last `desk_log` event

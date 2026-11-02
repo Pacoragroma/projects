@@ -406,7 +406,10 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
     hold per idea, the passes' plans copied into the desk, the candidate rows set) and
     `paper_autotrade.py --plan saved --ideas`. The agents' prompts live in `docs/agents/`;
   - both job prompts rewritten to that batch (6,924 and 5,034 characters, checked by machine) and
-    a third job, the pre-market study at 08:05 ET (RUNBOOK §2a), from 2026-11-03;
+    a third job, the pre-market study at 08:05 ET (RUNBOOK §2a, 3,815 characters), from 2026-11-03:
+    `tools/premarket.py` picks about 50 candidates from both scanners (at most 30 of ours, so the
+    original pack's most traded hits keep their room) and merges the agents' part files into the
+    study; the chart, macro and synthesis agents' prompts are in `docs/agents/`;
   - the rules and the idea definition unchanged through 2026-11-14.
 
 ## Decisions that shaped the design
