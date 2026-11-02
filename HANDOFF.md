@@ -6,10 +6,11 @@ autonomous paper bot in a two-week test (2026-10-31 to 2026-11-14). The desk tra
 that pass its rules. A shadow account trades every idea, so the two can be compared. The owner's
 standing order: paper trades need no per-ticket yes. Nothing here can place a real order.**
 
-State as of **Sunday 2026-11-01, about 12:20 UTC**, version 1.2.1, the latest commit on
-`claude/day-trader-skills`. The bot moved to a second session on 2026-10-31 and to a third on
-2026-11-01, right after the 12:10 UTC crypto run (HISTORY). The first crypto run in the new session
-is due at 14:10 UTC; the first stock sweep under the 3:1 rule is Monday 09:50 ET (14:50 UTC).
+State as of **Monday 2026-11-02, about 13:15 UTC**, the latest commit on `claude/day-trader-skills`.
+The bot moved to a second session on 2026-10-31, a third on 2026-11-01 and a fourth on 2026-11-02
+(HISTORY). Since 2026-11-02 the runs check their ideas as a batch: `desk_check.py` does the numbers
+while news agents read the news, `desk_decide.py` applies the rules ([RUNBOOK §3a](day-trader/docs/RUNBOOK.md#3a-the-automatic-batch-numbers-and-news-at-the-same-time-2026-11-02)),
+and a pre-market study runs on weekday mornings ([RUNBOOK §2a](day-trader/docs/RUNBOOK.md#2a-the-pre-market-study-weekdays-0805-et-from-2026-11-03)).
 
 Read in this order:
 
@@ -30,7 +31,8 @@ dashboard's link, the old session's id and the scheduled tasks' ids.
 | Thing | Where | Notes |
 |---|---|---|
 | Our skill pack, 11 skills, v1.2.1 | `day-trader/` on branch `claude/day-trader-skills` (the repo's default branch) | Stdlib Python 3.9+, 975 offline tests, CI on 3.9 and 3.12 |
-| The bot's tools | `day-trader/tools/` | `paper_autotrade.py` (ticket and confirm under the standing order), `desk_check.py` (the three-stop check of a batch of ideas, scripted, [RUNBOOK §3](day-trader/docs/RUNBOOK.md#3-ideas-the-shadow-takes-each-one-the-desk-only-the-ones-that-pass)), `desk_snapshot.py` (the dashboard data), `desk_backup.py`, `desk_restore.py`, `smoke_live.py`, `binance_live.py` (Binance's live public stream on demand, [RUNBOOK §12](day-trader/docs/RUNBOOK.md#12-watch-binance-live)) |
+| The bot's tools | `day-trader/tools/` | `paper_autotrade.py` (ticket and confirm under the standing order), `desk_check.py` (the three-stop check of a batch of ideas, scripted) and `desk_decide.py` (the numbers plus the news agents' files, the passes' plans into the desk; [RUNBOOK §3a](day-trader/docs/RUNBOOK.md#3a-the-automatic-batch-numbers-and-news-at-the-same-time-2026-11-02)), `desk_snapshot.py` (the dashboard data), `desk_backup.py`, `desk_restore.py`, `smoke_live.py`, `binance_live.py` (Binance's live public stream on demand, [RUNBOOK §12](day-trader/docs/RUNBOOK.md#12-watch-binance-live)) |
+| The helper agents' prompts | `day-trader/docs/agents/` | `news-agent.md` (one per five ideas, alongside `desk_check.py`); the pre-market study's `chart-agent.md`, `macro-agent.md` and `synthesis-agent.md` ([RUNBOOK §2a](day-trader/docs/RUNBOOK.md#2a-the-pre-market-study-weekdays-0805-et-from-2026-11-03)) |
 | The video's original pack, v2.0.0 | github.com/Jakeschincariol/day-trader-skill (MIT, Jake Schincariol) | US stocks only; its ORB sweep feeds the stock runs. The jobs run a clone pinned to the audited commit `3d0f4ef6986f4984b7c6bd46f7ff4f87744c3abd` at `/home/user/day-trader-skill/` |
 | **The desk** (main paper account) | `/root/.day-trader/` in the container | Trades only the ideas that pass the desk's rules |
 | **The shadow account** | `/root/.day-trader-shadow/` in the container | Trades every idea the desk checks, with the default plan (3R target). Same $250 risk and $25,000 cap per trade |
@@ -73,15 +75,16 @@ dashboard's link, the old session's id and the scheduled tasks' ids.
 
 ## What is scheduled
 
-Two scheduled tasks run the bot
+Three scheduled tasks run the bot
 ([RUNBOOK §6](day-trader/docs/RUNBOOK.md#6-scheduled-jobs-and-taking-them-over-after-a-session-transfer)).
 They fire into the session that created them. The owner's account also has an unrelated
 `PR review digest` task: leave it alone.
 
 | Name | When | What |
 |---|---|---|
-| `Paper bot: crypto every 2 hours` | Every 2 hours at :10 UTC, no end date | Sync both accounts, scan Binance, check alerts, ideas into the shadow and passes into the desk, refresh the dashboard, back up both, a daily results line, the verdict on 2026-11-14 |
-| `Paper bot: US stock sweep (weekdays 09:50 ET)` | Mon-Fri 09:50 ET (14:50 UTC in winter) | The original pack's opening-range sweep, the top liquid hits into the shadow, passes into the desk, refresh and back up |
+| `Paper bot: crypto every 2 hours` | Every 2 hours at :10 UTC, no end date | Sync both accounts, scan Binance, check alerts, the live ideas as a batch (the shadow, then `desk_check.py` with the news agents, `desk_decide.py`, the desk), refresh the dashboard, back up both, a daily results line, the verdict on 2026-11-14 |
+| `Paper bot: US stock sweep (weekdays 09:50 ET)` | Mon-Fri 09:50 ET (14:50 UTC in winter) | The original pack's opening-range sweep, the top liquid hits as a batch (the shadow, then `desk_check.py` with the news agents, `desk_decide.py`, the desk), refresh and back up |
+| `Paper bot: pre-market study (weekdays 08:05 ET)` | Mon-Fri 08:05 ET (13:05 UTC in winter), from 2026-11-03 | The universe and the daily scans, then chart, news and macro agents at once over about 50 liquid names, a study file and a brief, an Activity line ([RUNBOOK §2a](day-trader/docs/RUNBOOK.md#2a-the-pre-market-study-weekdays-0805-et-from-2026-11-03)) |
 
 ## A session transfer, in order
 

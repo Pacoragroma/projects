@@ -102,6 +102,30 @@ detail, levels, key_level}]`, `last`, `change_pct`, `rvol`, `atr_pct`, `dollar_v
 `sma20/50`, `rsi14`, `high_20d` and `low_20d`. The top level has `scanned`, `matched`,
 `skipped_by_reason`, `filtered_by_reason` and `notes`.
 
+## 2a. The pre-market study (weekdays 08:05 ET, from 2026-11-03)
+
+Before the open, helper agents study the names both scanners flagged, so the sweep's news agents
+start from a day's homework and the owner has a brief to read:
+
+1. The universe (§1.5, with the §9 fallback if `otherlisted.txt` is empty), then both daily scans
+   (§2): `$OUT/scan/us.json` and the original pack's `trader/watchlist.json`.
+2. The candidates: the liquid names of both scans (our 60+ with $20M+ a day, the original's most
+   traded hits), about 50, in groups of ten.
+3. **At once, with the Agent tool (`general-purpose`, `run_in_background: false`, all in one tool
+   block):** one chart agent and one news agent per group, and one macro agent. Their prompts are
+   [`docs/agents/`](agents/) with the placeholders filled: `chart-agent.md` (the brief, the levels,
+   the replay odds of the three standard stops at 3R from the open), `news-agent.md` (`MINUTES` 6,
+   `RUN` `<date>-premarket`), `macro-agent.md` (futures, the calendar, events, sectors, the
+   crypto-linked names). Each writes one JSON part.
+4. The study: the parts merged into `$OUT/premarket/study-<date>.json`, then one synthesis agent
+   (`synthesis-agent.md`) writes `$OUT/premarket/brief-<date>.md`: short version first, macro, red
+   flags, charts worth a sweep hit, charts that tend to fade, events, data issues.
+5. An Activity line (`--event "Pre-market brief"`, the brief's short version as the detail), the
+   refresh and the backups (§4).
+
+The first study, 2026-11-02, ran as a workflow at two agents a time and took two hours; the Agent
+tool runs them all at once (four ran together in a test), so the study should take about 15 minutes.
+
 ## 3. Ideas: the shadow takes each one, the desk only the ones that pass
 
 **What counts as an idea** (fixed for the two-week test, so nothing is cherry-picked):
@@ -172,7 +196,7 @@ that idea's best `plan_file` into `$DESK/plans/` and run `paper_autotrade.py --p
   verdict often reads `CLOSE TO A COIN FLIP` even when it pays, because the stop is hit first
   more often than the far target; the expected R is what decides;
 - liquid: our size is trivial against the daily dollar volume;
-- no red-flag news;
+- no red-flag news (the written definition below);
 - crypto: **long only** (spot cannot be shorted);
 - stocks, for a short: no **short-sale restriction** (SSR, Reg SHO Rule 201). Once a stock trades
   10% or more below the prior close at any time in a session, it can be shorted only above the
@@ -182,6 +206,21 @@ that idea's best `plan_file` into `$DESK/plans/` and run `paper_autotrade.py --p
 
 No vetoes beyond these rules: a reviewer's doubt is recorded in the candidate's reason, not
 used to skip a pass.
+
+**Red-flag news, the written definition (2026-11-02).** An idea carries a red flag only on evidence
+(a headline, a filing or an exchange notice, with its source recorded in the candidate's reason)
+of one of these:
+- the move is driven by an unconfirmed takeover report or a rumor;
+- a share offering, a dilution vote or a lock-up expiry is announced or pending today;
+- a trading halt;
+- a delisting notice, a going-concern warning, a fraud allegation or a regulatory investigation
+  announced in the last 5 days;
+- a guidance cut in the last 5 days (a cut of any guided line counts, even inside a beat);
+- an earnings release or a guidance call scheduled during today's regular session.
+
+Not a red flag: an earnings report that is already out (today's or Friday's gap is what the sweep
+trades), an analyst downgrade, a sector selloff, or a report scheduled after today's close (the
+desk is flat by the time stop). The news agents (§3a) look for exactly this list and nothing else.
 
 **A pass becomes a desk trade:**
 
@@ -200,6 +239,42 @@ python3 $TOOLS/paper_autotrade.py --home $DESK --standing-order "owner 2026-10-3
 
 **Record every decision** (pass or skip, with the reason and the odds) in `$OUT/candidates.json`:
 one row per symbol, as the dashboard's Candidates table shows.
+
+## 3a. The automatic batch: numbers and news at the same time (2026-11-02)
+
+Since 2026-11-02 the stock sweep and the crypto run check their ideas like this. The main session
+does every step and nothing waits on a person; the rules are §3's, unchanged. `RUN` below is
+`<date>-<HHMM>` of the run (`2026-11-02-0950`), so two runs on one day never share a file.
+
+1. **The batch:** `$OUT/ideas-<RUN>.json`, `paper_autotrade.py` rows (`symbol`, `side`, `entry`,
+   `setup`, `note`, plus `level` for a level setup).
+2. **The shadow first:** `python3 $TOOLS/paper_autotrade.py --home $SHADOW --standing-order "owner
+   2026-10-31: no per-ticket yes for paper" --plan default --rr 3 --ideas $OUT/ideas-<RUN>.json --json`.
+3. **In one tool block, at the same time:**
+   - Bash: `python3 $TOOLS/desk_check.py --home $DESK --out $OUT/homes --ideas $OUT/ideas-<RUN>.json
+     --candidates $OUT/candidates.json --json > $OUT/check-<RUN>.json` (§3: the trigger, the three
+     stops, the odds, the size; about a minute for ten ideas);
+   - **one news agent per group of up to five ideas**, with the Agent tool (`general-purpose`,
+     `run_in_background: false`): the prompt is [`docs/agents/news-agent.md`](agents/news-agent.md)
+     with its placeholders filled (`MINUTES` 3). Each writes `$OUT/sweep/news-<RUN>-<group>.json`.
+
+   Agents launched in the same block as the Bash call run alongside it (checked 2026-11-02: two
+   agents and a shell command, all done in 20 s together) and the block returns when all are done.
+4. **The decision:** `python3 $TOOLS/desk_decide.py --check $OUT/check-<RUN>.json --news
+   "$OUT/sweep/news-<RUN>-*.json" --desk $DESK --passes $OUT/passes-<RUN>.json --candidates
+   $OUT/candidates.json --json`. Per idea: `pass` (the numbers pass and the news row has no red
+   flag), `skip` (the numbers failed, or a red flag: its reason and sources are kept) or `hold` (a
+   numbers pass with no news row). The passes' plans are copied into `$DESK/plans/` and the candidate
+   rows are set. A hold: run `news.py SYM --since 24h`, apply the red-flag definition yourself, and
+   run `desk_decide.py` again with `--mark SYM=ok` or `--mark SYM=flag:"why"`.
+5. **The desk:** `python3 $TOOLS/paper_autotrade.py --home $DESK --standing-order "owner 2026-10-31:
+   no per-ticket yes for paper" --plan saved --ideas $OUT/passes-<RUN>.json --json`. An empty passes
+   list trades nothing.
+6. §4: sync, snapshot with `--event`, publish, back up.
+
+**Timing.** A trigger stays live 15 minutes (§3). From 09:50 ET the ORB sweep takes 4-5 minutes,
+the ranking and the shadow batch about a minute, step 3 about three: the desk's triggers are checked
+8-12 minutes old. Put nothing in front of step 3.
 
 Other broker commands, any account (`DAYTRADER_HOME=$SHADOW` for the shadow):
 
@@ -321,8 +396,13 @@ Scheduled tasks fire into the session that created them. The bot has two:
 
 | Name | Schedule | Prompt |
 |---|---|---|
-| `Paper bot: crypto every 2 hours` | cron `10 */2 * * *` UTC (00:10, 02:10, ...), no end date | Restore if needed → sync both accounts → crypto scan (re-create missing stock scans) → alerts → ideas into the shadow, passes into the desk (§3) → refresh and back up both → the daily results line after 00:00 UTC → the two-week verdict after 2026-11-14 12:00 UTC → restart the watcher |
-| `Paper bot: US stock sweep (weekdays 09:50 ET)` | cron `CRON_TZ=America/New_York 50 9 * * 1-5` | Restore if needed → sync → pinned original pack's ORB sweep → rank by `pct_over`, liquidity → shadow batch, then the desk (§3) → refresh and back up both |
+| `Paper bot: crypto every 2 hours` | cron `10 */2 * * *` UTC (00:10, 02:10, ...), no end date | Restore if needed → sync both accounts → crypto scan (re-create missing stock scans) → alerts → the live ideas as a batch (§3a): the shadow, `desk_check.py` with the news agents, `desk_decide.py`, the desk → refresh and back up both → the daily results line after 00:00 UTC → the two-week verdict after 2026-11-14 12:00 UTC → restart the watcher |
+| `Paper bot: US stock sweep (weekdays 09:50 ET)` | cron `CRON_TZ=America/New_York 50 9 * * 1-5` | Restore if needed → sync → pinned original pack's ORB sweep → rank by `pct_over`, liquidity → the batch (§3a): the shadow, `desk_check.py` with the news agents, `desk_decide.py`, the desk → refresh and back up both |
+| `Paper bot: pre-market study (weekdays 08:05 ET)` | cron `CRON_TZ=America/New_York 5 8 * * 1-5` | Universe (with the §9 fallback) and the daily scans → the candidates → chart agents, news agents and a macro agent at once → the study JSON and the brief (§2a) → an Activity line, refresh and back up |
+
+The owner chose this structure on 2026-11-02 ("include the skill, make it automatic, keep the
+rules until November 14"): helper agents read the charts and the news, the scripts do the numbers,
+the main session applies §3's rules. The rules themselves did not change.
 
 - The crypto run is at :10, so on weekdays it is done well before the 09:50 ET sweep (14:50 UTC in
   winter). Runs starting between 6 and 9 AM Pacific can start late; the sweep is still valid a
@@ -360,7 +440,8 @@ Scheduled tasks fire into the session that created them. The bot has two:
    the copies by machine, not by eye.** Paste the old prompts' JSON strings (as `get_trigger`
    prints them) into `$OUT/jobs/old_prompts.json` as `{"crypto": "...", "stock": "..."}`, the new
    tasks' stored prompts into `$OUT/jobs/new_prompts.json` the same way, and compare them in
-   Python: they must be equal (since the 3:1 rule of 2026-11-01: 5,642 and 3,706 characters).
+   Python: they must be equal (since the batch of 2026-11-02: 6,924 characters for the crypto run and
+   5,034 for the stock sweep; the pre-market study's prompt is listed in HANDOFF when it exists).
 5. **Verify** with `list_triggers` (`enabled: true` lists only the live tasks): of the desk's
    tasks, only the new pair is enabled, with `persistent_session_id` = this session
    (`get_session` with no args gives it). The `PR review digest` stays enabled.

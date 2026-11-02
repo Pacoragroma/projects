@@ -394,9 +394,20 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
     cache), with the numeric pass rules applied and a candidate row per idea. A trigger stays live
     for 15 minutes, and ten hand-run checks did not fit in that window. About 15 s per idea; 12
     offline tests. The news rule and the trade stay with the main session.
-- **Proposed, not yet decided by the owner:** the same structure in the jobs (news agents alongside
-  the scripted check in the stock sweep and the crypto run), a pre-market job at 08:05 ET, a written
-  red-flag definition in RUNBOOK §3, and the universe fallback as a tool.
+- **The owner, 12:33 UTC: "Include the skill, make it automatic, and keep the rules until
+  November 14."** Shipped the same afternoon:
+  - the skill pack installed as a plugin in the container (`day-trader@pacoragroma-projects`);
+  - a written red-flag definition in RUNBOOK §3 (the only news test: rumor-driven moves, offerings
+    and dilution votes, halts, delisting/going-concern/fraud/investigation notices, guidance cuts,
+    an earnings release during the session), a clarification of the existing rule, not a new one;
+  - **the batch** (RUNBOOK §3a): the shadow first, then in one tool block `desk_check.py` and one
+    news agent per five ideas (the Agent tool; four agents ran at once in a test, and two agents
+    plus a shell command ran side by side in one block), then `tools/desk_decide.py` (pass, skip or
+    hold per idea, the passes' plans copied into the desk, the candidate rows set) and
+    `paper_autotrade.py --plan saved --ideas`. The agents' prompts live in `docs/agents/`;
+  - both job prompts rewritten to that batch (6,924 and 5,034 characters, checked by machine) and
+    a third job, the pre-market study at 08:05 ET (RUNBOOK §2a), from 2026-11-03;
+  - the rules and the idea definition unchanged through 2026-11-14.
 
 ## Decisions that shaped the design
 
