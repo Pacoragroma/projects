@@ -412,6 +412,45 @@ is the heart of it; the rest of the desk decides whether a standout is actually 
     study; the chart, macro and synthesis agents' prompts are in `docs/agents/`;
   - the rules and the idea definition unchanged through 2026-11-14.
 
+### 2026-11-02 to 2026-11-05: the first stock trades, the outage and the stand-down
+
+- **The first batch sweep, Monday 14:50 UTC:** 105 opening-range hits, 10 liquid ideas (FTAI,
+  ETSY, FLUT, DKNG, HEI, EXPE, NXT, TDG, GE, BKNG). The shadow took all ten: 7 filled, 3 day orders
+  expired unfilled. `desk_check.py` passed none (the best expected R after fees was +0.11, FLUT,
+  under the +0.2 rule), so the desk traded nothing. The shadow's seven: NXT (+4.22R) and TDG
+  (+3.04R) hit their targets, GE made +3.25R by the 15:55 ET time stop, FTAI, ETSY and EXPE were
+  stopped at −1R, and BKNG ended at −0.10R on the time stop: +$706.07 in all.
+- **The weekly usage limit, Monday 15:01 UTC:** the account hit its weekly limit during that
+  sweep's news check. Both news agents died, and nothing in the session could run until the limit
+  reset on Thursday 2026-11-05 at 09:00 UTC. Lost: the rest of the sweep (its news rows, decision
+  record, refresh and backups), the Nov 3 and Nov 4 pre-market studies and sweeps, and 33 crypto
+  runs. Nothing was open on the desk. The shadow's seven trades had all closed on Monday; the first
+  sync on Thursday settled them from the 5-minute bars. One account's limit is a single point of
+  failure for every job; on Thursday the helper agents ran on a smaller model to spend less.
+- **Thursday 2026-11-05:** a catch-up pass at 09:55 UTC (the container's files had survived, so no
+  restore), the outage written into both logs, crypto runs at 10:10, 12:10 and 14:10 UTC (no liquid
+  long of 60+ in any) and the pre-market study at 13:06 UTC: 11 sub-agents over 50 names plus a
+  synthesis agent, charts and news complete for all, no red flags. 9 charts replayed "good", but
+  every one was close to a coin flip with the edge mostly drift (detrended −0.53R to +0.08R); 33
+  replayed poor, among them most chip, AI-infrastructure and power names (INTC, MRVL, LRCX, GEV,
+  VRT, ETN, VST, PWR, FIX). Nasdaq Trader's `otherlisted.txt` was back (5,935 symbols, no fallback).
+- **The owner, 09:51 UTC: "After markets close today shut down the bot"; then, at about 15:00 UTC:
+  "Stand down."** The session stood down at once, by RUNBOOK §6: its three jobs and the one-shot
+  shutdown task disabled, no watcher or background work, nothing open, the 14:50 sweep (it fired
+  during a worker restart) not run, "Old session stood down" in both logs, a last refresh and both
+  backups. Nothing is scheduled.
+
+**Results at the stand-down (paper):**
+
+| Account | Old rules (to 2026-11-01 11:30 UTC) | The 3:1 rule (after) | All-time |
+|---|---|---|---|
+| Desk, $25,000 | $0, no trades | $0, no trades | $0, no trades |
+| Shadow, $250,000 | −$20.57, 1 trade | +$706.07, 7 trades, 3 wins, average +1.06R | +$685.50, 8 trades, 38% win rate, average +0.61R |
+
+The shadow's gain is one morning's seven stock trades: far too few to call an edge. The desk's
+filter passed nothing, so the test has no desk trades to judge. The two-week verdict needs a
+restart before 2026-11-14.
+
 ## Decisions that shaped the design
 
 - **Paper only, always.** No live mode exists, and nothing calls an order endpoint. "Nothing

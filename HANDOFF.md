@@ -1,14 +1,17 @@
 # Session handoff: start here
 
 **Short version: this repo holds `day-trader`, our own MIT rebuild of the 11-skill "Day Trader" pack
-from the owner's promo video, extended to trade crypto 24/7 on Binance prices. It runs as an
-autonomous paper bot in a two-week test (2026-10-31 to 2026-11-14). The desk trades only ideas
-that pass its rules. A shadow account trades every idea, so the two can be compared. The owner's
+from the owner's promo video, extended to trade crypto 24/7 on Binance prices. It ran as an
+autonomous paper bot in a two-week test (2026-10-31 to 2026-11-14) until the owner stood it down
+on 2026-11-05; nothing is scheduled or open now. The desk trades only ideas that pass its rules. A shadow account trades every idea, so the two can be compared. The owner's
 standing order: paper trades need no per-ticket yes. Nothing here can place a real order.**
 
-State as of **Monday 2026-11-02, about 13:15 UTC**, the latest commit on `claude/day-trader-skills`.
-The bot moved to a second session on 2026-10-31, a third on 2026-11-01 and a fourth on 2026-11-02
-(HISTORY). Since 2026-11-02 the runs check their ideas as a batch: `desk_check.py` does the numbers
+State as of **Thursday 2026-11-05, about 15:05 UTC**, the latest commit on `claude/day-trader-skills`.
+**The bot is stood down.** At the owner's call ("Stand down", about 15:00 UTC on 2026-11-05) the
+session disabled all its scheduled tasks and wrote "Old session stood down" into both accounts'
+logs and backups. Nothing is open. A restart is a session transfer (below), from step 2. The bot
+moved to a second session on 2026-10-31, a third on 2026-11-01 and a fourth on 2026-11-02, and was
+off on the account's weekly usage limit from 2026-11-02 15:01 to 2026-11-05 09:00 UTC (HISTORY). Since 2026-11-02 the runs check their ideas as a batch: `desk_check.py` does the numbers
 while news agents read the news, `desk_decide.py` applies the rules ([RUNBOOK §3a](day-trader/docs/RUNBOOK.md#3a-the-automatic-batch-numbers-and-news-at-the-same-time-2026-11-02)),
 and a pre-market study runs on weekday mornings ([RUNBOOK §2a](day-trader/docs/RUNBOOK.md#2a-the-pre-market-study-weekdays-0805-et-from-2026-11-03)).
 
@@ -58,24 +61,27 @@ dashboard's link, the old session's id and the scheduled tasks' ids.
   owner chose no new alerts (2026-11-01), so ideas come from the scans. If one is ever set again:
   alerts fire on a touch, so re-check live before acting
   ([RUNBOOK §5](day-trader/docs/RUNBOOK.md#5-alerts-and-the-watcher)).
-- **Results so far:**
-  - the desk: no trades. It passed none of the ideas it checked on 2026-10-31 (13 that morning,
-    then ETH at 22:05 UTC); none had an edge after fees;
-  - the shadow: 1 closed trade, the ETH long the desk skipped, stopped out in 5 minutes for
-    −$20.57 (of which $12.49 fees), under the old 2R/$50 rules;
+- **Results at the stand-down (2026-11-05):**
+  - the desk: no trades. It passed none of the ideas it checked (13 on the morning of 2026-10-31,
+    ETH that night, the 10 of the 2026-11-02 stock sweep); none reached +0.2R after fees;
+  - the shadow: +$685.50 on 8 closed trades, 3 wins and 5 losses, average +0.61R. Under the old
+    2R/$50 rules, 1 trade: the ETH long the desk skipped, −$20.57 (of which $12.49 fees). Under the
+    3:1 rule, the 7 stock trades of the 2026-11-02 sweep: +$706.07, average +1.06R. One morning's
+    trades are far too few to call an edge;
   - a separate demo account (not in the test) took one forced BTC trade for the owner to watch:
     −$24.37. Details are in
     [HISTORY](day-trader/docs/HISTORY.md#2026-11-01-the-owners-31-rule).
 - **News to know:** Binance was hacked on Oct 29-30 (about $6.3B, the largest crypto theft on
   record). It pledges to cover users with its own funds and says about 95% is replaced (top ten
-  tokens 100%), not yet independently verified (a zero-knowledge proof of reserves is due Nov 3).
-  Withdrawals began reopening in phases on 2026-11-01 (14 of 1,447 networks at 10:12 UTC). Paper
-  trading is unaffected. Real money should wait. Check with
+  tokens 100%), not yet independently verified (a zero-knowledge proof of reserves was due Nov 3).
+  Withdrawals began reopening in phases on 2026-11-01; at the last check, 2026-11-02 09:08 UTC, 29
+  of 1,448 networks were open. Not checked since. Paper trading is unaffected. Real money should wait. Check with
   [RUNBOOK §11](day-trader/docs/RUNBOOK.md#11-the-binance-hack-checking-the-status).
 
 ## What is scheduled
 
-Three scheduled tasks run the bot
+**Nothing, since the stand-down on 2026-11-05.** The three tasks below are disabled in the owner's
+account. Paused tasks keep their prompts, and a new session copies them
 ([RUNBOOK §6](day-trader/docs/RUNBOOK.md#6-scheduled-jobs-and-taking-them-over-after-a-session-transfer)).
 They fire into the session that created them. The owner's account also has an unrelated
 `PR review digest` task: leave it alone.
@@ -95,16 +101,16 @@ watching, and in other modes they stall on permission prompts.
 
 1. **The owner tells the old session to stand down, right after a crypto run has finished**
    (about :20 past an even UTC hour), so no run falls between the two sessions. It disables its
-   two tasks, stops its background tasks, and writes final backups of both accounts whose last log
-   line is "Old session stood down".
+   three tasks, stops its background tasks, and writes final backups of both accounts whose last log
+   line is "Old session stood down". Done on 2026-11-05: a restart starts at step 2.
 2. **The new session syncs and reads.** `git fetch origin && git checkout claude/day-trader-skills
    && git pull --ff-only`, then `CLAUDE.md`, this file and the RUNBOOK.
 3. **It sets up the container** ([RUNBOOK §1](day-trader/docs/RUNBOOK.md#1-set-up-a-fresh-container)):
    the network check, the pinned original pack and its universe.
-4. **It checks the stand-down:** both old tasks disabled, and both backups end with "Old session
+4. **It checks the stand-down:** all three old tasks disabled, and both backups end with "Old session
    stood down". Until then: no restore, no jobs, no watcher.
 5. **It restores both accounts** (only where `settings.json` is missing).
-6. **It re-creates the two jobs** from the old prompts (`get_trigger`, then `create_trigger`) and
+6. **It re-creates the three jobs** from the old prompts (`get_trigger`, then `create_trigger`) and
    checks the copies by machine against the originals. Then it checks `list_triggers`.
 7. **It starts the alert watcher:** a PID-file check first, then Bash `run_in_background: true`,
    `timeout: 7200000`.
@@ -149,9 +155,12 @@ watching, and in other modes they stall on permission prompts.
 
 ## Open items
 
-- **The two-week verdict** is due on Saturday 2026-11-14, from the first crypto run after 12:00 UTC
-  ([RUNBOOK §10](day-trader/docs/RUNBOOK.md#10-the-two-week-test-and-the-verdict)). The question:
-  is the bot profitable, and does the desk's filter add money?
+- **The two-week verdict** was due on Saturday 2026-11-14, from the first crypto run after 12:00 UTC
+  ([RUNBOOK §10](day-trader/docs/RUNBOOK.md#10-the-two-week-test-and-the-verdict)). With the bot
+  stood down it runs only if a new session restarts the jobs first. The question stays: is the bot
+  profitable, and does the desk's filter add money? So far the desk has no trades to judge.
+- **The weekly usage limit** stopped every job from 2026-11-02 15:01 to 2026-11-05 09:00 UTC. All
+  the jobs and their helper agents draw on one account's limit, so a restart should keep an eye on it.
 - **Binance customer funds:** the owner asked whether they are safe. Check with
   [RUNBOOK §11](day-trader/docs/RUNBOOK.md#11-the-binance-hack-checking-the-status) at each
   session transfer and when the owner asks; the jobs don't check it on their own. Tell the owner
